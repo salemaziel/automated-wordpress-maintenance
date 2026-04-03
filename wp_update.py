@@ -150,10 +150,20 @@ class SiteReport:
     baseline: dict[str, Any] = field(default_factory=dict)
     steps: list[StepResult] = field(default_factory=list)
 
+    # Auth method: "key" (wpupdates SSH key) or "master" (master_xxx + password)
+    # Determined during ssh-preflight. When "master", ownership must be restored
+    # after any file-mutating operation.
+    auth_method: str = "key"
+
+    # Original user:group of the wp_path directory, captured before mutations.
+    # Used to chown -R back after updates when running as master user.
+    original_owner: str = ""
+
     # These are used at runtime but NEVER serialised (see to_dict)
     ssh_user: str = ""
     ssh_password: str = ""
     ssh_key_path: str = ""
+    master_user: str = ""
     master_password: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -166,6 +176,8 @@ class SiteReport:
             "is_staging": self.is_staging,
             "has_woocommerce": self.has_woocommerce,
             "overall": self.overall,
+            "auth_method": self.auth_method,
+            "original_owner": self.original_owner,
             "backup_dir": self.backup_dir,
             "failure_step": self.failure_step,
             "failure_detail": self.failure_detail,
@@ -451,6 +463,7 @@ class WPUpdater:
             ssh_user=resolve(sftp.get("username"), self.env) or self._ssh_user,
             ssh_password=resolve(sftp.get("password"), self.env) or self._app_pw,
             ssh_key_path=resolve(sftp.get("ssh_key"), self.env) or self._ssh_key,
+            master_user=master_creds.get("username", ""),
             master_password=master_creds.get("password", ""),
         )
 
@@ -501,6 +514,13 @@ class WPUpdater:
                 self._print_site_report(r)
                 return
 
+            # --- Capture ownership BEFORE any mutations ---
+            # When running as master user, WP-CLI will change file ownership.
+            # We capture the original user:group here so we can restore it
+            # after updates (and after rollback if needed).
+            current_step = "capture-ownership"
+            self._step_capture_ownership(r)
+
             # --- WooCommerce maintenance mode ---
             if r.has_woocommerce:
                 current_step = "woocommerce-maintenance-on"
@@ -515,6 +535,11 @@ class WPUpdater:
 
             current_step = "plugin-update"
             self._step_update_plugins(r)
+
+            # --- Restore ownership if running as master ---
+            if r.auth_method == "master" and r.original_owner:
+                current_step = "restore-ownership"
+                self._step_restore_ownership(r)
 
             # --- Final verification ---
             current_step = "final-verification"
@@ -549,11 +574,100 @@ class WPUpdater:
     # ------------------------------------------------------------------
 
     def _step_ssh_preflight(self, r: SiteReport) -> None:
+        """
+        Establish SSH connectivity and verify WordPress is installed.
+
+        Auth fallback strategy:
+          1. Try the wpupdates SSH key (app-scoped user).
+          2. If the key connects but `cd` to wp_path fails with "Permission
+             denied", the wpupdates user was provisioned on a different app
+             on this server.  Fall back to master credentials which have
+             access to ALL application directories.
+
+        When master fallback is used, r.auth_method is set to "master" so
+        downstream steps know to capture and restore file ownership.
+        """
         t0 = ts()
-        self._ssh(r, "echo 'ssh-ok'")
-        self._wp(r, "core is-installed")
+        r.auth_method = "key"
+
+        try:
+            self._ssh(r, "echo 'ssh-ok'")
+            self._wp(r, "core is-installed")
+        except SSHError as exc:
+            err = str(exc)
+            if "Permission denied" not in err:
+                raise  # Not a permission issue — re-raise
+
+            # The SSH key connected but the app-scoped user can't access
+            # this application directory.  Try master credentials.
+            if not r.master_user or not r.master_password:
+                raise SSHError(
+                    f"Permission denied on {r.wp_path} and no master "
+                    f"credentials available for fallback"
+                ) from exc
+
+            if not shutil.which("sshpass"):
+                raise SSHError(
+                    f"Permission denied on {r.wp_path} — master fallback "
+                    f"requires sshpass but it's not installed"
+                ) from exc
+
+            self.log.info(
+                "Key auth can't access %s — falling back to master credentials",
+                r.wp_path,
+            )
+            r.auth_method = "master"
+            self._ssh(r, "echo 'ssh-ok'")
+            self._wp(r, "core is-installed")
+
+        auth_label = f"auth={r.auth_method}"
         self._record_step(r, "ssh-preflight", "success",
-                          f"SSH reachable at {r.server_ip}", t0)
+                          f"SSH reachable at {r.server_ip} ({auth_label})", t0)
+
+    # ------------------------------------------------------------------
+    # Step: Capture ownership
+    #
+    # When running as master user, WP-CLI changes file ownership to
+    # master_xxx:master_xxx.  We capture the original user:group of the
+    # WordPress directory BEFORE any mutations so we can chown -R back
+    # after updates complete (or after a rollback).
+    #
+    # This is a no-op when running with the app-scoped SSH key, since
+    # that user already owns the files.
+    # ------------------------------------------------------------------
+
+    def _step_capture_ownership(self, r: SiteReport) -> None:
+        t0 = ts()
+        # stat -c '%U:%G' returns "username:groupname" of the directory
+        raw = self._ssh(r, f"stat -c '%U:%G' {shlex.quote(r.wp_path)}").strip()
+        if ":" in raw:
+            r.original_owner = raw
+            self._record_step(r, "capture-ownership", "success",
+                              f"owner={raw} (auth={r.auth_method})", t0)
+            self.log.info("Captured ownership  |  %s  |  %s", r.domain, raw)
+        else:
+            # Couldn't parse — record but don't block
+            self._record_step(r, "capture-ownership", "success",
+                              f"could not parse ownership (raw={raw!r}), "
+                              "will skip restore", t0)
+
+    # ------------------------------------------------------------------
+    # Step: Restore ownership
+    #
+    # After updates or rollback, restore the original user:group on all
+    # files under public_html.  Only runs when auth_method="master".
+    # ------------------------------------------------------------------
+
+    def _step_restore_ownership(self, r: SiteReport) -> None:
+        if not r.original_owner or ":" not in r.original_owner:
+            return
+        t0 = ts()
+        owner = r.original_owner
+        script = f"chown -R {shlex.quote(owner)} {shlex.quote(r.wp_path)}"
+        self._ssh(r, script, timeout=self.args.remote_timeout)
+        self._record_step(r, "restore-ownership", "success",
+                          f"chown -R {owner} on {r.wp_path}", t0)
+        self.log.info("Restored ownership  |  %s  |  %s", r.domain, owner)
 
     # ------------------------------------------------------------------
     # Step: Baseline collection
@@ -833,6 +947,9 @@ echo 'rollback-ok'
 """
         try:
             self._ssh(r, script, timeout=self.args.remote_timeout)
+            # Restore ownership after rollback if running as master
+            if r.auth_method == "master" and r.original_owner:
+                self._step_restore_ownership(r)
             self._verify(r)
             # Deactivate maintenance mode if it was on
             if r.has_woocommerce:
@@ -964,29 +1081,41 @@ echo 'rollback-ok'
         return stdout
 
     def _ssh_cmd(self, r: SiteReport) -> list[str]:
-        """Build the SSH command list. Script is delivered via stdin."""
-        target = f"{r.ssh_user}@{r.server_ip}"
+        """Build the SSH command list. Script is delivered via stdin.
+
+        Auth method selection:
+          - auth_method="key":    use wpupdates SSH key (app-scoped user)
+          - auth_method="master": use master_xxx + password via sshpass
+                                  (server-wide access to all app dirs)
+        """
         common_opts = [
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", f"ConnectTimeout={self.args.connect_timeout}",
-            "-o", "BatchMode=yes",
         ]
 
-        # Try SSH key first
+        # Master credentials — used when the SSH key user can't access
+        # this particular application directory on a multi-app server.
+        if r.auth_method == "master":
+            target = f"{r.master_user}@{r.server_ip}"
+            return [
+                "sshpass", "-p", r.master_password,
+                "ssh", *common_opts, target, "bash", "-ls",
+            ]
+
+        # Default: SSH key (app-scoped wpupdates user)
+        target = f"{r.ssh_user}@{r.server_ip}"
         key_path = Path(r.ssh_key_path).expanduser() if r.ssh_key_path else None
         if key_path and key_path.exists():
-            return ["ssh", *common_opts, "-i", str(key_path), target, "bash", "-ls"]
-
-        # Fallback to sshpass + password
-        if r.ssh_password and shutil.which("sshpass"):
-            # Remove BatchMode for password auth
-            pw_opts = [
-                "-o", "StrictHostKeyChecking=accept-new",
-                "-o", f"ConnectTimeout={self.args.connect_timeout}",
+            return [
+                "ssh", *common_opts, "-o", "BatchMode=yes",
+                "-i", str(key_path), target, "bash", "-ls",
             ]
+
+        # Password fallback for key auth mode (when no key file exists)
+        if r.ssh_password and shutil.which("sshpass"):
             return [
                 "sshpass", "-p", r.ssh_password,
-                "ssh", *pw_opts, target, "bash", "-ls",
+                "ssh", *common_opts, target, "bash", "-ls",
             ]
 
         raise SSHError(
