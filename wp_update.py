@@ -536,8 +536,8 @@ class WPUpdater:
             current_step = "plugin-update"
             self._step_update_plugins(r)
 
-            # --- Restore ownership if running as master ---
-            if r.auth_method == "master" and r.original_owner:
+            # --- Restore ownership if running as master user ---
+            if r.auth_method in ("master", "master-key") and r.original_owner:
                 current_step = "restore-ownership"
                 self._step_restore_ownership(r)
 
@@ -577,52 +577,75 @@ class WPUpdater:
         """
         Establish SSH connectivity and verify WordPress is installed.
 
-        Auth fallback strategy:
-          1. Try the wpupdates SSH key (app-scoped user).
-          2. If the key connects but `cd` to wp_path fails with "Permission
-             denied", the wpupdates user was provisioned on a different app
-             on this server.  Fall back to master credentials which have
-             access to ALL application directories.
+        Three-tier auth cascade:
+          1. SSH key + wpupdates user (app-scoped).
+          2. SSH key + master username — same key, but the master user has
+             server-wide access to all application directories.
+          3. sshpass + master password — last resort when the key isn't
+             authorized for the master user.
 
-        When master fallback is used, r.auth_method is set to "master" so
-        downstream steps know to capture and restore file ownership.
+        When master fallback is used (tier 2 or 3), r.auth_method is set to
+        "master" so downstream steps know to capture and restore file
+        ownership after mutations.
         """
         t0 = ts()
         r.auth_method = "key"
 
+        # --- Tier 1: SSH key + wpupdates (app-scoped user) ---
         try:
             self._ssh(r, "echo 'ssh-ok'")
             self._wp(r, "core is-installed")
+            self._record_step(r, "ssh-preflight", "success",
+                              f"SSH reachable at {r.server_ip} (auth=key)", t0)
+            return
         except SSHError as exc:
-            err = str(exc)
-            if "Permission denied" not in err:
+            tier1_err = str(exc)
+            if "Permission denied" not in tier1_err:
                 raise  # Not a permission issue — re-raise
 
-            # The SSH key connected but the app-scoped user can't access
-            # this application directory.  Try master credentials.
-            if not r.master_user or not r.master_password:
-                raise SSHError(
-                    f"Permission denied on {r.wp_path} and no master "
-                    f"credentials available for fallback"
-                ) from exc
-
-            if not shutil.which("sshpass"):
-                raise SSHError(
-                    f"Permission denied on {r.wp_path} — master fallback "
-                    f"requires sshpass but it's not installed"
-                ) from exc
-
-            self.log.info(
-                "Key auth can't access %s — falling back to master credentials",
-                r.wp_path,
+        # Need master credentials for tier 2 and 3
+        if not r.master_user:
+            raise SSHError(
+                f"Permission denied on {r.wp_path} and no master "
+                f"credentials available for fallback"
             )
-            r.auth_method = "master"
+
+        # --- Tier 2: SSH key + master username ---
+        self.log.info(
+            "Key+wpupdates can't access %s — trying key+master user",
+            r.wp_path,
+        )
+        r.auth_method = "master-key"
+        try:
             self._ssh(r, "echo 'ssh-ok'")
             self._wp(r, "core is-installed")
+            self._record_step(r, "ssh-preflight", "success",
+                              f"SSH reachable at {r.server_ip} (auth=master-key)", t0)
+            return
+        except SSHError:
+            pass  # Fall through to tier 3
 
-        auth_label = f"auth={r.auth_method}"
+        # --- Tier 3: sshpass + master password ---
+        if not r.master_password:
+            raise SSHError(
+                f"Key auth failed for both wpupdates and master user on "
+                f"{r.server_ip}, and no master password available"
+            )
+        if not shutil.which("sshpass"):
+            raise SSHError(
+                f"Key auth failed — master password fallback requires "
+                f"sshpass but it's not installed"
+            )
+
+        self.log.info(
+            "Key+master failed — trying sshpass+master password for %s",
+            r.wp_path,
+        )
+        r.auth_method = "master"
+        self._ssh(r, "echo 'ssh-ok'")
+        self._wp(r, "core is-installed")
         self._record_step(r, "ssh-preflight", "success",
-                          f"SSH reachable at {r.server_ip} ({auth_label})", t0)
+                          f"SSH reachable at {r.server_ip} (auth=master-password)", t0)
 
     # ------------------------------------------------------------------
     # Step: Capture ownership
@@ -947,8 +970,8 @@ echo 'rollback-ok'
 """
         try:
             self._ssh(r, script, timeout=self.args.remote_timeout)
-            # Restore ownership after rollback if running as master
-            if r.auth_method == "master" and r.original_owner:
+            # Restore ownership after rollback if running as master user
+            if r.auth_method in ("master", "master-key") and r.original_owner:
                 self._step_restore_ownership(r)
             self._verify(r)
             # Deactivate maintenance mode if it was on
@@ -1083,18 +1106,29 @@ echo 'rollback-ok'
     def _ssh_cmd(self, r: SiteReport) -> list[str]:
         """Build the SSH command list. Script is delivered via stdin.
 
-        Auth method selection:
-          - auth_method="key":    use wpupdates SSH key (app-scoped user)
-          - auth_method="master": use master_xxx + password via sshpass
-                                  (server-wide access to all app dirs)
+        Auth methods (set by _step_ssh_preflight):
+          "key"        — SSH key + wpupdates user (app-scoped)
+          "master-key" — SSH key + master username (server-wide)
+          "master"     — sshpass + master password (last resort)
         """
         common_opts = [
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", f"ConnectTimeout={self.args.connect_timeout}",
         ]
 
-        # Master credentials — used when the SSH key user can't access
-        # this particular application directory on a multi-app server.
+        key_path = Path(r.ssh_key_path).expanduser() if r.ssh_key_path else None
+
+        # Tier 2: SSH key + master username
+        if r.auth_method == "master-key":
+            target = f"{r.master_user}@{r.server_ip}"
+            if key_path and key_path.exists():
+                return [
+                    "ssh", *common_opts, "-o", "BatchMode=yes",
+                    "-i", str(key_path), target, "bash", "-ls",
+                ]
+            raise SSHError(f"master-key auth requires SSH key but {key_path} not found")
+
+        # Tier 3: sshpass + master password
         if r.auth_method == "master":
             target = f"{r.master_user}@{r.server_ip}"
             return [
@@ -1102,16 +1136,15 @@ echo 'rollback-ok'
                 "ssh", *common_opts, target, "bash", "-ls",
             ]
 
-        # Default: SSH key (app-scoped wpupdates user)
+        # Tier 1 (default): SSH key + wpupdates user
         target = f"{r.ssh_user}@{r.server_ip}"
-        key_path = Path(r.ssh_key_path).expanduser() if r.ssh_key_path else None
         if key_path and key_path.exists():
             return [
                 "ssh", *common_opts, "-o", "BatchMode=yes",
                 "-i", str(key_path), target, "bash", "-ls",
             ]
 
-        # Password fallback for key auth mode (when no key file exists)
+        # Password fallback for tier 1 (when no key file exists)
         if r.ssh_password and shutil.which("sshpass"):
             return [
                 "sshpass", "-p", r.ssh_password,
