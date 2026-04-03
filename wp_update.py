@@ -101,6 +101,23 @@ FATAL_MARKERS = (
 # Fields that must NEVER appear in log files or summary JSON
 REDACTED_FIELDS = {"ssh_password", "ssh_key_path", "master_password"}
 
+# Known backup/migration plugins — if present, the site has an alternative
+# backup mechanism beyond our script's own pre-flight backup.
+KNOWN_BACKUP_PLUGINS = {
+    "updraftplus":              "UpdraftPlus",
+    "backwpup":                 "BackWPup",
+    "duplicator":               "Duplicator",
+    "duplicator-pro":           "Duplicator Pro",
+    "all-in-one-wp-migration":  "All-in-One WP Migration",
+    "blogvault-real-time-backup": "BlogVault",
+    "wpvivid-backuprestore":    "WPvivid",
+    "backup-backup":            "Backup Migration",
+    "jetpack":                  "Jetpack (includes backup)",
+    "backupwordpress":          "BackUpWordPress",
+    "flavstarter-flavor-starter": "flavor starter",
+    "flavor-starter":           "flavor starter",
+}
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -241,7 +258,7 @@ def slugify(name: str) -> str:
 # Logger setup
 # ---------------------------------------------------------------------------
 
-def make_logger(log_dir: Path, run_id: str) -> logging.Logger:
+def make_logger(log_dir: Path, run_id: str, stream: bool = False) -> logging.Logger:
     log_dir.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("wp-update")
     logger.setLevel(logging.DEBUG)
@@ -258,9 +275,11 @@ def make_logger(log_dir: Path, run_id: str) -> logging.Logger:
     fh.setLevel(logging.DEBUG)
     logger.addHandler(fh)
 
+    # --stream: show DEBUG on stdout (tail -f style, everything including
+    # remote SSH commands and their output).  Default: INFO only.
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(fmt)
-    sh.setLevel(logging.INFO)
+    sh.setLevel(logging.DEBUG if stream else logging.INFO)
     logger.addHandler(sh)
 
     return logger
@@ -287,7 +306,7 @@ class WPUpdater:
         self.args = args
         self.run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         self.env = load_env(args.env_file)
-        self.log = make_logger(args.log_dir, self.run_id)
+        self.log = make_logger(args.log_dir, self.run_id, stream=args.stream)
         self.reports: list[SiteReport] = []
 
         # Global SSH credentials from .env
@@ -478,7 +497,8 @@ class WPUpdater:
 
             if not self.args.execute:
                 r.overall = "dry-run"
-                self.log.info("DRY-RUN complete  |  %s", r.domain)
+                r.baseline["confidence"] = self._compute_confidence(r)
+                self._print_site_report(r)
                 return
 
             # --- WooCommerce maintenance mode ---
@@ -547,6 +567,18 @@ class WPUpdater:
         core_updates = self._wp_json(r, "core check-update --format=json",
                                      allow_empty=True)
 
+        # Detect known backup/migration plugins already installed
+        backup_plugins = []
+        for p in plugins:
+            slug = p.get("name", "")
+            if slug in KNOWN_BACKUP_PLUGINS:
+                backup_plugins.append({
+                    "slug": slug,
+                    "label": KNOWN_BACKUP_PLUGINS[slug],
+                    "status": p.get("status", "unknown"),
+                    "version": p.get("version", "?"),
+                })
+
         r.baseline = {
             "wp_version": self._wp_text(r, "core version"),
             "php_version": self._wp_text(r, "eval 'echo PHP_VERSION;'"),
@@ -556,6 +588,7 @@ class WPUpdater:
             "core_updates": core_updates,
             "plugin_updates": [p for p in plugins if p.get("update") == "available"],
             "theme_updates": [t for t in themes if t.get("update") == "available"],
+            "backup_plugins": backup_plugins,
         }
 
         self._record_step(
@@ -1022,11 +1055,246 @@ echo 'rollback-ok'
         path.write_text(json.dumps(summary, indent=2) + "\n")
         self.log.info("Summary written to %s", path)
 
+    # ------------------------------------------------------------------
+    # Confidence scoring
+    #
+    # Estimates how likely a live update run is to succeed without
+    # issues.  Starts at 100 and subtracts for known risk factors.
+    #   90-100  HIGH    — safe to auto-update
+    #   70-89   MEDIUM  — likely fine, monitor closely
+    #   50-69   LOW     — consider manual update
+    #   <50     RISKY   — strong recommendation for manual update
+    # ------------------------------------------------------------------
+
+    def _compute_confidence(self, r: SiteReport) -> dict[str, Any]:
+        score = 100
+        factors: list[str] = []
+        b = r.baseline
+
+        # WooCommerce = higher stakes (payment, orders)
+        if r.has_woocommerce:
+            score -= 15
+            factors.append("-15  WooCommerce site (payment/order risk)")
+
+        # Many plugin updates = more things that can break
+        n_plugins = len(b.get("plugin_updates", []))
+        if n_plugins > 10:
+            score -= 20
+            factors.append(f"-20  {n_plugins} plugin updates (>10)")
+        elif n_plugins > 5:
+            score -= 10
+            factors.append(f"-10  {n_plugins} plugin updates (>5)")
+        elif n_plugins > 0:
+            score -= 3
+            factors.append(f" -3  {n_plugins} plugin update(s)")
+
+        # Theme updates
+        n_themes = len(b.get("theme_updates", []))
+        if n_themes > 0:
+            score -= 5
+            factors.append(f" -5  {n_themes} theme update(s)")
+
+        # Core update pending
+        if b.get("core_updates"):
+            score -= 5
+            factors.append(" -5  WordPress core update pending")
+
+        # Large site (backup takes longer, more to go wrong)
+        disk = b.get("disk", {})
+        site_mb = disk.get("site_mb", 0)
+        if site_mb > 2000:
+            score -= 5
+            factors.append(f" -5  Large site ({site_mb:.0f} MB)")
+
+        # Tight disk space
+        avail_mb = disk.get("available_mb", 0)
+        est_backup = disk.get("estimated_backup_mb", 0)
+        if avail_mb > 0 and est_backup > 0 and avail_mb < est_backup * 3:
+            score -= 10
+            factors.append(f"-10  Tight disk space ({avail_mb:.0f} MB avail, need {est_backup:.0f} MB)")
+
+        # PHP version (older = riskier with new plugin versions)
+        php = b.get("php_version", "")
+        if php:
+            try:
+                major_minor = float(php.rsplit(".", 1)[0])
+                if major_minor < 8.0:
+                    score -= 10
+                    factors.append(f"-10  Outdated PHP {php} (<8.0)")
+            except ValueError:
+                pass
+
+        # No backup plugin = we're the only safety net
+        if not b.get("backup_plugins"):
+            score -= 5
+            factors.append(" -5  No backup plugin installed")
+
+        # Staging site = lower stakes
+        if r.is_staging:
+            score += 10
+            factors.append("+10  Staging site (lower risk)")
+
+        # Nothing to update = nothing to break
+        if n_plugins == 0 and n_themes == 0 and not b.get("core_updates"):
+            score = 100
+            factors = ["     No updates pending — nothing to change"]
+
+        score = max(0, min(100, score))
+
+        if score >= 90:
+            grade = "HIGH"
+        elif score >= 70:
+            grade = "MEDIUM"
+        elif score >= 50:
+            grade = "LOW"
+        else:
+            grade = "RISKY"
+
+        return {"score": score, "grade": grade, "factors": factors}
+
+    # ------------------------------------------------------------------
+    # Per-site report (printed after each site in both modes)
+    # ------------------------------------------------------------------
+
+    def _print_site_report(self, r: SiteReport) -> None:
+        """Print a detailed per-site status block to stdout."""
+        b = r.baseline
+        disk = b.get("disk", {})
+        conf = b.get("confidence", {})
+        L = self.log.info  # shorthand
+
+        L("")
+        L("  ┌─ %s — %s", r.client, r.domain)
+        L("  │")
+        L("  │  WordPress:    %s", b.get("wp_version", "?"))
+        L("  │  PHP:          %s", b.get("php_version", "?"))
+        L("  │  Site URL:     %s", b.get("siteurl", "?"))
+        L("  │  WooCommerce:  %s", "YES" if r.has_woocommerce else "no")
+        L("  │  Staging:      %s", "YES" if r.is_staging else "no")
+        L("  │")
+
+        # Core updates
+        core = b.get("core_updates", [])
+        if core:
+            target = core[0].get("version", "?") if core else "?"
+            L("  │  Core update:  %s → %s", b.get("wp_version", "?"), target)
+        else:
+            L("  │  Core update:  up to date")
+
+        # Themes
+        theme_updates = b.get("theme_updates", [])
+        all_themes = b.get("themes", [])
+        L("  │")
+        L("  │  Themes:       %d installed, %d need updates",
+          len(all_themes), len(theme_updates))
+        if theme_updates:
+            for t in theme_updates:
+                L("  │    %-35s  %s → %s",
+                  t.get("name", "?"),
+                  t.get("version", "?"),
+                  t.get("update_version", "?"))
+
+        # Plugins
+        plugin_updates = b.get("plugin_updates", [])
+        all_plugins = b.get("plugins", [])
+        L("  │")
+        L("  │  Plugins:      %d installed, %d need updates",
+          len(all_plugins), len(plugin_updates))
+        if plugin_updates:
+            for p in plugin_updates:
+                L("  │    %-35s  %s → %s",
+                  p.get("name", "?"),
+                  p.get("version", "?"),
+                  p.get("update_version", "?"))
+
+        # Disk
+        L("  │")
+        if disk:
+            L("  │  Disk:         %s MB site, %s MB available, ~%s MB backup",
+              f"{disk.get('site_mb', 0):.0f}",
+              f"{disk.get('available_mb', 0):.0f}",
+              f"{disk.get('estimated_backup_mb', 0):.0f}")
+        else:
+            L("  │  Disk:         not checked")
+
+        # Backup plugins
+        backup_plugins = b.get("backup_plugins", [])
+        L("  │")
+        if backup_plugins:
+            names = ", ".join(
+                f"{bp['label']} ({bp['status']}, v{bp['version']})"
+                for bp in backup_plugins
+            )
+            L("  │  Backup tools: %s", names)
+        else:
+            L("  │  Backup tools: none detected")
+
+        # Confidence
+        L("  │")
+        if conf:
+            bar_len = conf["score"] // 5  # 0-20 chars
+            bar = "█" * bar_len + "░" * (20 - bar_len)
+            L("  │  Confidence:   %s %d/100 [%s]", bar, conf["score"], conf["grade"])
+            for f in conf.get("factors", []):
+                L("  │                %s", f)
+        L("  │")
+        L("  └─ %s", r.overall.upper())
+        L("")
+
+    def _print_site_execution_report(self, r: SiteReport) -> None:
+        """Print a short summary of what was done on this site after execution."""
+        b = r.baseline
+        L = self.log.info
+
+        L("")
+        L("  ┌─ %s — %s  [%s]", r.client, r.domain, r.overall.upper())
+        L("  │")
+
+        # Summarise each step
+        for s in r.steps:
+            icon = {"success": "✓", "failed": "✗", "skipped": "–", "planned": "◇"}.get(s.status, "?")
+            L("  │  %s  %-30s  %s", icon, s.name, s.detail[:80])
+
+        if r.failure_step:
+            L("  │")
+            L("  │  FAILURE:  step=%s", r.failure_step)
+            # Truncate long error details for the report
+            detail = r.failure_detail
+            if len(detail) > 200:
+                detail = detail[:200] + "..."
+            L("  │            %s", detail)
+
+        if r.rollback_result:
+            L("  │  ROLLBACK: %s", r.rollback_result)
+
+        L("  └─")
+        L("")
+
+    # ------------------------------------------------------------------
+    # Final report
+    # ------------------------------------------------------------------
+
     def _print_final_report(self) -> None:
         self.log.info("=" * 70)
         self.log.info("FINAL REPORT")
         self.log.info("=" * 70)
 
+        # In execute mode, print per-site execution summaries first
+        if self.args.execute:
+            for r in self.reports:
+                if r.overall not in ("skipped", "pending"):
+                    self._print_site_execution_report(r)
+            self.log.info("-" * 70)
+
+        # Counts
+        counts = {}
+        for r in self.reports:
+            counts[r.overall] = counts.get(r.overall, 0) + 1
+        self.log.info("  Totals:  %s",
+                       "  ".join(f"{v} {k}" for k, v in sorted(counts.items())))
+        self.log.info("")
+
+        # Per-site one-liner table
         for r in self.reports:
             icon = {
                 "success": "✓",
@@ -1042,9 +1310,13 @@ echo 'rollback-ok'
                 extra = "  [WooCommerce — manual review]"
             elif r.overall in ("failed", "rolled-back"):
                 extra = f"  [failed at: {r.failure_step}]"
+            elif r.overall == "dry-run":
+                conf = r.baseline.get("confidence", {})
+                if conf:
+                    extra = f"  [{conf['grade']} {conf['score']}/100]"
 
             self.log.info(
-                "  %s  %-8s  %-25s  %s%s",
+                "  %s  %-11s  %-25s  %s%s",
                 icon, r.overall.upper(), r.client, r.domain, extra,
             )
 
@@ -1108,6 +1380,11 @@ def build_cli() -> argparse.Namespace:
     p.add_argument(
         "--http-timeout", type=int, default=20,
         help="HTTP health check timeout in seconds (default: 20).",
+    )
+    p.add_argument(
+        "--stream", action="store_true",
+        help="Stream all activity to stdout (tail -f style). Shows SSH "
+             "commands, remote output, and all debug-level detail in real time.",
     )
     return p.parse_args()
 
