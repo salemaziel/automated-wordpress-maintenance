@@ -418,6 +418,10 @@ class WPUpdater:
             )
             return
 
+        # Validate all apps first, then sort staging before production.
+        # In execute mode, staging sites are updated first so the operator
+        # can review the logs before production sites are touched.
+        validated: list[tuple[int, dict, SiteReport]] = []
         for idx, app in enumerate(apps, 1):
             try:
                 report = self._validate_app(doc, app, idx, path.name)
@@ -426,9 +430,55 @@ class WPUpdater:
                     "SKIP  %s app #%d — %s", path.name, idx, exc
                 )
                 continue
+            validated.append((idx, app, report))
 
+        # Sort: staging sites first (is_staging=True sorts before False
+        # when using not-is_staging as key, so staging comes first)
+        if self.args.execute:
+            validated.sort(key=lambda x: (not x[2].is_staging, x[0]))
+            staging = [v for v in validated if v[2].is_staging]
+            production = [v for v in validated if not v[2].is_staging]
+            if staging and production:
+                self.log.info(
+                    "Staging-first: %d staging site(s) will be updated "
+                    "before %d production site(s)",
+                    len(staging), len(production),
+                )
+
+        for _idx, _app, report in validated:
             self.reports.append(report)
             self._process_site(report)
+
+            # In execute mode, if a staging site failed or rolled back,
+            # skip production sites on the same server — don't risk it.
+            if (self.args.execute
+                    and report.is_staging
+                    and report.overall in ("failed", "rolled-back")):
+                remaining_prod = [
+                    v for v in validated
+                    if not v[2].is_staging and v[2] not in
+                    [r for r in self.reports]
+                ]
+                if remaining_prod:
+                    self.log.warning(
+                        "⚠ Staging site %s %s — skipping %d production "
+                        "site(s) on this server",
+                        report.domain, report.overall,
+                        len(remaining_prod),
+                    )
+                    for _, _, prod_report in remaining_prod:
+                        prod_report.overall = "skipped"
+                        prod_report.failure_detail = (
+                            f"Skipped: staging site {report.domain} "
+                            f"{report.overall}"
+                        )
+                        self._record_step(
+                            prod_report, "staging-gate", "skipped",
+                            f"staging {report.domain} {report.overall} — "
+                            "not safe to proceed",
+                        )
+                        self.reports.append(prod_report)
+                    break  # Stop processing this client file
 
     def _validate_app(
         self, doc: dict, app: dict, idx: int, filename: str
