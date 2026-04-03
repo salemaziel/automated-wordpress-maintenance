@@ -1,0 +1,1122 @@
+#!/usr/bin/env python3
+"""
+wp_update.py — Production-grade WordPress maintenance automation for Cloudways.
+Written by Claude.
+
+Safely updates WordPress core, themes, and plugins across multiple client sites
+hosted on Cloudways. Prioritises zero-downtime and rapid rollback.
+
+Design principles:
+  1. Dry-run by default — pass --execute to perform remote writes.
+  2. Atomic sequential updates — plugins are updated ONE AT A TIME with an HTTP
+     health-check after each, so the exact point of failure is always known.
+  3. Pre-flight backups — full DB export + filesystem tar BEFORE any mutation.
+  4. Automatic rollback — on any failure (non-zero exit OR 5xx HTTP), the site
+     is restored from its pre-flight backup immediately.
+  5. Credential safety — passwords and key paths are NEVER written to log files
+     or summary JSON.
+  6. Graceful degradation — incomplete client JSON files are logged and skipped,
+     they do not crash the entire run.
+  7. WooCommerce caution — sites with has_woocommerce=true are flagged for
+     manual review and skipped unless --include-woocommerce is passed.
+
+Usage:
+  # Dry-run (default) — collects baselines, plans backups, touches nothing
+  python3 wp_update.py
+
+  # Live execution against all clients
+  python3 wp_update.py --execute
+
+  # Single client
+  python3 wp_update.py --execute --client-file ../clients/amy_cloudways.json
+
+  # Include WooCommerce sites (normally skipped for safety)
+  python3 wp_update.py --execute --include-woocommerce
+
+SSH execution strategy:
+  Scripts are piped to the remote host via stdin rather than passed as SSH
+  positional arguments. This avoids a class of quoting bugs where multi-line
+  scripts are mangled by SSH's argument concatenation. The remote command is:
+    ssh [opts] user@host bash -ls
+  where -l = login shell (loads PATH for wp-cli) and -s = read from stdin.
+  subprocess.run(input=script) delivers the script body over stdin.
+
+Rollback mechanism:
+  Before ANY update, the script creates:
+    1. A full database dump via `wp db export --add-drop-table`
+    2. A compressed tar of the entire public_html directory
+  Both are stored under /home/master/wp-maintenance-backups/<client>/<app>/<run_id>/
+  which is persistent storage (not /tmp/).
+
+  If an update step fails:
+    1. The failed state is archived (for forensic analysis)
+    2. The public_html directory is wiped and restored from the tar
+    3. The database is restored via `wp db import`
+    4. An HTTP health-check confirms the rollback succeeded
+
+  If the ROLLBACK itself fails, the script logs the failure and moves on —
+  the pre-flight backup files remain on disk for manual recovery.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import re
+import shlex
+import shutil
+import ssl
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+from urllib import error as urlerror
+from urllib import request as urlrequest
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+ROOT = Path(__file__).resolve().parent.parent          # todds-clients-cloudways/
+DEFAULT_ENV = ROOT / ".env"
+DEFAULT_CLIENTS = ROOT / "clients"
+DEFAULT_LOGS = ROOT / "logs"
+
+# Cloudways apps always live under /home/master/applications/<hash>/public_html
+VALID_PATH = re.compile(r"^/home/master/applications/[A-Za-z0-9_-]+/public_html$")
+
+# Strings that indicate a fatal PHP crash when found in page body
+FATAL_MARKERS = (
+    "fatal error",
+    "there has been a critical error",
+    "uncaught exception",
+    "parse error",
+    "stack trace",
+)
+
+# Fields that must NEVER appear in log files or summary JSON
+REDACTED_FIELDS = {"ssh_password", "ssh_key_path", "master_password"}
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
+@dataclass
+class StepResult:
+    """One atomic operation within a site update."""
+    name: str
+    status: str                    # success | failed | skipped | planned
+    started: str
+    ended: str
+    detail: str = ""
+
+
+@dataclass
+class SiteReport:
+    """Aggregate result for one WordPress application."""
+    client: str
+    domain: str
+    server_ip: str
+    wp_path: str
+    is_staging: bool
+    has_woocommerce: bool
+    overall: str = "pending"       # pending | dry-run | success | failed | rolled-back | skipped
+    backup_dir: str = ""
+    failure_step: str = ""
+    failure_detail: str = ""
+    rollback_result: str = ""
+    baseline: dict[str, Any] = field(default_factory=dict)
+    steps: list[StepResult] = field(default_factory=list)
+
+    # These are used at runtime but NEVER serialised (see to_dict)
+    ssh_user: str = ""
+    ssh_password: str = ""
+    ssh_key_path: str = ""
+    master_password: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise to dict, stripping credentials."""
+        return {
+            "client": self.client,
+            "domain": self.domain,
+            "server_ip": self.server_ip,
+            "wp_path": self.wp_path,
+            "is_staging": self.is_staging,
+            "has_woocommerce": self.has_woocommerce,
+            "overall": self.overall,
+            "backup_dir": self.backup_dir,
+            "failure_step": self.failure_step,
+            "failure_detail": self.failure_detail,
+            "rollback_result": self.rollback_result,
+            "baseline": self.baseline,
+            "steps": [
+                {"name": s.name, "status": s.status,
+                 "started": s.started, "ended": s.ended, "detail": s.detail}
+                for s in self.steps
+            ],
+        }
+
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+class InventoryError(RuntimeError):
+    """A client JSON file is invalid or incomplete."""
+
+
+class SSHError(RuntimeError):
+    """A remote command returned non-zero."""
+
+
+class HealthCheckError(RuntimeError):
+    """Post-update HTTP or WP-CLI verification failed."""
+
+
+class RollbackFailed(RuntimeError):
+    """The rollback itself failed — manual intervention needed."""
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def ts() -> str:
+    """Current UTC timestamp in ISO-8601."""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def load_env(path: Path) -> dict[str, str]:
+    """
+    Parse a shell-style .env file.  Handles:
+      export KEY="value"
+      KEY='value'
+      KEY=value
+      # comments
+    Expands ~ and $HOME in values.
+    """
+    if not path.exists():
+        raise FileNotFoundError(f".env not found: {path}")
+
+    env: dict[str, str] = {}
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:]
+        if "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        # Strip matching quotes
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1]
+        val = os.path.expanduser(os.path.expandvars(val))
+        env[key] = val
+    return env
+
+
+def resolve(raw: str | None, env: dict[str, str]) -> str:
+    """Resolve $VAR placeholders against the loaded env dict."""
+    if not raw:
+        return ""
+    raw = raw.strip()
+    if raw.startswith("$"):
+        return env.get(raw[1:], "")
+    return raw
+
+
+def slugify(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Logger setup
+# ---------------------------------------------------------------------------
+
+def make_logger(log_dir: Path, run_id: str) -> logging.Logger:
+    log_dir.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("wp-update")
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
+
+    fmt = logging.Formatter(
+        "%(asctime)s  %(levelname)-7s  %(message)s", "%Y-%m-%dT%H:%M:%SZ"
+    )
+    # Force UTC
+    fmt.converter = lambda *_: datetime.now(timezone.utc).timetuple()
+
+    fh = logging.FileHandler(log_dir / f"wp-update-{run_id}.log", encoding="utf-8")
+    fh.setFormatter(fmt)
+    fh.setLevel(logging.DEBUG)
+    logger.addHandler(fh)
+
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    sh.setLevel(logging.INFO)
+    logger.addHandler(sh)
+
+    return logger
+
+
+# ---------------------------------------------------------------------------
+# Main runner
+# ---------------------------------------------------------------------------
+
+class WPUpdater:
+    """
+    Orchestrates the full update lifecycle for every client application:
+      1. Load inventory
+      2. SSH preflight
+      3. Collect baseline
+      4. Create pre-flight backup
+      5. Update core → themes → plugins (atomic, sequential)
+      6. Verify after each step
+      7. Rollback on failure
+      8. Write credential-safe summary
+    """
+
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        self.env = load_env(args.env_file)
+        self.log = make_logger(args.log_dir, self.run_id)
+        self.reports: list[SiteReport] = []
+
+        # Global SSH credentials from .env
+        self._ssh_user = self.env.get("SSH_USER", "")
+        self._ssh_key = self.env.get("SSH_KEY", "")
+        self._app_pw = self.env.get("APP_PW", "")
+
+        # SSL context for HTTP verification
+        if args.skip_ssl_verify:
+            self._ssl_ctx = ssl.create_default_context()
+            self._ssl_ctx.check_hostname = False
+            self._ssl_ctx.verify_mode = ssl.CERT_NONE
+        else:
+            self._ssl_ctx = ssl.create_default_context()
+
+        # Pre-flight validation
+        if args.execute and not self._ssh_user:
+            self.log.error("SSH_USER is required in .env for --execute mode")
+            raise SystemExit(1)
+        key_path = Path(self._ssh_key).expanduser() if self._ssh_key else None
+        if key_path and not key_path.exists():
+            self.log.error("SSH_KEY points to missing file: %s", key_path)
+            raise SystemExit(1)
+        if args.execute and not key_path and not self._app_pw:
+            self.log.error("Either SSH_KEY or APP_PW must be set in .env for --execute")
+            raise SystemExit(1)
+
+    # ------------------------------------------------------------------
+    # Entry point
+    # ------------------------------------------------------------------
+
+    def run(self) -> int:
+        files = self._gather_client_files()
+        if not files:
+            self.log.error("No client JSON files found in %s", self.args.clients_dir)
+            return 1
+
+        self.log.info("=" * 70)
+        self.log.info("WordPress Maintenance Run  |  ID: %s", self.run_id)
+        self.log.info("Mode: %s  |  Clients: %d files",
+                       "EXECUTE" if self.args.execute else "DRY-RUN", len(files))
+        self.log.info("=" * 70)
+
+        for path in files:
+            self._process_client_file(path)
+
+        self._write_summary()
+        self._print_final_report()
+
+        failures = [r for r in self.reports if r.overall in ("failed",)]
+        return 1 if failures else 0
+
+    # ------------------------------------------------------------------
+    # Client file handling (graceful on incomplete files)
+    # ------------------------------------------------------------------
+
+    def _gather_client_files(self) -> list[Path]:
+        if self.args.client_file:
+            p = Path(self.args.client_file).resolve()
+            if not p.exists():
+                self.log.error("Client file not found: %s", p)
+                return []
+            return [p]
+        return sorted(self.args.clients_dir.glob("*_cloudways.json"))
+
+    def _process_client_file(self, path: Path) -> None:
+        """
+        Load one client JSON, extract applications, and process each.
+        Incomplete or malformed files are logged and skipped — they never
+        crash the entire run.
+        """
+        self.log.info("-" * 50)
+        self.log.info("Loading client file: %s", path.name)
+
+        try:
+            doc = json.loads(path.read_text())
+        except json.JSONDecodeError as exc:
+            self.log.warning("SKIP  %s — invalid JSON: %s", path.name, exc)
+            return
+
+        # Validate required top-level fields
+        client_name = doc.get("client_name", "")
+        server_ip = doc.get("server_ip_address", "")
+        apps = doc.get("applications")
+
+        missing = []
+        if not client_name or client_name.startswith("["):
+            missing.append("client_name")
+        if not server_ip or server_ip.startswith("["):
+            missing.append("server_ip_address")
+        if not isinstance(apps, list) or not apps:
+            missing.append("applications")
+
+        if missing:
+            self.log.warning(
+                "SKIP  %s — incomplete (missing: %s)", path.name, ", ".join(missing)
+            )
+            return
+
+        for idx, app in enumerate(apps, 1):
+            try:
+                report = self._validate_app(doc, app, idx, path.name)
+            except InventoryError as exc:
+                self.log.warning(
+                    "SKIP  %s app #%d — %s", path.name, idx, exc
+                )
+                continue
+
+            self.reports.append(report)
+            self._process_site(report)
+
+    def _validate_app(
+        self, doc: dict, app: dict, idx: int, filename: str
+    ) -> SiteReport:
+        """
+        Validate a single application block and build a SiteReport.
+        Raises InventoryError on any missing or invalid field.
+        """
+        domain = app.get("website_domain", "")
+        wp_path = app.get("path_to_public_html", "")
+        sftp = app.get("sftp_credentials", {})
+        flags = app.get("environment_flags", {})
+
+        if not domain or domain.startswith("["):
+            raise InventoryError(f"missing website_domain")
+        if not VALID_PATH.match(wp_path):
+            raise InventoryError(f"invalid path_to_public_html: {wp_path!r}")
+        if not isinstance(sftp, dict):
+            raise InventoryError("sftp_credentials is not an object")
+        if not isinstance(flags, dict):
+            raise InventoryError("environment_flags is not an object")
+
+        master_creds = doc.get("master_credentials", {})
+
+        return SiteReport(
+            client=doc["client_name"],
+            domain=domain,
+            server_ip=doc["server_ip_address"],
+            wp_path=wp_path,
+            is_staging=bool(flags.get("is_staging", False)),
+            has_woocommerce=bool(flags.get("has_woocommerce", False)),
+            ssh_user=resolve(sftp.get("username"), self.env) or self._ssh_user,
+            ssh_password=resolve(sftp.get("password"), self.env) or self._app_pw,
+            ssh_key_path=resolve(sftp.get("ssh_key"), self.env) or self._ssh_key,
+            master_password=master_creds.get("password", ""),
+        )
+
+    # ------------------------------------------------------------------
+    # Per-site processing
+    # ------------------------------------------------------------------
+
+    def _process_site(self, r: SiteReport) -> None:
+        self.log.info(
+            "Processing  %s  |  %s  |  %s", r.client, r.domain, r.wp_path
+        )
+
+        # --- WooCommerce gate ---
+        if r.has_woocommerce and not self.args.include_woocommerce:
+            self.log.warning(
+                "⚠ WOOCOMMERCE — MANUAL REVIEW  |  %s  |  Skipped (use "
+                "--include-woocommerce to override)", r.domain
+            )
+            self._record_step(r, "woocommerce-gate", "skipped",
+                              "WooCommerce site — flagged for manual review")
+            r.overall = "skipped"
+            return
+
+        # --- Staging gate ---
+        if r.is_staging and self.args.skip_staging:
+            self.log.info("SKIP  %s — staging site", r.domain)
+            self._record_step(r, "staging-gate", "skipped", "staging site skipped")
+            r.overall = "skipped"
+            return
+
+        # Track current step so failures always report the exact point
+        current_step = "ssh-preflight"
+        try:
+            self._step_ssh_preflight(r)
+
+            current_step = "baseline"
+            self._step_collect_baseline(r)
+
+            current_step = "disk-check"
+            self._step_disk_check(r)
+
+            current_step = "backup"
+            self._step_backup(r)
+
+            if not self.args.execute:
+                r.overall = "dry-run"
+                self.log.info("DRY-RUN complete  |  %s", r.domain)
+                return
+
+            # --- WooCommerce maintenance mode ---
+            if r.has_woocommerce:
+                current_step = "woocommerce-maintenance-on"
+                self._wp(r, "maintenance-mode activate")
+                self.log.info("Maintenance mode ON  |  %s", r.domain)
+
+            current_step = "core-update"
+            self._step_update_core(r)
+
+            current_step = "theme-update"
+            self._step_update_themes(r)
+
+            current_step = "plugin-update"
+            self._step_update_plugins(r)
+
+            # --- Final verification ---
+            current_step = "final-verification"
+            self._verify(r)
+            self._record_step(r, "final-verification", "success",
+                              "site healthy after all updates")
+
+            # --- WooCommerce maintenance mode off ---
+            if r.has_woocommerce:
+                self._wp(r, "maintenance-mode deactivate")
+                self.log.info("Maintenance mode OFF  |  %s", r.domain)
+
+            r.overall = "success"
+            self.log.info("✓ SUCCESS  |  %s", r.domain)
+
+        except (SSHError, HealthCheckError) as exc:
+            # Use the tracked step name — falls back to last recorded step
+            r.failure_step = current_step
+            r.failure_detail = str(exc)
+            self.log.error(
+                "✗ FAILED  |  %s  |  step=%s  |  %s",
+                r.domain, r.failure_step, exc
+            )
+
+            if self.args.execute and r.backup_dir:
+                self._step_rollback(r)
+            else:
+                r.overall = "failed"
+
+    # ------------------------------------------------------------------
+    # Step: SSH preflight
+    # ------------------------------------------------------------------
+
+    def _step_ssh_preflight(self, r: SiteReport) -> None:
+        t0 = ts()
+        self._ssh(r, "echo 'ssh-ok'")
+        self._wp(r, "core is-installed")
+        self._record_step(r, "ssh-preflight", "success",
+                          f"SSH reachable at {r.server_ip}", t0)
+
+    # ------------------------------------------------------------------
+    # Step: Baseline collection
+    # ------------------------------------------------------------------
+
+    def _step_collect_baseline(self, r: SiteReport) -> None:
+        t0 = ts()
+
+        plugins = self._wp_json(r, "plugin list --format=json")
+        themes = self._wp_json(r, "theme list --format=json")
+        core_updates = self._wp_json(r, "core check-update --format=json",
+                                     allow_empty=True)
+
+        r.baseline = {
+            "wp_version": self._wp_text(r, "core version"),
+            "php_version": self._wp_text(r, "eval 'echo PHP_VERSION;'"),
+            "siteurl": self._wp_text(r, "option get siteurl"),
+            "plugins": plugins,
+            "themes": themes,
+            "core_updates": core_updates,
+            "plugin_updates": [p for p in plugins if p.get("update") == "available"],
+            "theme_updates": [t for t in themes if t.get("update") == "available"],
+        }
+
+        self._record_step(
+            r, "baseline", "success",
+            f"WP {r.baseline['wp_version']}  |  "
+            f"{len(r.baseline['plugin_updates'])} plugin updates  |  "
+            f"{len(r.baseline['theme_updates'])} theme updates",
+            t0,
+        )
+
+    # ------------------------------------------------------------------
+    # Step: Pre-flight backup
+    #
+    # Backups go to /home/master/wp-maintenance-backups/ which is
+    # persistent storage on Cloudways servers (not /tmp/ which can be
+    # wiped on reboot or by cron).
+    # ------------------------------------------------------------------
+
+    def _step_disk_check(self, r: SiteReport) -> None:
+        """
+        Check available disk space and estimate backup size BEFORE writing
+        anything.  A WordPress backup needs room for:
+          - A compressed tar of public_html
+          - A full SQL dump of the database
+        We estimate the backup at ~50% of public_html size (tar.gz compression)
+        plus a generous margin.  If available space is less than 2x the
+        estimated backup size, we abort — filling a disk on a shared Cloudways
+        server could take down every app on that instance.
+
+        This check runs in both dry-run and execute mode so the operator
+        always sees the disk health.
+        """
+        t0 = ts()
+
+        # du -sb = total bytes of public_html
+        # df -B1 = available bytes on the partition
+        check_script = f"""\
+du_bytes=$(du -sb {shlex.quote(r.wp_path)} 2>/dev/null | awk '{{print $1}}')
+avail_bytes=$(df -B1 {shlex.quote(r.wp_path)} 2>/dev/null | awk 'NR==2{{print $4}}')
+echo "${{du_bytes:-0}} ${{avail_bytes:-0}}"
+"""
+        raw = self._ssh(r, check_script).strip()
+        parts = raw.split()
+        if len(parts) != 2:
+            self._record_step(r, "disk-check", "success",
+                              f"could not parse disk info (raw={raw!r}), proceeding", t0)
+            return
+
+        try:
+            site_bytes = int(parts[0])
+            avail_bytes = int(parts[1])
+        except ValueError:
+            self._record_step(r, "disk-check", "success",
+                              f"could not parse disk info (raw={raw!r}), proceeding", t0)
+            return
+
+        site_mb = site_bytes / (1024 * 1024)
+        avail_mb = avail_bytes / (1024 * 1024)
+        # Estimate: compressed tar ≈ 50% of original + SQL dump ≈ 10% of original
+        est_backup_mb = site_mb * 0.6
+        # Require at least 2x the estimated backup size as headroom
+        required_mb = est_backup_mb * 2
+
+        r.baseline["disk"] = {
+            "site_mb": round(site_mb, 1),
+            "available_mb": round(avail_mb, 1),
+            "estimated_backup_mb": round(est_backup_mb, 1),
+        }
+
+        if avail_mb < required_mb:
+            detail = (
+                f"INSUFFICIENT DISK — site={site_mb:.0f}MB, "
+                f"available={avail_mb:.0f}MB, need≥{required_mb:.0f}MB"
+            )
+            self.log.error("⚠ %s  |  %s", detail, r.domain)
+            self._record_step(r, "disk-check", "failed", detail, t0)
+            raise HealthCheckError(detail)
+
+        detail = (
+            f"site={site_mb:.0f}MB, available={avail_mb:.0f}MB, "
+            f"est_backup={est_backup_mb:.0f}MB — OK"
+        )
+        self._record_step(r, "disk-check", "success", detail, t0)
+
+    def _step_backup(self, r: SiteReport) -> None:
+        t0 = ts()
+
+        # Extract the application hash from the path:
+        # /home/master/applications/<hash>/public_html → <hash>
+        app_hash = r.wp_path.split("/")[-2]
+        backup_dir = (
+            f"/home/master/wp-maintenance-backups"
+            f"/{slugify(r.client)}/{app_hash}/{self.run_id}"
+        )
+        r.backup_dir = backup_dir
+
+        if not self.args.execute:
+            self._record_step(r, "backup", "planned",
+                              f"would create backup at {backup_dir}", t0)
+            return
+
+        # The backup script is piped via stdin to avoid quoting issues.
+        # It creates:
+        #   preflight.sql       — full DB dump with DROP TABLE statements
+        #   public_html.tar.gz  — compressed snapshot of the entire app
+        #   plugins.json        — plugin inventory at backup time
+        #   themes.json         — theme inventory at backup time
+        script = f"""\
+set -euo pipefail
+cd {shlex.quote(r.wp_path)}
+mkdir -p {shlex.quote(backup_dir)}
+wp --path={shlex.quote(r.wp_path)} db export {shlex.quote(backup_dir + '/preflight.sql')} --add-drop-table 2>&1
+wp --path={shlex.quote(r.wp_path)} plugin list --format=json > {shlex.quote(backup_dir + '/plugins.json')} 2>&1
+wp --path={shlex.quote(r.wp_path)} theme list --format=json > {shlex.quote(backup_dir + '/themes.json')} 2>&1
+tar -czf {shlex.quote(backup_dir + '/public_html.tar.gz')} -C {shlex.quote(r.wp_path)} . 2>&1
+# Verify both backup files are non-empty
+test -s {shlex.quote(backup_dir + '/preflight.sql')}
+test -s {shlex.quote(backup_dir + '/public_html.tar.gz')}
+echo 'backup-ok'
+"""
+        self._ssh(r, script, timeout=self.args.remote_timeout)
+        self._record_step(r, "backup", "success",
+                          f"backup at {backup_dir}", t0)
+
+    # ------------------------------------------------------------------
+    # Step: Update WordPress core
+    # ------------------------------------------------------------------
+
+    def _step_update_core(self, r: SiteReport) -> None:
+        if not r.baseline.get("core_updates"):
+            self._record_step(r, "core-update", "success",
+                              "no core updates pending")
+            return
+
+        t0 = ts()
+        self._wp(r, "core update", timeout=self.args.remote_timeout)
+        self._wp(r, "core update-db", timeout=self.args.remote_timeout)
+        self._verify(r)
+        self._record_step(r, "core-update", "success",
+                          "core updated and verified", t0)
+
+    # ------------------------------------------------------------------
+    # Step: Update themes (sequential, one-by-one)
+    # ------------------------------------------------------------------
+
+    def _step_update_themes(self, r: SiteReport) -> None:
+        updates = r.baseline.get("theme_updates", [])
+        if not updates:
+            self._record_step(r, "theme-update", "success",
+                              "no theme updates pending")
+            return
+
+        for theme in updates:
+            slug = theme.get("name", "").strip()
+            if not slug:
+                continue
+            step = f"theme-update:{slug}"
+            t0 = ts()
+            self._wp(r, f"theme update {shlex.quote(slug)}",
+                      timeout=self.args.remote_timeout)
+            self._verify(r)
+            self._record_step(r, step, "success",
+                              f"{slug} updated and verified", t0)
+
+    # ------------------------------------------------------------------
+    # Step: Update plugins (atomic — one at a time with verification)
+    #
+    # This is the most critical section.  Plugins are the #1 cause of
+    # site breakage during WordPress maintenance.  Each plugin is updated
+    # individually, and the site is health-checked after each one.  If
+    # any single plugin breaks the site, we know EXACTLY which one did
+    # it, and we can rollback before touching the rest.
+    # ------------------------------------------------------------------
+
+    def _step_update_plugins(self, r: SiteReport) -> None:
+        updates = r.baseline.get("plugin_updates", [])
+        if not updates:
+            self._record_step(r, "plugin-update", "success",
+                              "no plugin updates pending")
+            return
+
+        for plugin in updates:
+            slug = plugin.get("name", "").strip()
+            ver_from = plugin.get("version", "?")
+            ver_to = plugin.get("update_version", "?")
+            if not slug:
+                continue
+
+            step = f"plugin-update:{slug}"
+            t0 = ts()
+            self.log.info(
+                "  Updating plugin  %s  (%s → %s)  |  %s",
+                slug, ver_from, ver_to, r.domain,
+            )
+
+            try:
+                self._wp(r, f"plugin update {shlex.quote(slug)}",
+                          timeout=self.args.remote_timeout)
+                self._verify(r)
+            except (SSHError, HealthCheckError) as exc:
+                self._record_step(r, step, "failed",
+                                  f"{slug} {ver_from}→{ver_to} FAILED: {exc}", t0)
+                raise  # Propagates to _process_site which triggers rollback
+
+            self._record_step(r, step, "success",
+                              f"{slug} {ver_from}→{ver_to}", t0)
+
+    # ------------------------------------------------------------------
+    # Rollback
+    #
+    # Restore sequence:
+    #   1. Archive the failed state (for post-mortem analysis)
+    #   2. Wipe public_html contents
+    #   3. Extract the pre-flight tar over public_html
+    #   4. Import the pre-flight database dump
+    #   5. Verify the site is back to healthy
+    #
+    # If any of these steps fail, the rollback is marked as failed and
+    # the operator must intervene manually.  The backup files remain on
+    # disk for manual recovery.
+    # ------------------------------------------------------------------
+
+    def _step_rollback(self, r: SiteReport) -> None:
+        t0 = ts()
+        self.log.warning("ROLLING BACK  |  %s  |  from %s", r.domain, r.backup_dir)
+
+        db_backup = f"{r.backup_dir}/preflight.sql"
+        fs_backup = f"{r.backup_dir}/public_html.tar.gz"
+        failed_snapshot = f"{r.backup_dir}/failed-state.tar.gz"
+
+        script = f"""\
+set -euo pipefail
+# 1. Archive the broken state for forensic analysis
+tar -czf {shlex.quote(failed_snapshot)} -C {shlex.quote(r.wp_path)} . 2>/dev/null || true
+# 2. Wipe current public_html contents
+find {shlex.quote(r.wp_path)} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} +
+# 3. Restore filesystem from pre-flight backup
+tar -xzf {shlex.quote(fs_backup)} -C {shlex.quote(r.wp_path)}
+# 4. Restore database from pre-flight dump
+wp --path={shlex.quote(r.wp_path)} db import {shlex.quote(db_backup)} 2>&1
+echo 'rollback-ok'
+"""
+        try:
+            self._ssh(r, script, timeout=self.args.remote_timeout)
+            self._verify(r)
+            # Deactivate maintenance mode if it was on
+            if r.has_woocommerce:
+                try:
+                    self._wp(r, "maintenance-mode deactivate")
+                except SSHError:
+                    pass  # Best-effort
+            r.rollback_result = "success"
+            r.overall = "rolled-back"
+            self._record_step(r, "rollback", "success",
+                              f"restored from {r.backup_dir}", t0)
+            self.log.warning("ROLLBACK OK  |  %s", r.domain)
+        except (SSHError, HealthCheckError) as exc:
+            r.rollback_result = f"FAILED: {exc}"
+            r.overall = "failed"
+            self._record_step(r, "rollback", "failed", str(exc), t0)
+            self.log.error(
+                "⚠ ROLLBACK FAILED  |  %s  |  %s  |  Manual recovery needed "
+                "from %s", r.domain, exc, r.backup_dir
+            )
+
+    # ------------------------------------------------------------------
+    # Verification
+    #
+    # Two-layer check after every update step:
+    #   1. WP-CLI: `wp core is-installed` — catches fatal PHP errors
+    #   2. HTTP: GET the site + /wp-login.php — catches 5xx and crash
+    #      markers in the response body
+    # ------------------------------------------------------------------
+
+    def _verify(self, r: SiteReport) -> None:
+        """Raise HealthCheckError if the site is unhealthy."""
+        # Layer 1: WP-CLI sanity
+        self._wp(r, "core is-installed")
+
+        # Layer 2: HTTP health
+        result = self._http_check(r.domain)
+        if result != "ok":
+            raise HealthCheckError(result)
+
+    def _http_check(self, domain: str) -> str:
+        """
+        Hit the site over HTTPS (fallback to HTTP) and check for 5xx
+        status codes or fatal error markers in the response body.
+        Returns "ok" or a description of the problem.
+        """
+        schemes = (
+            [domain] if domain.startswith(("http://", "https://"))
+            else [f"https://{domain}", f"http://{domain}"]
+        )
+        last_err = "all HTTP checks failed"
+
+        for base in schemes:
+            for suffix in ("", "/wp-login.php"):
+                url = f"{base}{suffix}"
+                try:
+                    req = urlrequest.Request(
+                        url, headers={"User-Agent": "wp-update/1.0 (maintenance)"}
+                    )
+                    with urlrequest.urlopen(
+                        req, timeout=self.args.http_timeout, context=self._ssl_ctx
+                    ) as resp:
+                        if resp.status >= 500:
+                            return f"{url} → HTTP {resp.status}"
+                        body = resp.read(65536).decode("utf-8", errors="ignore").lower()
+                        for marker in FATAL_MARKERS:
+                            if marker in body:
+                                return f"{url} → fatal marker: {marker!r}"
+                except urlerror.HTTPError as exc:
+                    if exc.code >= 500:
+                        return f"{url} → HTTP {exc.code}"
+                    # 3xx/4xx are not fatal — continue checking
+                    continue
+                except Exception as exc:
+                    last_err = f"{url} → {exc}"
+                    break
+            else:
+                return "ok"
+
+        return last_err
+
+    # ------------------------------------------------------------------
+    # SSH transport
+    #
+    # Scripts are piped via stdin to avoid SSH argument quoting bugs.
+    # The remote command is always `bash -ls`:
+    #   -l  login shell (loads .bashrc / .profile where wp-cli lives)
+    #   -s  read commands from stdin
+    #
+    # Authentication priority:
+    #   1. SSH key (if path exists on disk)
+    #   2. sshpass + password (if sshpass is installed)
+    #   3. Error
+    # ------------------------------------------------------------------
+
+    def _ssh(self, r: SiteReport, script: str, timeout: int | None = None) -> str:
+        """Execute a script on the remote host via SSH stdin piping."""
+        target = f"{r.ssh_user}@{r.server_ip}"
+        cmd = self._ssh_cmd(r)
+        effective_timeout = timeout or self.args.remote_timeout
+
+        self.log.debug("SSH → %s  |  %s", target, script.replace("\n", " \\n "))
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                input=script,
+                capture_output=True,
+                text=True,
+                timeout=effective_timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            raise SSHError(f"SSH timeout ({effective_timeout}s) on {target}")
+
+        stdout = proc.stdout.strip()
+        stderr = proc.stderr.strip()
+
+        if stdout:
+            self.log.debug("SSH ← stdout  |  %s  |  %s", target, stdout[:500])
+        if stderr:
+            self.log.debug("SSH ← stderr  |  %s  |  %s", target, stderr[:500])
+
+        if proc.returncode != 0:
+            raise SSHError(
+                f"exit={proc.returncode} on {target}: "
+                f"{stderr or stdout or 'no output'}"
+            )
+        return stdout
+
+    def _ssh_cmd(self, r: SiteReport) -> list[str]:
+        """Build the SSH command list. Script is delivered via stdin."""
+        target = f"{r.ssh_user}@{r.server_ip}"
+        common_opts = [
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", f"ConnectTimeout={self.args.connect_timeout}",
+            "-o", "BatchMode=yes",
+        ]
+
+        # Try SSH key first
+        key_path = Path(r.ssh_key_path).expanduser() if r.ssh_key_path else None
+        if key_path and key_path.exists():
+            return ["ssh", *common_opts, "-i", str(key_path), target, "bash", "-ls"]
+
+        # Fallback to sshpass + password
+        if r.ssh_password and shutil.which("sshpass"):
+            # Remove BatchMode for password auth
+            pw_opts = [
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", f"ConnectTimeout={self.args.connect_timeout}",
+            ]
+            return [
+                "sshpass", "-p", r.ssh_password,
+                "ssh", *pw_opts, target, "bash", "-ls",
+            ]
+
+        raise SSHError(
+            f"No SSH auth method for {target}. "
+            "Set SSH_KEY in .env or install sshpass for password fallback."
+        )
+
+    def _wp(self, r: SiteReport, wp_cmd: str, timeout: int | None = None) -> str:
+        """Run a wp-cli command on the remote host.
+
+        Cloudways wp-config.php files use `require('wp-salt.php')` with a
+        relative path, so PHP resolves it against the CWD — not the directory
+        where wp-config.php lives.  We must `cd` into the WordPress root
+        before invoking wp-cli, otherwise the require fails.
+        """
+        script = f"cd {shlex.quote(r.wp_path)} && wp --path={shlex.quote(r.wp_path)} {wp_cmd}"
+        return self._ssh(r, script, timeout)
+
+    def _wp_text(self, r: SiteReport, wp_cmd: str) -> str:
+        return self._wp(r, wp_cmd).strip()
+
+    def _wp_json(self, r: SiteReport, wp_cmd: str,
+                 allow_empty: bool = False) -> list[dict]:
+        raw = self._wp(r, wp_cmd).strip()
+        if not raw:
+            if allow_empty:
+                return []
+            raise SSHError(f"Empty output from: wp {wp_cmd}")
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise SSHError(f"Bad JSON from `wp {wp_cmd}`: {exc}") from exc
+
+    # ------------------------------------------------------------------
+    # Step recording
+    # ------------------------------------------------------------------
+
+    def _record_step(self, r: SiteReport, name: str, status: str,
+                     detail: str, started: str | None = None) -> None:
+        r.steps.append(StepResult(
+            name=name, status=status,
+            started=started or ts(), ended=ts(), detail=detail,
+        ))
+
+    # ------------------------------------------------------------------
+    # Summary output — credentials are NEVER written to disk
+    # ------------------------------------------------------------------
+
+    def _write_summary(self) -> None:
+        summary = {
+            "run_id": self.run_id,
+            "mode": "execute" if self.args.execute else "dry-run",
+            "generated_at": ts(),
+            "total_sites": len(self.reports),
+            "results": {
+                "success": len([r for r in self.reports if r.overall == "success"]),
+                "dry_run": len([r for r in self.reports if r.overall == "dry-run"]),
+                "skipped": len([r for r in self.reports if r.overall == "skipped"]),
+                "rolled_back": len([r for r in self.reports if r.overall == "rolled-back"]),
+                "failed": len([r for r in self.reports if r.overall == "failed"]),
+            },
+            "sites": [r.to_dict() for r in self.reports],
+        }
+
+        path = self.args.log_dir / f"wp-update-summary-{self.run_id}.json"
+        path.write_text(json.dumps(summary, indent=2) + "\n")
+        self.log.info("Summary written to %s", path)
+
+    def _print_final_report(self) -> None:
+        self.log.info("=" * 70)
+        self.log.info("FINAL REPORT")
+        self.log.info("=" * 70)
+
+        for r in self.reports:
+            icon = {
+                "success": "✓",
+                "dry-run": "◇",
+                "skipped": "–",
+                "rolled-back": "↺",
+                "failed": "✗",
+                "pending": "?",
+            }.get(r.overall, "?")
+
+            extra = ""
+            if r.overall == "skipped" and r.has_woocommerce:
+                extra = "  [WooCommerce — manual review]"
+            elif r.overall in ("failed", "rolled-back"):
+                extra = f"  [failed at: {r.failure_step}]"
+
+            self.log.info(
+                "  %s  %-8s  %-25s  %s%s",
+                icon, r.overall.upper(), r.client, r.domain, extra,
+            )
+
+        self.log.info("=" * 70)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_cli() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description=(
+            "Safely update WordPress core, themes, and plugins across "
+            "Cloudways client sites.  Dry-run by default."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    p.add_argument(
+        "--execute", action="store_true",
+        help="Perform live updates. Without this flag, the script only "
+             "collects baselines and plans backups.",
+    )
+    p.add_argument(
+        "--env-file", type=Path, default=DEFAULT_ENV,
+        help=f"Path to .env file (default: {DEFAULT_ENV})",
+    )
+    p.add_argument(
+        "--clients-dir", type=Path, default=DEFAULT_CLIENTS,
+        help=f"Directory with *_cloudways.json files (default: {DEFAULT_CLIENTS})",
+    )
+    p.add_argument(
+        "--client-file", type=Path, default=None,
+        help="Process a single client JSON file instead of all.",
+    )
+    p.add_argument(
+        "--log-dir", type=Path, default=DEFAULT_LOGS,
+        help=f"Directory for logs and summaries (default: {DEFAULT_LOGS})",
+    )
+    p.add_argument(
+        "--include-woocommerce", action="store_true",
+        help="Include WooCommerce sites (normally skipped for manual review).",
+    )
+    p.add_argument(
+        "--skip-staging", action="store_true",
+        help="Skip sites with is_staging=true.",
+    )
+    p.add_argument(
+        "--skip-ssl-verify", action="store_true",
+        help="Disable SSL certificate verification for HTTP health checks.",
+    )
+    p.add_argument(
+        "--connect-timeout", type=int, default=20,
+        help="SSH connection timeout in seconds (default: 20).",
+    )
+    p.add_argument(
+        "--remote-timeout", type=int, default=600,
+        help="Per-command remote execution timeout in seconds (default: 600).",
+    )
+    p.add_argument(
+        "--http-timeout", type=int, default=20,
+        help="HTTP health check timeout in seconds (default: 20).",
+    )
+    return p.parse_args()
+
+
+def main() -> int:
+    args = build_cli()
+    updater = WPUpdater(args)
+    return updater.run()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
