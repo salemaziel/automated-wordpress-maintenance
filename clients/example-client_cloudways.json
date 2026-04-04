@@ -1,0 +1,25 @@
+{
+  "client_name": "[Extracted Client Name]",
+  "email": "[Extracted Email Address]",
+  "server_ip_address": "[Extracted IP Address]",
+  "master_credentials": {
+    "username": "[Extracted Master Username]",
+    "password": "[Extracted Master Password]"
+  },
+  "applications": [
+    {
+      "website_domain": "[Extracted Domain Name]",
+      "path_to_public_html": "/home/master/applications/[EXTRACTED_DIRECTORY]/public_html",
+      "sftp_credentials": {
+        "username": "$SSH_USER",
+        "password": "$APP_PW",
+        "ssh_key": "$SSH_KEY"
+      },
+      "environment_flags": {
+        "wp_cli_installed": true,
+        "is_staging": [true/false],
+        "has_woocommerce": [true/false]
+      }
+    }
+  ]
+}

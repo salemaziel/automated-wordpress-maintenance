@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 wp_update.py — Production-grade WordPress maintenance automation for Cloudways.
-Written by Claude.
 
 Safely updates WordPress core, themes, and plugins across multiple client sites
 hosted on Cloudways. Prioritises zero-downtime and rapid rollback.
@@ -81,10 +80,10 @@ from urllib import request as urlrequest
 # Constants
 # ---------------------------------------------------------------------------
 
-ROOT = Path(__file__).resolve().parent.parent          # todds-clients-cloudways/
-DEFAULT_ENV = ROOT / ".env"
-DEFAULT_CLIENTS = ROOT / "clients"
-DEFAULT_LOGS = ROOT / "logs"
+SCRIPT_DIR = Path(__file__).resolve().parent            # automated-wordpress-maintenance/
+DEFAULT_ENV = SCRIPT_DIR / ".env"
+DEFAULT_CLIENTS = SCRIPT_DIR / "clients"
+DEFAULT_LOGS = SCRIPT_DIR / "logs"
 
 # Cloudways apps always live under /home/master/applications/<hash>/public_html
 VALID_PATH = re.compile(r"^/home/master/applications/[A-Za-z0-9_-]+/public_html$")
