@@ -33,6 +33,9 @@ For each application listed in the client inventory, the script:
 | Path | Purpose |
 |------|---------|
 | `wp_update.py` | The entire maintenance CLI and orchestration logic |
+| `pyproject.toml` | Configuration for `pytest` and `ruff` |
+| `requirements-dev.txt` | Development dependencies for linting and tests |
+| `tests/test_wp_update.py` | Unit tests for helper logic and core non-network behavior |
 | `.env.example` | Example local environment file for SSH credentials |
 | `clients/example-client_cloudways.json` | Example client inventory file |
 | `.github/copilot-instructions.md` | Repository-specific guidance for future Copilot sessions |
@@ -47,7 +50,7 @@ For each application listed in the client inventory, the script:
 - Network access to target site domains for post-update HTTP health checks
 - Optional: `sshpass` if password-based fallback auth is required
 
-This project has no checked-in Python package dependencies; it uses the standard library.
+This project has no checked-in runtime Python package dependencies; it uses the standard library. Development tooling lives in `requirements-dev.txt`.
 
 ### Remote environment
 
@@ -327,7 +330,14 @@ The score is influenced by factors such as pending plugin/theme/core updates, di
 
 ## Development and maintenance
 
-This repository does not include a build system, test suite, or linter. The most relevant local checks are:
+Set up a local virtual environment before running lint or tests:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt
+```
+
+The most relevant local checks are:
 
 ```bash
 # Syntax check
@@ -335,6 +345,15 @@ python3 -m py_compile wp_update.py
 
 # Inspect CLI changes
 python3 wp_update.py --help
+
+# Lint
+.venv/bin/python -m ruff check .
+
+# Run all tests
+.venv/bin/python -m pytest
+
+# Run one test
+.venv/bin/python -m pytest tests/test_wp_update.py::test_validate_app_resolves_placeholders_from_env
 ```
 
 ## Common gotchas
@@ -344,4 +363,4 @@ python3 wp_update.py --help
 - The remote WordPress path must be the Cloudways `public_html` path, not a parent directory
 - Health checks hit both the site root and `/wp-login.php`, so firewall, DNS, or certificate issues can fail verification even if SSH succeeds
 - `wp-cli` must be available in the remote login shell because the script runs remote commands with `bash -ls`
-
+- On systems with PEP 668 enabled, install dev tooling into `.venv` instead of the system Python

@@ -492,7 +492,7 @@ class WPUpdater:
         flags = app.get("environment_flags", {})
 
         if not domain or domain.startswith("["):
-            raise InventoryError(f"missing website_domain")
+            raise InventoryError("missing website_domain")
         if not VALID_PATH.match(wp_path):
             raise InventoryError(f"invalid path_to_public_html: {wp_path!r}")
         if not isinstance(sftp, dict):
@@ -682,8 +682,8 @@ class WPUpdater:
             )
         if not shutil.which("sshpass"):
             raise SSHError(
-                f"Key auth failed — master password fallback requires "
-                f"sshpass but it's not installed"
+                "Key auth failed — master password fallback requires "
+                "sshpass but it's not installed"
             )
 
         self.log.info(
@@ -1454,7 +1454,6 @@ echo 'rollback-ok'
 
     def _print_site_execution_report(self, r: SiteReport) -> None:
         """Print a short summary of what was done on this site after execution."""
-        b = r.baseline
         L = self.log.info
 
         L("")

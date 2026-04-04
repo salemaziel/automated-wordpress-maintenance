@@ -2,14 +2,27 @@
 
 ## Commands
 
-This repository is a single-file Python CLI. There is no checked-in build system, test suite, or linter.
+This repository is a single-file Python CLI with lightweight local tooling for linting and tests.
 
 ```bash
+# Create a local dev environment for linting/tests
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt
+
 # Syntax check
 python3 -m py_compile wp_update.py
 
 # Inspect the CLI and defaults
 python3 wp_update.py --help
+
+# Lint
+.venv/bin/python -m ruff check .
+
+# Run the full test suite
+.venv/bin/python -m pytest
+
+# Run a single test
+.venv/bin/python -m pytest tests/test_wp_update.py::test_validate_app_resolves_placeholders_from_env
 
 # Dry-run a single inventory file from this checkout
 python3 wp_update.py --client-file clients/example-client_cloudways.json
