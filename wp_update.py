@@ -60,6 +60,7 @@ Rollback mechanism:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import os
@@ -71,7 +72,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib import error as urlerror
@@ -241,7 +242,7 @@ class RollbackFailed(RuntimeError):
 
 def ts() -> str:
     """Current UTC timestamp in ISO-8601."""
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -340,7 +341,7 @@ class WPUpdater:
 
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
-        self.run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        self.run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         self.env = load_env(args.env_file)
         self.log = make_logger(args.log_dir, self.run_id, stream=args.stream)
         self.reports: list[SiteReport] = []
@@ -968,10 +969,8 @@ echo 'backup-ok'
         self._verify(r)
         # Refresh baseline so summaries report the post-update version.
         # A transient read failure here shouldn't undo a successful update.
-        try:
+        with contextlib.suppress(SSHError):
             r.baseline["wp_version"] = self._wp_text(r, "core version")
-        except SSHError:
-            pass
         self._record_step(r, "core-update", "success",
                           f"core {old_version} → {r.baseline.get('wp_version', '?')}", t0)
 
@@ -1103,12 +1102,10 @@ echo 'rollback-ok'
             if r.auth_method in ("master", "master-key") and r.original_owner:
                 self._step_restore_ownership(r)
             self._verify(r)
-            # Deactivate maintenance mode if it was on
+            # Deactivate maintenance mode if it was on (best-effort).
             if r.has_woocommerce:
-                try:
+                with contextlib.suppress(SSHError):
                     self._wp(r, "maintenance-mode deactivate")
-                except SSHError:
-                    pass  # Best-effort
             r.rollback_result = "success"
             r.overall = "rolled-back"
             self._record_step(r, "rollback", "success",
