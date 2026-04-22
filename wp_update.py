@@ -69,6 +69,7 @@ import shutil
 import ssl
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -326,18 +327,16 @@ class WPUpdater:
         self._app_pw = self.env.get("APP_PW", "")
 
         # SSL context for HTTP verification
+        self._ssl_ctx = ssl.create_default_context()
         if args.skip_ssl_verify:
-            self._ssl_ctx = ssl.create_default_context()
             self._ssl_ctx.check_hostname = False
             self._ssl_ctx.verify_mode = ssl.CERT_NONE
-        else:
-            self._ssl_ctx = ssl.create_default_context()
 
-        # Pre-flight validation
+        # Pre-flight validation. load_env already expands ~ in SSH_KEY.
         if args.execute and not self._ssh_user:
             self.log.error("SSH_USER is required in .env for --execute mode")
             raise SystemExit(1)
-        key_path = Path(self._ssh_key).expanduser() if self._ssh_key else None
+        key_path = Path(self._ssh_key) if self._ssh_key else None
         if key_path and not key_path.exists():
             self.log.error("SSH_KEY points to missing file: %s", key_path)
             raise SystemExit(1)
@@ -453,31 +452,46 @@ class WPUpdater:
             if (self.args.execute
                     and report.is_staging
                     and report.overall in ("failed", "rolled-back")):
-                remaining_prod = [
-                    v for v in validated
-                    if not v[2].is_staging and v[2] not in
-                    [r for r in self.reports]
-                ]
-                if remaining_prod:
-                    self.log.warning(
-                        "⚠ Staging site %s %s — skipping %d production "
-                        "site(s) on this server",
-                        report.domain, report.overall,
-                        len(remaining_prod),
-                    )
-                    for _, _, prod_report in remaining_prod:
-                        prod_report.overall = "skipped"
-                        prod_report.failure_detail = (
-                            f"Skipped: staging site {report.domain} "
-                            f"{report.overall}"
-                        )
-                        self._record_step(
-                            prod_report, "staging-gate", "skipped",
-                            f"staging {report.domain} {report.overall} — "
-                            "not safe to proceed",
-                        )
-                        self.reports.append(prod_report)
-                    break  # Stop processing this client file
+                self._skip_remaining_production(validated, report)
+                break  # Stop processing this client file
+
+    def _skip_remaining_production(
+        self,
+        validated: list[tuple[int, dict, SiteReport]],
+        failed_staging: SiteReport,
+    ) -> None:
+        """Mark every production SiteReport in `validated` that has not yet
+        been processed as 'skipped' and append it to self.reports.
+
+        Identity-based set difference (id()) makes the not-yet-processed
+        check obviously correct and rules out double-appending if logic
+        elsewhere changes which reports are recorded.
+        """
+        processed = {id(r) for r in self.reports}
+        remaining_prod = [
+            (i, a, rpt) for i, a, rpt in validated
+            if not rpt.is_staging and id(rpt) not in processed
+        ]
+        if not remaining_prod:
+            return
+
+        self.log.warning(
+            "⚠ Staging site %s %s — skipping %d production site(s) on this "
+            "server",
+            failed_staging.domain, failed_staging.overall, len(remaining_prod),
+        )
+        for _, _, prod_report in remaining_prod:
+            prod_report.overall = "skipped"
+            prod_report.failure_detail = (
+                f"Skipped: staging site {failed_staging.domain} "
+                f"{failed_staging.overall}"
+            )
+            self._record_step(
+                prod_report, "staging-gate", "skipped",
+                f"staging {failed_staging.domain} {failed_staging.overall} — "
+                "not safe to proceed",
+            )
+            self.reports.append(prod_report)
 
     def _validate_app(
         self, doc: dict, app: dict, idx: int, filename: str
@@ -604,6 +618,10 @@ class WPUpdater:
             r.overall = "success"
             self.log.info("✓ SUCCESS  |  %s", r.domain)
 
+        except RollbackFailed:
+            # Rollback machinery already recorded the failure on r; bubble
+            # up so the operator is forced to look at it.
+            raise
         except (SSHError, HealthCheckError) as exc:
             # Use the tracked step name — falls back to last recorded step
             r.failure_step = current_step
@@ -613,6 +631,23 @@ class WPUpdater:
                 r.domain, r.failure_step, exc
             )
 
+            if self.args.execute and r.backup_dir:
+                self._step_rollback(r)
+            else:
+                r.overall = "failed"
+        except (OSError, subprocess.SubprocessError) as exc:
+            # Operational failure outside the typed-exception hierarchy —
+            # transient DNS, disk full, broken pipe, subprocess crash, etc.
+            # Don't let one site's environmental hiccup tear down the whole
+            # run. Programming bugs (TypeError, AttributeError, KeyError, …)
+            # are deliberately NOT caught here — they should fast-fail so
+            # they're noticed and fixed.
+            r.failure_step = current_step
+            r.failure_detail = f"unexpected {type(exc).__name__}: {exc}"
+            self.log.exception(
+                "✗ UNEXPECTED  |  %s  |  step=%s  |  %s",
+                r.domain, r.failure_step, exc,
+            )
             if self.args.execute and r.backup_dir:
                 self._step_rollback(r)
             else:
@@ -817,15 +852,8 @@ avail_bytes=$(df -B1 {shlex.quote(r.wp_path)} 2>/dev/null | awk 'NR==2{{print $4
 echo "${{du_bytes:-0}} ${{avail_bytes:-0}}"
 """
         raw = self._ssh(r, check_script).strip()
-        parts = raw.split()
-        if len(parts) != 2:
-            self._record_step(r, "disk-check", "success",
-                              f"could not parse disk info (raw={raw!r}), proceeding", t0)
-            return
-
         try:
-            site_bytes = int(parts[0])
-            avail_bytes = int(parts[1])
+            site_bytes, avail_bytes = (int(p) for p in raw.split())
         except ValueError:
             self._record_step(r, "disk-check", "success",
                               f"could not parse disk info (raw={raw!r}), proceeding", t0)
@@ -910,11 +938,18 @@ echo 'backup-ok'
             return
 
         t0 = ts()
+        old_version = r.baseline.get("wp_version", "?")
         self._wp(r, "core update", timeout=self.args.remote_timeout)
         self._wp(r, "core update-db", timeout=self.args.remote_timeout)
         self._verify(r)
+        # Refresh baseline so summaries report the post-update version.
+        # A transient read failure here shouldn't undo a successful update.
+        try:
+            r.baseline["wp_version"] = self._wp_text(r, "core version")
+        except SSHError:
+            pass
         self._record_step(r, "core-update", "success",
-                          "core updated and verified", t0)
+                          f"core {old_version} → {r.baseline.get('wp_version', '?')}", t0)
 
     # ------------------------------------------------------------------
     # Step: Update themes (sequential, one-by-one)
@@ -929,15 +964,22 @@ echo 'backup-ok'
 
         for theme in updates:
             slug = theme.get("name", "").strip()
+            ver_from = theme.get("version", "?")
+            ver_to = theme.get("update_version", "?")
             if not slug:
                 continue
             step = f"theme-update:{slug}"
             t0 = ts()
-            self._wp(r, f"theme update {shlex.quote(slug)}",
-                      timeout=self.args.remote_timeout)
-            self._verify(r)
+            try:
+                self._wp(r, f"theme update {shlex.quote(slug)}",
+                         timeout=self.args.remote_timeout)
+                self._verify(r)
+            except (SSHError, HealthCheckError) as exc:
+                self._record_step(r, step, "failed",
+                                  f"{slug} {ver_from}→{ver_to} FAILED: {exc}", t0)
+                raise
             self._record_step(r, step, "success",
-                              f"{slug} updated and verified", t0)
+                              f"{slug} {ver_from}→{ver_to}", t0)
 
     # ------------------------------------------------------------------
     # Step: Update plugins (atomic — one at a time with verification)
@@ -1076,6 +1118,10 @@ echo 'rollback-ok'
         if result != "ok":
             raise HealthCheckError(result)
 
+    # Retry transient connection errors before declaring a site unhealthy.
+    # 5xx and fatal-marker matches are deterministic and never retried.
+    HTTP_RETRY_BACKOFFS = (0, 1.0, 2.0)
+
     def _http_check(self, domain: str) -> str:
         """
         Hit the site over HTTPS (fallback to HTTP) and check for 5xx
@@ -1091,31 +1137,65 @@ echo 'rollback-ok'
         for base in schemes:
             for suffix in ("", "/wp-login.php"):
                 url = f"{base}{suffix}"
-                try:
-                    req = urlrequest.Request(
-                        url, headers={"User-Agent": "wp-update/1.0 (maintenance)"}
-                    )
-                    with urlrequest.urlopen(
-                        req, timeout=self.args.http_timeout, context=self._ssl_ctx
-                    ) as resp:
-                        if resp.status >= 500:
-                            return f"{url} → HTTP {resp.status}"
-                        body = resp.read(65536).decode("utf-8", errors="ignore").lower()
-                        for marker in FATAL_MARKERS:
-                            if marker in body:
-                                return f"{url} → fatal marker: {marker!r}"
-                except urlerror.HTTPError as exc:
-                    if exc.code >= 500:
-                        return f"{url} → HTTP {exc.code}"
-                    # 3xx/4xx are not fatal — continue checking
+                outcome = self._http_check_one(url)
+                if outcome is None:
+                    # Passed — check the next suffix.
                     continue
-                except Exception as exc:
-                    last_err = f"{url} → {exc}"
+                if outcome.startswith("transient:"):
+                    # Exhausted retries on a connection-class error. Move
+                    # to the next scheme but remember the message.
+                    last_err = outcome[len("transient:"):]
                     break
+                # Definitive failure (5xx or fatal marker) — bail out.
+                return outcome
             else:
                 return "ok"
 
         return last_err
+
+    def _http_check_one(self, url: str) -> str | None:
+        """Probe a single URL with retries for transient errors.
+
+        Returns:
+            None — passed; check the next suffix on the same scheme.
+            "transient:<msg>" — transient failure exhausted retries; the
+                                caller should try the next scheme.
+            anything else — definitive failure description; caller bails.
+        """
+        last_exc: Exception | None = None
+        for backoff in self.HTTP_RETRY_BACKOFFS:
+            if backoff:
+                time.sleep(backoff)
+            try:
+                req = urlrequest.Request(
+                    url, headers={"User-Agent": "wp-update/1.0 (maintenance)"}
+                )
+                with urlrequest.urlopen(
+                    req, timeout=self.args.http_timeout, context=self._ssl_ctx
+                ) as resp:
+                    if resp.status >= 500:
+                        return f"{url} → HTTP {resp.status}"
+                    body = resp.read(65536).decode("utf-8", errors="ignore").lower()
+                    for marker in FATAL_MARKERS:
+                        if marker in body:
+                            return f"{url} → fatal marker: {marker!r}"
+                return None
+            except urlerror.HTTPError as exc:
+                if exc.code >= 500:
+                    return f"{url} → HTTP {exc.code}"
+                # 3xx/4xx are deterministic — pass and check next suffix.
+                return None
+            except OSError as exc:
+                # Includes URLError, socket.timeout, ConnectionRefusedError,
+                # name resolution failures. Worth retrying.
+                last_exc = exc
+                continue
+
+        # Exhausted retries on a transient error. Surface the actual
+        # exception text so operators can diagnose.
+        msg = f"{url} → {last_exc}" if last_exc is not None else f"{url} → unknown"
+        self.log.debug("HTTP transient failure: %s", msg)
+        return f"transient:{msg}"
 
     # ------------------------------------------------------------------
     # SSH transport
