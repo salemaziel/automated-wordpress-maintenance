@@ -1007,6 +1007,20 @@ echo 'backup-ok'
 
         script = f"""\
 set -euo pipefail
+# 0a. Defense-in-depth on the live tree: refuse to wipe a directory that
+#     doesn't look like a WordPress install. VALID_PATH already gates this
+#     at the Python layer; this is a backstop.
+if [ ! -d {shlex.quote(r.wp_path + "/wp-content")} ]; then
+    echo "rollback-abort: {r.wp_path}/wp-content not present — refusing to wipe" >&2
+    exit 99
+fi
+# 0b. Defense-in-depth on the backup archive: refuse to extract a tarball
+#     that doesn't contain wp-content/. Catches truncated/corrupt backups
+#     and refuses to repopulate public_html with non-WP contents.
+if ! tar -tzf {shlex.quote(fs_backup)} 2>/dev/null | grep -qE '(^|/)wp-content/'; then
+    echo "rollback-abort: {fs_backup} missing wp-content/ — refusing to extract" >&2
+    exit 98
+fi
 # 1. Archive the broken state for forensic analysis
 tar -czf {shlex.quote(failed_snapshot)} -C {shlex.quote(r.wp_path)} . 2>/dev/null || true
 # 2. Wipe current public_html contents
@@ -1120,10 +1134,16 @@ echo 'rollback-ok'
     def _ssh(self, r: SiteReport, script: str, timeout: int | None = None) -> str:
         """Execute a script on the remote host via SSH stdin piping."""
         target = f"{r.ssh_user}@{r.server_ip}"
-        cmd = self._ssh_cmd(r)
+        cmd, sshpass_password = self._ssh_cmd(r)
         effective_timeout = timeout or self.args.remote_timeout
 
         self.log.debug("SSH → %s  |  %s", target, script.replace("\n", " \\n "))
+
+        # Pass sshpass passwords via SSHPASS env var (`sshpass -e`) instead
+        # of argv (`sshpass -p`) so they don't leak in `ps auxww` output.
+        env = None
+        if sshpass_password is not None:
+            env = {**os.environ, "SSHPASS": sshpass_password}
 
         try:
             proc = subprocess.run(
@@ -1133,9 +1153,10 @@ echo 'rollback-ok'
                 text=True,
                 timeout=effective_timeout,
                 check=False,
+                env=env,
             )
-        except subprocess.TimeoutExpired:
-            raise SSHError(f"SSH timeout ({effective_timeout}s) on {target}")
+        except subprocess.TimeoutExpired as exc:
+            raise SSHError(f"SSH timeout ({effective_timeout}s) on {target}") from exc
 
         stdout = proc.stdout.strip()
         stderr = proc.stderr.strip()
@@ -1152,8 +1173,13 @@ echo 'rollback-ok'
             )
         return stdout
 
-    def _ssh_cmd(self, r: SiteReport) -> list[str]:
-        """Build the SSH command list. Script is delivered via stdin.
+    def _ssh_cmd(self, r: SiteReport) -> tuple[list[str], str | None]:
+        """Build the SSH command list and the password (if any) for sshpass.
+
+        Returns (argv, password_for_SSHPASS_env). The caller must put the
+        password in the SSHPASS env var when it's not None and use
+        `sshpass -e` rather than `sshpass -p`, so the secret never appears
+        in `ps`.
 
         Auth methods (set by _step_ssh_preflight):
           "key"        — SSH key + wpupdates user (app-scoped)
@@ -1171,34 +1197,34 @@ echo 'rollback-ok'
         if r.auth_method == "master-key":
             target = f"{r.master_user}@{r.server_ip}"
             if key_path and key_path.exists():
-                return [
+                return ([
                     "ssh", *common_opts, "-o", "BatchMode=yes",
                     "-i", str(key_path), target, "bash", "-ls",
-                ]
+                ], None)
             raise SSHError(f"master-key auth requires SSH key but {key_path} not found")
 
-        # Tier 3: sshpass + master password
+        # Tier 3: sshpass + master password (via SSHPASS env)
         if r.auth_method == "master":
             target = f"{r.master_user}@{r.server_ip}"
-            return [
-                "sshpass", "-p", r.master_password,
+            return ([
+                "sshpass", "-e",
                 "ssh", *common_opts, target, "bash", "-ls",
-            ]
+            ], r.master_password)
 
         # Tier 1 (default): SSH key + wpupdates user
         target = f"{r.ssh_user}@{r.server_ip}"
         if key_path and key_path.exists():
-            return [
+            return ([
                 "ssh", *common_opts, "-o", "BatchMode=yes",
                 "-i", str(key_path), target, "bash", "-ls",
-            ]
+            ], None)
 
         # Password fallback for tier 1 (when no key file exists)
         if r.ssh_password and shutil.which("sshpass"):
-            return [
-                "sshpass", "-p", r.ssh_password,
+            return ([
+                "sshpass", "-e",
                 "ssh", *common_opts, target, "bash", "-ls",
-            ]
+            ], r.ssh_password)
 
         raise SSHError(
             f"No SSH auth method for {target}. "
