@@ -81,7 +81,7 @@ from urllib import request as urlrequest
 # Constants
 # ---------------------------------------------------------------------------
 
-SCRIPT_DIR = Path(__file__).resolve().parent            # automated-wordpress-maintenance/
+SCRIPT_DIR = Path(__file__).resolve().parent            # claude-wordpress-maintenance/
 DEFAULT_ENV = SCRIPT_DIR / ".env"
 DEFAULT_CLIENTS = SCRIPT_DIR / "clients"
 DEFAULT_LOGS = SCRIPT_DIR / "logs"
@@ -98,11 +98,10 @@ FATAL_MARKERS = (
     "stack trace",
 )
 
-# Fields that must NEVER appear in log files or summary JSON
-REDACTED_FIELDS = {"ssh_password", "ssh_key_path", "master_password"}
-
 # Known backup/migration plugins — if present, the site has an alternative
 # backup mechanism beyond our script's own pre-flight backup.
+# Note: jetpack-backup is the actual backup add-on; the base "jetpack" slug
+# does NOT imply backup capability.
 KNOWN_BACKUP_PLUGINS = {
     "updraftplus":              "UpdraftPlus",
     "backwpup":                 "BackWPup",
@@ -112,10 +111,31 @@ KNOWN_BACKUP_PLUGINS = {
     "blogvault-real-time-backup": "BlogVault",
     "wpvivid-backuprestore":    "WPvivid",
     "backup-backup":            "Backup Migration",
-    "jetpack":                  "Jetpack (includes backup)",
+    "jetpack-backup":           "Jetpack Backup",
     "backupwordpress":          "BackUpWordPress",
-    "flavstarter-flavor-starter": "flavor starter",
-    "flavor-starter":           "flavor starter",
+}
+
+# Confidence-scoring rules used by _compute_confidence. Tunable in one place.
+CONFIDENCE_RULES = {
+    "woocommerce_penalty": 15,
+    "plugin_updates_high_threshold": 10,
+    "plugin_updates_high_penalty": 20,
+    "plugin_updates_med_threshold": 5,
+    "plugin_updates_med_penalty": 10,
+    "plugin_updates_low_penalty": 3,
+    "theme_updates_penalty": 5,
+    "core_update_penalty": 5,
+    "large_site_threshold_mb": 2000,
+    "large_site_penalty": 5,
+    "tight_disk_multiplier": 3,
+    "tight_disk_penalty": 10,
+    "old_php_threshold": 8.0,
+    "old_php_penalty": 10,
+    "no_backup_plugin_penalty": 5,
+    "staging_bonus": 10,
+    "grade_high_min": 90,
+    "grade_medium_min": 70,
+    "grade_low_min": 50,
 }
 
 
@@ -207,6 +227,10 @@ class HealthCheckError(RuntimeError):
     """Post-update HTTP or WP-CLI verification failed."""
 
 
+class WPCliError(RuntimeError):
+    """A wp-cli command produced unparseable output (e.g. malformed JSON)."""
+
+
 class RollbackFailed(RuntimeError):
     """The rollback itself failed — manual intervention needed."""
 
@@ -279,8 +303,8 @@ def make_logger(log_dir: Path, run_id: str, stream: bool = False) -> logging.Log
     fmt = logging.Formatter(
         "%(asctime)s  %(levelname)-7s  %(message)s", "%Y-%m-%dT%H:%M:%SZ"
     )
-    # Force UTC
-    fmt.converter = lambda *_: datetime.now(timezone.utc).timetuple()
+    # Force UTC for log timestamps
+    fmt.converter = time.gmtime
 
     fh = logging.FileHandler(log_dir / f"wp-update-{run_id}.log", encoding="utf-8")
     fh.setFormatter(fmt)
@@ -419,7 +443,7 @@ class WPUpdater:
         # Validate all apps first, then sort staging before production.
         # In execute mode, staging sites are updated first so the operator
         # can review the logs before production sites are touched.
-        validated: list[tuple[int, dict, SiteReport]] = []
+        validated: list[tuple[int, dict[str, Any], SiteReport]] = []
         for idx, app in enumerate(apps, 1):
             try:
                 report = self._validate_app(doc, app, idx, path.name)
@@ -457,7 +481,7 @@ class WPUpdater:
 
     def _skip_remaining_production(
         self,
-        validated: list[tuple[int, dict, SiteReport]],
+        validated: list[tuple[int, dict[str, Any], SiteReport]],
         failed_staging: SiteReport,
     ) -> None:
         """Mark every production SiteReport in `validated` that has not yet
@@ -622,7 +646,7 @@ class WPUpdater:
             # Rollback machinery already recorded the failure on r; bubble
             # up so the operator is forced to look at it.
             raise
-        except (SSHError, HealthCheckError) as exc:
+        except (SSHError, HealthCheckError, WPCliError) as exc:
             # Use the tracked step name — falls back to last recorded step
             r.failure_step = current_step
             r.failure_detail = str(exc)
@@ -1271,7 +1295,9 @@ echo 'rollback-ok'
             "-o", f"ConnectTimeout={self.args.connect_timeout}",
         ]
 
-        key_path = Path(r.ssh_key_path).expanduser() if r.ssh_key_path else None
+        # load_env already expanded ~ in any path read from .env, so this
+        # is just a typesafe Path() coercion.
+        key_path = Path(r.ssh_key_path) if r.ssh_key_path else None
 
         # Tier 2: SSH key + master username
         if r.auth_method == "master-key":
@@ -1331,11 +1357,11 @@ echo 'rollback-ok'
         if not raw:
             if allow_empty:
                 return []
-            raise SSHError(f"Empty output from: wp {wp_cmd}")
+            raise WPCliError(f"Empty output from: wp {wp_cmd}")
         try:
             return json.loads(raw)
         except json.JSONDecodeError as exc:
-            raise SSHError(f"Bad JSON from `wp {wp_cmd}`: {exc}") from exc
+            raise WPCliError(f"Bad JSON from `wp {wp_cmd}`: {exc}") from exc
 
     # ------------------------------------------------------------------
     # Step recording
@@ -1384,72 +1410,100 @@ echo 'rollback-ok'
     # ------------------------------------------------------------------
 
     def _compute_confidence(self, r: SiteReport) -> dict[str, Any]:
+        rules = CONFIDENCE_RULES
         score = 100
         factors: list[str] = []
         b = r.baseline
 
         # WooCommerce = higher stakes (payment, orders)
         if r.has_woocommerce:
-            score -= 15
-            factors.append("-15  WooCommerce site (payment/order risk)")
+            score -= rules["woocommerce_penalty"]
+            factors.append(
+                f"-{rules['woocommerce_penalty']:<2}  WooCommerce site (payment/order risk)"
+            )
 
         # Many plugin updates = more things that can break
         n_plugins = len(b.get("plugin_updates", []))
-        if n_plugins > 10:
-            score -= 20
-            factors.append(f"-20  {n_plugins} plugin updates (>10)")
-        elif n_plugins > 5:
-            score -= 10
-            factors.append(f"-10  {n_plugins} plugin updates (>5)")
+        if n_plugins > rules["plugin_updates_high_threshold"]:
+            score -= rules["plugin_updates_high_penalty"]
+            factors.append(
+                f"-{rules['plugin_updates_high_penalty']:<2}  {n_plugins} plugin updates "
+                f"(>{rules['plugin_updates_high_threshold']})"
+            )
+        elif n_plugins > rules["plugin_updates_med_threshold"]:
+            score -= rules["plugin_updates_med_penalty"]
+            factors.append(
+                f"-{rules['plugin_updates_med_penalty']:<2}  {n_plugins} plugin updates "
+                f"(>{rules['plugin_updates_med_threshold']})"
+            )
         elif n_plugins > 0:
-            score -= 3
-            factors.append(f" -3  {n_plugins} plugin update(s)")
+            score -= rules["plugin_updates_low_penalty"]
+            factors.append(
+                f" -{rules['plugin_updates_low_penalty']}  {n_plugins} plugin update(s)"
+            )
 
         # Theme updates
         n_themes = len(b.get("theme_updates", []))
         if n_themes > 0:
-            score -= 5
-            factors.append(f" -5  {n_themes} theme update(s)")
+            score -= rules["theme_updates_penalty"]
+            factors.append(
+                f" -{rules['theme_updates_penalty']}  {n_themes} theme update(s)"
+            )
 
         # Core update pending
         if b.get("core_updates"):
-            score -= 5
-            factors.append(" -5  WordPress core update pending")
+            score -= rules["core_update_penalty"]
+            factors.append(
+                f" -{rules['core_update_penalty']}  WordPress core update pending"
+            )
 
         # Large site (backup takes longer, more to go wrong)
         disk = b.get("disk", {})
         site_mb = disk.get("site_mb", 0)
-        if site_mb > 2000:
-            score -= 5
-            factors.append(f" -5  Large site ({site_mb:.0f} MB)")
+        if site_mb > rules["large_site_threshold_mb"]:
+            score -= rules["large_site_penalty"]
+            factors.append(
+                f" -{rules['large_site_penalty']}  Large site ({site_mb:.0f} MB)"
+            )
 
         # Tight disk space
         avail_mb = disk.get("available_mb", 0)
         est_backup = disk.get("estimated_backup_mb", 0)
-        if avail_mb > 0 and est_backup > 0 and avail_mb < est_backup * 3:
-            score -= 10
-            factors.append(f"-10  Tight disk space ({avail_mb:.0f} MB avail, need {est_backup:.0f} MB)")
+        if (avail_mb > 0 and est_backup > 0
+                and avail_mb < est_backup * rules["tight_disk_multiplier"]):
+            score -= rules["tight_disk_penalty"]
+            factors.append(
+                f"-{rules['tight_disk_penalty']:<2}  Tight disk space "
+                f"({avail_mb:.0f} MB avail, need {est_backup:.0f} MB)"
+            )
 
         # PHP version (older = riskier with new plugin versions)
         php = b.get("php_version", "")
         if php:
             try:
                 major_minor = float(php.rsplit(".", 1)[0])
-                if major_minor < 8.0:
-                    score -= 10
-                    factors.append(f"-10  Outdated PHP {php} (<8.0)")
+                if major_minor < rules["old_php_threshold"]:
+                    score -= rules["old_php_penalty"]
+                    factors.append(
+                        f"-{rules['old_php_penalty']:<2}  Outdated PHP {php} "
+                        f"(<{rules['old_php_threshold']})"
+                    )
             except ValueError:
                 pass
 
         # No backup plugin = we're the only safety net
         if not b.get("backup_plugins"):
-            score -= 5
-            factors.append(" -5  No backup plugin installed")
+            score -= rules["no_backup_plugin_penalty"]
+            factors.append(
+                f" -{rules['no_backup_plugin_penalty']}  No backup plugin installed"
+            )
 
         # Staging site = lower stakes
         if r.is_staging:
-            score += 10
-            factors.append("+10  Staging site (lower risk)")
+            score += rules["staging_bonus"]
+            factors.append(
+                f"+{rules['staging_bonus']:<2}  Staging site (lower risk)"
+            )
 
         # Nothing to update = nothing to break
         if n_plugins == 0 and n_themes == 0 and not b.get("core_updates"):
@@ -1458,11 +1512,11 @@ echo 'rollback-ok'
 
         score = max(0, min(100, score))
 
-        if score >= 90:
+        if score >= rules["grade_high_min"]:
             grade = "HIGH"
-        elif score >= 70:
+        elif score >= rules["grade_medium_min"]:
             grade = "MEDIUM"
-        elif score >= 50:
+        elif score >= rules["grade_low_min"]:
             grade = "LOW"
         else:
             grade = "RISKY"
