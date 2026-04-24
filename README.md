@@ -183,6 +183,9 @@ If a later step fails:
 3. the database is restored from `preflight.sql`
 4. the site is verified again
 
+If rollback itself fails, the run stops immediately after recording the failed
+rollback so the operator can intervene manually.
+
 Backups are stored on the remote server under:
 
 ```text
@@ -279,6 +282,7 @@ python3 wp_update.py \
 | `--connect-timeout` | SSH connection timeout in seconds |
 | `--remote-timeout` | Per-remote-command timeout in seconds |
 | `--http-timeout` | HTTP health-check timeout in seconds |
+| `--max-consecutive-failures` | Abort execute mode after N consecutive failed/rolled-back sites (`0` disables) |
 | `--stream` | Show DEBUG-level activity on stdout |
 
 ## Output and reporting
@@ -312,6 +316,13 @@ The project is built around running a dry-run first, reviewing confidence scores
 ### Staging sites go first
 
 In execute mode, staging sites are processed before production sites. If a staging site fails or rolls back, the script skips remaining production sites from that same client file.
+
+### Execute mode has a small circuit breaker
+
+Execute mode aborts after 3 consecutive failed or rolled-back sites by default.
+This is meant to contain shared DNS/TLS/routing outage days before the run
+fans out across the whole inventory. Pass `--max-consecutive-failures 0` to
+disable that guard.
 
 ### WooCommerce requires explicit opt-in
 

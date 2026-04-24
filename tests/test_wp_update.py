@@ -31,6 +31,7 @@ def make_args(
         connect_timeout=20,
         remote_timeout=600,
         http_timeout=20,
+        max_consecutive_failures=3,
         stream=False,
     )
 
@@ -508,14 +509,20 @@ def test_step_rollback_success_constructs_correct_script(tmp_path: Path) -> None
     assert "tar -xzf" in script_text
 
 
-def test_step_rollback_failure_sets_failed_state(tmp_path: Path) -> None:
+def test_step_rollback_failure_raises_and_sets_failed_state(tmp_path: Path) -> None:
     updater = wp_update.WPUpdater(make_args(tmp_path))
     r = make_report(
         backup_dir="/home/master/wp-maintenance-backups/example-client/example.com/run01",
         auth_method="key",
     )
 
-    with patch.object(updater, "_ssh", side_effect=wp_update.SSHError("connection lost")):
+    with (
+        patch.object(updater, "_ssh", side_effect=wp_update.SSHError("connection lost")),
+        pytest.raises(
+            wp_update.RollbackFailed,
+            match="rollback failed for example.com: connection lost",
+        ),
+    ):
         updater._step_rollback(r)
 
     assert r.overall == "failed"
@@ -561,6 +568,31 @@ def _make_client_json(tmp_path: Path) -> Path:
     return path
 
 
+def _write_single_app_client_json(
+    clients_dir: Path, filename: str, domain: str, app_hash: str
+) -> Path:
+    doc = {
+        "client_name": filename.removesuffix("_cloudways.json").replace("-", " ").title(),
+        "server_ip_address": "203.0.113.50",
+        "master_credentials": {"username": "master_xyz", "password": "pw"},
+        "applications": [
+            {
+                "website_domain": domain,
+                "path_to_public_html": f"/home/master/applications/{app_hash}/public_html",
+                "sftp_credentials": {
+                    "username": "$SSH_USER",
+                    "password": "$APP_PW",
+                    "ssh_key": "$SSH_KEY",
+                },
+                "environment_flags": {"is_staging": False, "has_woocommerce": False},
+            }
+        ],
+    }
+    path = clients_dir / filename
+    path.write_text(json.dumps(doc))
+    return path
+
+
 def test_process_client_file_skips_prod_sites_when_staging_fails(tmp_path: Path) -> None:
     args = make_args(tmp_path, execute=True)
     # WPUpdater __init__ requires either SSH_KEY or APP_PW in execute mode.
@@ -593,3 +625,71 @@ def test_process_client_file_skips_prod_sites_when_staging_fails(tmp_path: Path)
             s.name == "staging-gate" and s.status == "skipped"
             for s in prod_report.steps
         ), f"Expected staging-gate step on {prod_report.domain}"
+
+
+def test_run_returns_failure_when_rollback_failure_aborts_batch(tmp_path: Path) -> None:
+    args = make_args(tmp_path, execute=True)
+    args.env_file.write_text("SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=fake-password-for-test\n")
+    clients_dir = tmp_path / "clients"
+    clients_dir.mkdir()
+    args.clients_dir = clients_dir
+
+    _write_single_app_client_json(
+        clients_dir, "client-a_cloudways.json", "a.example.com", "apphasha"
+    )
+    _write_single_app_client_json(
+        clients_dir, "client-b_cloudways.json", "b.example.com", "apphashb"
+    )
+
+    updater = wp_update.WPUpdater(args)
+
+    def fake_process_site(report):  # noqa: ANN001
+        report.overall = "failed"
+        report.rollback_result = "FAILED: connection lost"
+        raise wp_update.RollbackFailed(
+            f"rollback failed for {report.domain}: connection lost"
+        )
+
+    with patch.object(updater, "_process_site", side_effect=fake_process_site):
+        rc = updater.run()
+
+    assert rc == 1
+    assert updater._run_abort_reason == "rollback failed for a.example.com: connection lost"
+    assert [r.domain for r in updater.reports] == ["a.example.com"]
+
+
+def test_run_aborts_after_max_consecutive_failures(tmp_path: Path) -> None:
+    args = make_args(tmp_path, execute=True)
+    args.env_file.write_text("SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=fake-password-for-test\n")
+    args.max_consecutive_failures = 2
+    clients_dir = tmp_path / "clients"
+    clients_dir.mkdir()
+    args.clients_dir = clients_dir
+
+    _write_single_app_client_json(
+        clients_dir, "client-a_cloudways.json", "a.example.com", "apphasha"
+    )
+    _write_single_app_client_json(
+        clients_dir, "client-b_cloudways.json", "b.example.com", "apphashb"
+    )
+    _write_single_app_client_json(
+        clients_dir, "client-c_cloudways.json", "c.example.com", "apphashc"
+    )
+
+    updater = wp_update.WPUpdater(args)
+    outcomes = iter(("failed", "rolled-back", "success"))
+
+    def fake_process_site(report):  # noqa: ANN001
+        report.overall = next(outcomes)
+        report.failure_step = "final-verification"
+        if report.overall != "success":
+            report.failure_detail = "simulated outage"
+
+    with patch.object(updater, "_process_site", side_effect=fake_process_site):
+        rc = updater.run()
+
+    assert rc == 1
+    assert updater._run_abort_reason == (
+        "circuit breaker opened after 2 consecutive failed/rolled-back site(s)"
+    )
+    assert [r.domain for r in updater.reports] == ["a.example.com", "b.example.com"]

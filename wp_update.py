@@ -345,6 +345,8 @@ class WPUpdater:
         self.env = load_env(args.env_file)
         self.log = make_logger(args.log_dir, self.run_id, stream=args.stream)
         self.reports: list[SiteReport] = []
+        self._consecutive_execute_failures = 0
+        self._run_abort_reason = ""
 
         # Global SSH credentials from .env
         self._ssh_user = self.env.get("SSH_USER", "")
@@ -385,14 +387,21 @@ class WPUpdater:
                        "EXECUTE" if self.args.execute else "DRY-RUN", len(files))
         self.log.info("=" * 70)
 
-        for path in files:
-            self._process_client_file(path)
+        try:
+            for path in files:
+                self._process_client_file(path)
+                if self._run_abort_reason:
+                    self.log.error("ABORTING RUN  |  %s", self._run_abort_reason)
+                    break
+        except RollbackFailed as exc:
+            self._run_abort_reason = str(exc)
+            self.log.error("ABORTING RUN  |  %s", exc)
 
         self._write_summary()
         self._print_final_report()
 
         failures = [r for r in self.reports if r.overall in ("failed",)]
-        return 1 if failures else 0
+        return 1 if failures or self._run_abort_reason else 0
 
     # ------------------------------------------------------------------
     # Client file handling (graceful on incomplete files)
@@ -474,10 +483,15 @@ class WPUpdater:
 
             # In execute mode, if a staging site failed or rolled back,
             # skip production sites on the same server — don't risk it.
+            stop_client_file = False
             if (self.args.execute
                     and report.is_staging
                     and report.overall in ("failed", "rolled-back")):
                 self._skip_remaining_production(validated, report)
+                stop_client_file = True
+
+            self._note_execute_outcome(report)
+            if stop_client_file or self._run_abort_reason:
                 break  # Stop processing this client file
 
     def _skip_remaining_production(
@@ -517,6 +531,31 @@ class WPUpdater:
                 "not safe to proceed",
             )
             self.reports.append(prod_report)
+
+    def _note_execute_outcome(self, r: SiteReport) -> None:
+        """Track execute-mode failure streaks and open the run circuit if needed."""
+        if not self.args.execute or self.args.max_consecutive_failures <= 0:
+            return
+
+        if r.overall in ("failed", "rolled-back"):
+            self._consecutive_execute_failures += 1
+            if self._consecutive_execute_failures >= self.args.max_consecutive_failures:
+                self._run_abort_reason = (
+                    "circuit breaker opened after "
+                    f"{self._consecutive_execute_failures} consecutive "
+                    "failed/rolled-back site(s)"
+                )
+                self.log.error(
+                    "⚠ RUN CIRCUIT OPEN  |  %s  |  last site=%s",
+                    self._run_abort_reason, r.domain,
+                )
+            return
+
+        if r.overall == "success" and self._consecutive_execute_failures:
+            self.log.info(
+                "Run failure streak reset after success  |  %s", r.domain
+            )
+            self._consecutive_execute_failures = 0
 
     def _validate_app(
         self, doc: dict, app: dict, idx: int, filename: str
@@ -1119,6 +1158,9 @@ echo 'rollback-ok'
                 "⚠ ROLLBACK FAILED  |  %s  |  %s  |  Manual recovery needed "
                 "from %s", r.domain, exc, r.backup_dir
             )
+            raise RollbackFailed(
+                f"rollback failed for {r.domain}: {exc}"
+            ) from exc
 
     # ------------------------------------------------------------------
     # Verification
@@ -1646,6 +1688,10 @@ echo 'rollback-ok'
         self.log.info("FINAL REPORT")
         self.log.info("=" * 70)
 
+        if self._run_abort_reason:
+            self.log.error("  Run stopped early: %s", self._run_abort_reason)
+            self.log.info("")
+
         # In execute mode, print per-site execution summaries first
         if self.args.execute:
             for r in self.reports:
@@ -1747,6 +1793,11 @@ def build_cli() -> argparse.Namespace:
     p.add_argument(
         "--http-timeout", type=int, default=20,
         help="HTTP health check timeout in seconds (default: 20).",
+    )
+    p.add_argument(
+        "--max-consecutive-failures", type=int, default=3,
+        help="Abort an execute-mode batch after this many consecutive "
+             "failed/rolled-back sites (default: 3, use 0 to disable).",
     )
     p.add_argument(
         "--stream", action="store_true",
