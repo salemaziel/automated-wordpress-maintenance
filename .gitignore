@@ -3,3 +3,10 @@
 __pycache__
 .pytest_cache
 .ruff_cache
+.claude/
+.omx/
+.serena/
+IP_WHITELIST.txt
+notes/
+clients/*_cloudways.json
+!clients/example-client_cloudways.json
