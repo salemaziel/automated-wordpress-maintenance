@@ -139,6 +139,31 @@ CONFIDENCE_RULES = {
     "grade_low_min": 50,
 }
 
+# Tolerant classification of WP-CLI's `wp plugin update` status field.
+# WP-CLI status strings have drifted across versions (e.g. "Updated" vs
+# "updated successfully" vs "success"), so we normalise via .strip().lower()
+# before membership-testing.  Anything outside these two sets is treated as
+# an error.
+_PLUGIN_STATUS_SUCCESS = frozenset({"updated", "success", "updated successfully"})
+_PLUGIN_STATUS_UPTODATE = frozenset({"up to date", "already up to date"})
+
+
+def _extract_plugin_error(result: dict) -> str:
+    """Pull a short error message out of a wp-cli plugin-update result dict.
+
+    Prefers explicit 'message'/'error' keys, falls back to the captured
+    SSH/parse-error text, truncating to ~200 chars so we never dump a
+    full stderr into the JSON report.
+    """
+    for key in ("message", "error", "_error", "_raw"):
+        val = result.get(key)
+        if val:
+            text = str(val).strip().splitlines()[0] if "\n" in str(val) else str(val).strip()
+            return text[:200]
+    if result.get("_no_entry"):
+        return "wp-cli returned no entry for this slug"
+    return f"status={result.get('status', '?')}"
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -682,11 +707,6 @@ class WPUpdater:
             r.overall = "success"
             self.log.info("✓ SUCCESS  |  %s", r.domain)
 
-            if self.args.prune_plugin_snapshots and r.backup_dir:
-                plugins_snapshots = r.backup_dir + "/plugins"
-                with contextlib.suppress(SSHError):
-                    self._ssh(r, f"rm -rf {shlex.quote(plugins_snapshots)}")
-
         except RollbackFailed:
             # Rollback machinery already recorded the failure on r; bubble
             # up so the operator is forced to look at it.
@@ -932,9 +952,6 @@ echo "${{du_bytes:-0}} ${{avail_bytes:-0}}"
         avail_mb = avail_bytes / (1024 * 1024)
         # Estimate: compressed tar ≈ 50% of original + SQL dump ≈ 10% of original
         est_backup_mb = site_mb * 0.6
-        # Add per-plugin snapshot budget: ~2% of site size per plugin update
-        plugin_count = len(r.baseline.get("plugin_updates", []))
-        est_backup_mb += site_mb * 0.02 * plugin_count
         # Require at least 2x the estimated backup size as headroom
         required_mb = est_backup_mb * 2
 
@@ -986,7 +1003,6 @@ echo "${{du_bytes:-0}} ${{avail_bytes:-0}}"
 set -euo pipefail
 cd {shlex.quote(r.wp_path)}
 mkdir -p {shlex.quote(backup_dir)}
-mkdir -p {shlex.quote(backup_dir + '/plugins')}
 wp --path={shlex.quote(r.wp_path)} db export {shlex.quote(backup_dir + '/preflight.sql')} --add-drop-table 2>&1
 wp --path={shlex.quote(r.wp_path)} plugin list --format=json > {shlex.quote(backup_dir + '/plugins.json')} 2>&1
 wp --path={shlex.quote(r.wp_path)} theme list --format=json > {shlex.quote(backup_dir + '/themes.json')} 2>&1
@@ -1056,24 +1072,16 @@ echo 'backup-ok'
     # Plugin update helpers
     # ------------------------------------------------------------------
 
-    def _plugin_dir_fingerprint(self, r: SiteReport, slug: str) -> str:
-        """SHA-256 fingerprint of a plugin directory (mtime + size + path).
-
-        Returns an empty string when the directory does not exist.
-        """
-        script = (
-            f"find {shlex.quote(r.wp_path)}/wp-content/plugins/{shlex.quote(slug)}"
-            f" -printf '%T@ %s %p\\n' 2>/dev/null"
-            f" | LC_ALL=C sort | sha256sum | awk '{{print $1}}'"
-        )
-        return self._ssh(r, script).strip()
-
     def _run_plugin_update_structured(self, r: SiteReport, slug: str) -> dict:
         """Run `wp plugin update <slug> --format=json` and return the result dict.
 
         Returns a dict with at least {"name": slug, "status": "..."}.
         On SSH/WP-CLI failure: {"name": slug, "status": "Error", "_exit_nonzero": True}.
         On JSON parse failure: {"name": slug, "status": "Error", "_parse_error": True}.
+        When JSON parses cleanly but no entry for the slug is present, returns
+        {"name": slug, "status": "Error", "_no_entry": True} — the absence of
+        the slug in the response is a signal something went wrong, NOT a
+        silent "up to date".
         """
         try:
             raw = self._wp(
@@ -1095,17 +1103,27 @@ echo 'backup-ok'
         for entry in entries:
             if isinstance(entry, dict) and entry.get("name") == slug:
                 return entry
-        # JSON returned but no matching entry — treat as up to date
-        return {"name": slug, "status": "Up to date"}
+        # JSON returned but no matching entry — treat as Error, NOT up to date.
+        # WP-CLI normally emits an entry per slug; its absence is ambiguous
+        # and the safe default is to surface it rather than silently pass.
+        return {"name": slug, "status": "Error", "_no_entry": True}
 
     # ------------------------------------------------------------------
-    # Step: Update plugins (atomic — one at a time with verification)
+    # Step: Update plugins (sequential — one at a time with verification)
     #
-    # This is the most critical section.  Plugins are the #1 cause of
-    # site breakage during WordPress maintenance.  Each plugin is updated
-    # individually, and the site is health-checked after each one.  If
-    # any single plugin breaks the site, we know EXACTLY which one did
-    # it, and we can rollback before touching the rest.
+    # Plugins are the #1 cause of site breakage during WordPress
+    # maintenance.  Each plugin is updated individually, and the site is
+    # health-checked (via _verify) after every single update.  The
+    # classification is:
+    #   * wp-cli reports success/up-to-date AND verify passes -> success
+    #   * wp-cli reports a non-fatal error (license/auth/etc.) but the
+    #     site still verifies -> skipped, continue to next plugin
+    #   * verify FAILS after an update -> attempt `wp plugin deactivate`
+    #     to isolate the offender.  If that recovers verify -> degraded
+    #     (manual review required) and continue.  If it does NOT -> raise
+    #     SSHError so _process_site escalates to the full-site rollback
+    #     (preflight.sql + public_html.tar.gz), which is the only recovery
+    #     that is safe in the presence of DB schema migrations.
     # ------------------------------------------------------------------
 
     def _step_update_plugins(self, r: SiteReport) -> None:
@@ -1117,8 +1135,8 @@ echo 'backup-ok'
 
         for plugin in updates:
             slug = plugin.get("name", "").strip()
-            ver_from = plugin.get("version", "?")
-            ver_to = plugin.get("update_version", "?")
+            ver_from = plugin.get("version", "?") or "?"
+            ver_to = plugin.get("update_version", "?") or "?"
             if not slug:
                 continue
 
@@ -1129,126 +1147,95 @@ echo 'backup-ok'
                 slug, ver_from, ver_to, r.domain,
             )
 
-            self._snapshot_plugin(r, slug)
-            fp_before = self._plugin_dir_fingerprint(r, slug)
             result = self._run_plugin_update_structured(r, slug)
-            fp_after = self._plugin_dir_fingerprint(r, slug)
-            fingerprint_changed = bool(fp_before) and fp_before != fp_after
+            status = (result.get("status", "") or "").strip().lower()
+            # Prefer the post-update version reported by wp-cli, fall back
+            # to the baseline's target version.
+            ver_to_reported = result.get("version") or ver_to or "?"
 
-            status = result.get("status", "")
+            # Always verify after the update attempt — this is the oracle
+            # that decides whether the site still works.
+            try:
+                self._verify(r)
+                verify_ok = True
+                verify_exc: HealthCheckError | None = None
+            except HealthCheckError as exc:
+                verify_ok = False
+                verify_exc = exc
 
-            if status in ("Updated", "Up to date"):
-                try:
-                    self._verify(r)
-                except HealthCheckError as exc:
-                    # Verify failed after a reportedly successful update —
-                    # delegate to per-plugin restore.
-                    if self._try_restore_plugin(r, slug):
-                        self._record_step(r, step, "rolled-back-local",
-                                          f"{slug} {ver_from}→{ver_to} verify failed; "
-                                          "restored from snapshot", t0)
-                        self.log.warning(
-                            "  ⚠ Plugin  %s  rolled back after verify failure  |  %s",
-                            slug, r.domain,
-                        )
-                        continue
-                    self._record_step(r, step, "failed",
-                                      f"{slug} {ver_from}→{ver_to} FAILED (verify): {exc}", t0)
-                    raise SSHError(
-                        f"per-plugin restore failed for {slug}: verify broken after update"
-                    ) from exc
+            if verify_ok and status in _PLUGIN_STATUS_SUCCESS:
                 self._record_step(r, step, "success",
-                                  f"{slug} {ver_from}→{ver_to}", t0)
+                                  f"{slug} {ver_from}→{ver_to_reported}", t0)
                 continue
 
-            # Error / unknown / parse failure
-            if not fingerprint_changed:
-                detail = "fingerprint unchanged — premium license inactive or slug renamed"
-                self._record_step(r, step, "skipped",
-                                  f"{slug} {ver_from}→{ver_to} skipped: {detail}", t0)
+            if verify_ok and status in _PLUGIN_STATUS_UPTODATE:
+                self._record_step(r, step, "success",
+                                  f"{slug} up to date", t0)
+                continue
+
+            if verify_ok:
+                # wp-cli reported an Error / unknown status but the site
+                # is still healthy.  Typical causes: premium license not
+                # active, auth failure fetching the zip, network blip.
+                # Skip and continue.
+                err_msg = _extract_plugin_error(result)
+                detail = f"{slug} {ver_from}→{ver_to} non-fatal error: {err_msg}"
+                self._record_step(r, step, "skipped", detail, t0)
                 self.log.warning(
-                    "  ⚠ Skipping plugin  %s  (%s → %s): %s  |  %s",
-                    slug, ver_from, ver_to, detail, r.domain,
+                    "  ⚠ Skipping plugin  %s  (%s → %s): non-fatal error: %s  |  %s",
+                    slug, ver_from, ver_to, err_msg, r.domain,
                 )
                 continue
 
-            # Fingerprint changed but status is Error — per-plugin restore
-            if self._try_restore_plugin(r, slug):
-                self._record_step(r, step, "rolled-back-local",
-                                  f"{slug} {ver_from}→{ver_to} partial update rolled back", t0)
+            # verify FAILED — the update broke the site.  Attempt
+            # deactivation to isolate the offending plugin before
+            # escalating to full-site rollback.
+            self.log.warning(
+                "  ⚠ Plugin  %s  update broke site; attempting deactivation  |  %s",
+                slug, r.domain,
+            )
+            deactivate_exit_ok = True
+            try:
+                self._wp(r, f"plugin deactivate {shlex.quote(slug)}",
+                         timeout=self.args.remote_timeout)
+            except (SSHError, WPCliError) as exc:
+                deactivate_exit_ok = False
                 self.log.warning(
-                    "  ⚠ Plugin  %s  partially updated then rolled back  |  %s",
+                    "  ⚠ `wp plugin deactivate %s` failed: %s  |  %s",
+                    slug, exc, r.domain,
+                )
+
+            try:
+                self._verify(r)
+                recovered = True
+            except HealthCheckError:
+                recovered = False
+
+            if recovered:
+                deact_note = "ok" if deactivate_exit_ok else "non-zero exit"
+                detail = (
+                    f"{slug} {ver_from}→{ver_to} fatal update broke site; "
+                    f"plugin deactivated ({deact_note}) — requires manual review"
+                )
+                self._record_step(r, step, "degraded", detail, t0)
+                self.log.warning(
+                    "  ⚠ Plugin  %s  deactivated after fatal update — manual "
+                    "review required  |  %s",
                     slug, r.domain,
                 )
                 continue
-            self._record_step(r, step, "failed",
-                              f"{slug} {ver_from}→{ver_to} FAILED: partial update, restore failed",
-                              t0)
-            raise SSHError(f"per-plugin restore failed for {slug}")
 
-    # ------------------------------------------------------------------
-    # Per-plugin snapshot + restore
-    # ------------------------------------------------------------------
-
-    def _snapshot_plugin(self, r: SiteReport, slug: str) -> None:
-        """Capture a pre-update tarball of a plugin dir under backup_dir/plugins/."""
-        if not self.args.execute or not r.backup_dir:
-            return
-        t0 = ts()
-        step = f"plugin-snapshot:{slug}"
-        tarball = shlex.quote(r.backup_dir + f"/plugins/{slug}.tar.gz")
-        plugins_root = shlex.quote(r.wp_path + "/wp-content/plugins")
-        script = f"""\
-set -euo pipefail
-cd {plugins_root}
-if [ ! -d {shlex.quote(slug)} ]; then
-    echo 'no-plugin-dir'
-    exit 0
-fi
-tar -czf {tarball} {shlex.quote(slug)}
-"""
-        try:
-            out = self._ssh(r, script, timeout=self.args.remote_timeout)
-            if "no-plugin-dir" in out:
-                self._record_step(r, step, "skipped", f"{slug}: plugin dir not found", t0)
-            else:
-                self._record_step(r, step, "success", f"snapshot {slug}.tar.gz", t0)
-        except SSHError as exc:
-            # Non-fatal — snapshot failure does not abort the run
-            self._record_step(r, step, "skipped", f"snapshot failed (non-fatal): {exc}", t0)
-
-    def _try_restore_plugin(self, r: SiteReport, slug: str) -> bool:
-        """Restore a plugin from its per-plugin snapshot tarball.
-
-        Returns True only if both the filesystem restore and the post-restore
-        health check succeed.
-        """
-        if not r.backup_dir:
-            return False
-        t0 = ts()
-        step = f"plugin-restore:{slug}"
-        tarball = shlex.quote(r.backup_dir + f"/plugins/{slug}.tar.gz")
-        plugins_root = shlex.quote(r.wp_path + "/wp-content/plugins")
-        script = f"""\
-set -euo pipefail
-test -f {tarball} || {{ echo 'no-tarball'; exit 1; }}
-cd {plugins_root}
-rm -rf {shlex.quote(slug)}
-tar -xzf {tarball}
-test -d {shlex.quote(slug)}
-"""
-        try:
-            self._ssh(r, script, timeout=self.args.remote_timeout)
-        except SSHError as exc:
-            self._record_step(r, step, "failed", f"extract failed: {exc}", t0)
-            return False
-        try:
-            self._verify(r)
-        except HealthCheckError as exc:
-            self._record_step(r, step, "failed", f"verify after restore failed: {exc}", t0)
-            return False
-        self._record_step(r, step, "success", f"restored {slug} from snapshot", t0)
-        return True
+            # Deactivation did not recover the site — escalate to
+            # full-site rollback via _process_site's handler.
+            detail = (
+                f"{slug} {ver_from}→{ver_to} fatal update broke site; "
+                f"deactivation did not recover (verify: {verify_exc})"
+            )
+            self._record_step(r, step, "failed", detail, t0)
+            raise SSHError(
+                f"plugin {slug} update broke site, deactivation failed — "
+                "escalating to full rollback"
+            )
 
     # ------------------------------------------------------------------
     # Rollback
@@ -1971,11 +1958,6 @@ def build_cli() -> argparse.Namespace:
         "--stream", action="store_true",
         help="Stream all activity to stdout (tail -f style). Shows SSH "
              "commands, remote output, and all debug-level detail in real time.",
-    )
-    p.add_argument(
-        "--prune-plugin-snapshots", action="store_true",
-        help="Delete per-plugin snapshot tarballs after a successful run "
-             "(default: retain for forensic auditing).",
     )
     return p.parse_args()
 

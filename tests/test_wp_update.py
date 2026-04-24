@@ -33,7 +33,6 @@ def make_args(
         http_timeout=20,
         max_consecutive_failures=3,
         stream=False,
-        prune_plugin_snapshots=False,
     )
 
 
@@ -697,8 +696,9 @@ def test_run_aborts_after_max_consecutive_failures(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Part 1 — Structured plugin-update failure detection
+# Plugin-update flow — sequential updates with deactivate-on-fatal recovery
 # ---------------------------------------------------------------------------
+
 
 def _make_updater(tmp_path: Path, *, execute: bool = True) -> wp_update.WPUpdater:
     args = make_args(tmp_path, execute=execute)
@@ -719,28 +719,6 @@ def _make_exec_report(**overrides: object) -> wp_update.SiteReport:
     )
     defaults.update(overrides)
     return wp_update.SiteReport(**defaults)
-
-
-def test_plugin_dir_fingerprint_returns_consistent_string(tmp_path: Path) -> None:
-    updater = _make_updater(tmp_path)
-    r = _make_exec_report()
-    expected = "deadbeef" * 8  # 64-char hex string
-    with patch.object(updater, "_ssh", return_value=expected) as mock_ssh:
-        result = updater._plugin_dir_fingerprint(r, "my-plugin")
-    assert result == expected
-    assert mock_ssh.call_count == 1
-    script = mock_ssh.call_args[0][1]
-    assert "my-plugin" in script
-    assert "sha256sum" in script
-    assert "LC_ALL=C" in script
-
-
-def test_plugin_dir_fingerprint_empty_when_dir_missing(tmp_path: Path) -> None:
-    updater = _make_updater(tmp_path)
-    r = _make_exec_report()
-    with patch.object(updater, "_ssh", return_value=""):
-        result = updater._plugin_dir_fingerprint(r, "missing-plugin")
-    assert result == ""
 
 
 def test_run_plugin_update_structured_parses_clean_json(tmp_path: Path) -> None:
@@ -783,56 +761,41 @@ def test_run_plugin_update_structured_returns_error_on_ssh_failure(tmp_path: Pat
     assert result.get("_exit_nonzero")
 
 
-def test_step_update_plugins_records_success_from_json_status_updated(tmp_path: Path) -> None:
+def test_run_plugin_update_structured_no_matching_entry(tmp_path: Path) -> None:
+    """JSON parses cleanly but does not contain our slug — must be Error,
+    never silent Up to date (regression guard)."""
     updater = _make_updater(tmp_path)
     r = _make_exec_report()
-    r.baseline = {
-        "plugin_updates": [{"name": "good-plugin", "version": "1.0", "update_version": "2.0"}]
-    }
-    fp = "aabbcc" * 10
-
-    with (
-        patch.object(updater, "_snapshot_plugin"),
-        patch.object(updater, "_plugin_dir_fingerprint", return_value=fp),
-        patch.object(updater, "_run_plugin_update_structured",
-                     return_value={"name": "good-plugin", "status": "Updated"}),
-        patch.object(updater, "_verify"),
-    ):
-        updater._step_update_plugins(r)
-
-    steps = {s.name: s for s in r.steps}
-    assert "plugin-update:good-plugin" in steps
-    assert steps["plugin-update:good-plugin"].status == "success"
+    # wp-cli returns an entry for a different plugin
+    payload = '[{"name":"other-plugin","status":"Updated"}]'
+    with patch.object(updater, "_wp", return_value=payload):
+        result = updater._run_plugin_update_structured(r, "my-plugin")
+    assert result["status"] == "Error"
+    assert result.get("_no_entry") is True
+    assert result["name"] == "my-plugin"
 
 
-def test_step_update_plugins_records_skipped_on_error_with_unchanged_fingerprint(
-    tmp_path: Path,
-) -> None:
-    updater = _make_updater(tmp_path)
-    r = _make_exec_report()
-    r.baseline = {
-        "plugin_updates": [{"name": "perfmatters", "version": "2.0", "update_version": "2.1"}]
-    }
-    fp = "aabbcc" * 10  # same before and after
-
-    with (
-        patch.object(updater, "_snapshot_plugin"),
-        patch.object(updater, "_plugin_dir_fingerprint", return_value=fp),
-        patch.object(updater, "_run_plugin_update_structured",
-                     return_value={"name": "perfmatters", "status": "Error",
-                                   "_exit_nonzero": True}),
-        patch.object(updater, "_verify"),
-    ):
-        updater._step_update_plugins(r)  # must not raise
-
-    steps = {s.name: s for s in r.steps}
-    assert steps["plugin-update:perfmatters"].status == "skipped"
-    assert "fingerprint unchanged" in steps["plugin-update:perfmatters"].detail
+@pytest.mark.parametrize(
+    "raw_status",
+    ["Updated", "UPDATED", "updated", "Success", "success", "updated successfully",
+     "Updated Successfully", "UPDATED SUCCESSFULLY"],
+)
+def test_run_plugin_update_structured_tolerant_status(tmp_path: Path, raw_status: str) -> None:
+    """All these strings must classify as success after .strip().lower()."""
+    assert raw_status.strip().lower() in wp_update._PLUGIN_STATUS_SUCCESS
 
 
-def test_step_update_plugins_delegates_to_per_plugin_restore_on_changed_fingerprint(
-    tmp_path: Path,
-) -> None:
+@pytest.mark.parametrize(
+    "raw_status",
+    ["Up to date", "UP TO DATE", "up to date", "Already up to date",
+     "already up to date"],
+)
+def test_run_plugin_update_structured_tolerant_uptodate(tmp_path: Path, raw_status: str) -> None:
+    assert raw_status.strip().lower() in wp_update._PLUGIN_STATUS_UPTODATE
+
+
+def test_step_update_plugins_success_continues(tmp_path: Path) -> None:
+    """3 plugins, all update cleanly, verify passes after each."""
     updater = _make_updater(tmp_path)
     r = _make_exec_report()
     r.baseline = {
@@ -842,73 +805,190 @@ def test_step_update_plugins_delegates_to_per_plugin_restore_on_changed_fingerpr
             {"name": "plugin-c", "version": "1.0", "update_version": "2.0"},
         ]
     }
-    fps: dict[str, list[str]] = {
-        "plugin-a": ["fp-a", "fp-a"],
-        "plugin-b": ["fp-b-before", "fp-b-after"],  # changed
-        "plugin-c": ["fp-c", "fp-c"],
-    }
-    call_counts: dict[str, int] = {"plugin-a": 0, "plugin-b": 0, "plugin-c": 0}
-
-    def fake_fingerprint(report: wp_update.SiteReport, slug: str) -> str:
-        call_counts[slug] += 1
-        return fps[slug][(call_counts[slug] - 1) % 2]
 
     def fake_structured(report: wp_update.SiteReport, slug: str) -> dict:
-        if slug == "plugin-b":
-            return {"name": slug, "status": "Error", "_exit_nonzero": True}
-        return {"name": slug, "status": "Updated"}
+        return {"name": slug, "status": "Updated", "version": "2.0"}
 
     with (
-        patch.object(updater, "_snapshot_plugin"),
-        patch.object(updater, "_plugin_dir_fingerprint", side_effect=fake_fingerprint),
         patch.object(updater, "_run_plugin_update_structured", side_effect=fake_structured),
-        patch.object(updater, "_verify"),
-        patch.object(updater, "_try_restore_plugin", return_value=True) as mock_restore,
+        patch.object(updater, "_verify") as mock_verify,
+        patch.object(updater, "_wp") as mock_wp,
     ):
         updater._step_update_plugins(r)
 
-    mock_restore.assert_called_once()
-    assert mock_restore.call_args[0][1] == "plugin-b"
+    # No deactivation should have run on the happy path
+    mock_wp.assert_not_called()
+    assert mock_verify.call_count == 3
 
     steps = {s.name: s for s in r.steps}
     assert steps["plugin-update:plugin-a"].status == "success"
-    assert steps["plugin-update:plugin-b"].status == "rolled-back-local"
+    assert steps["plugin-update:plugin-b"].status == "success"
     assert steps["plugin-update:plugin-c"].status == "success"
 
 
-def test_step_update_plugins_propagates_when_per_plugin_restore_fails(
-    tmp_path: Path,
-) -> None:
+def test_step_update_plugins_non_fatal_error_skips(tmp_path: Path) -> None:
+    """plugin 2 returns Error (license failure) but verify passes → skipped,
+    continues to plugin 3, no rollback."""
     updater = _make_updater(tmp_path)
     r = _make_exec_report()
     r.baseline = {
-        "plugin_updates": [{"name": "bad-plugin", "version": "1.0", "update_version": "2.0"}]
+        "plugin_updates": [
+            {"name": "plugin-a", "version": "1.0", "update_version": "2.0"},
+            {"name": "plugin-b", "version": "1.0", "update_version": "2.0"},
+            {"name": "plugin-c", "version": "1.0", "update_version": "2.0"},
+        ]
     }
 
+    def fake_structured(report: wp_update.SiteReport, slug: str) -> dict:
+        if slug == "plugin-b":
+            return {"name": slug, "status": "Error", "_exit_nonzero": True,
+                    "_error": "license key invalid"}
+        return {"name": slug, "status": "Updated", "version": "2.0"}
+
     with (
-        patch.object(updater, "_snapshot_plugin"),
-        patch.object(updater, "_plugin_dir_fingerprint",
-                     side_effect=["fp-before", "fp-after"]),
-        patch.object(updater, "_run_plugin_update_structured",
-                     return_value={"name": "bad-plugin", "status": "Error",
-                                   "_exit_nonzero": True}),
-        patch.object(updater, "_try_restore_plugin", return_value=False),
-        pytest.raises(wp_update.SSHError, match="per-plugin restore failed"),
+        patch.object(updater, "_run_plugin_update_structured", side_effect=fake_structured),
+        patch.object(updater, "_verify"),  # always passes
+        patch.object(updater, "_wp") as mock_wp,
+    ):
+        updater._step_update_plugins(r)  # must not raise
+
+    mock_wp.assert_not_called()  # no deactivation needed
+
+    steps = {s.name: s for s in r.steps}
+    assert steps["plugin-update:plugin-a"].status == "success"
+    assert steps["plugin-update:plugin-b"].status == "skipped"
+    assert "non-fatal error" in steps["plugin-update:plugin-b"].detail
+    assert steps["plugin-update:plugin-c"].status == "success"
+
+
+def test_step_update_plugins_fatal_deactivation_recovers(tmp_path: Path) -> None:
+    """plugin 2 update 'succeeds' but verify fails; wp plugin deactivate
+    succeeds and subsequent verify passes → degraded, continues, no rollback."""
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    r.baseline = {
+        "plugin_updates": [
+            {"name": "plugin-a", "version": "1.0", "update_version": "2.0"},
+            {"name": "plugin-b", "version": "1.0", "update_version": "2.0"},
+            {"name": "plugin-c", "version": "1.0", "update_version": "2.0"},
+        ]
+    }
+
+    verify_calls: list[str] = []
+    # verify call sequence: a-post, b-post(FAIL), b-after-deactivate(OK), c-post
+    verify_returns = iter([None, wp_update.HealthCheckError("500"), None, None])
+
+    def fake_verify(report: wp_update.SiteReport) -> None:
+        verify_calls.append("v")
+        nxt = next(verify_returns)
+        if isinstance(nxt, Exception):
+            raise nxt
+
+    wp_calls: list[str] = []
+
+    def fake_wp(report: wp_update.SiteReport, cmd: str, timeout: int | None = None) -> str:
+        wp_calls.append(cmd)
+        return "Plugin deactivated."
+
+    def fake_structured(report: wp_update.SiteReport, slug: str) -> dict:
+        return {"name": slug, "status": "Updated", "version": "2.0"}
+
+    with (
+        patch.object(updater, "_run_plugin_update_structured", side_effect=fake_structured),
+        patch.object(updater, "_verify", side_effect=fake_verify),
+        patch.object(updater, "_wp", side_effect=fake_wp),
+    ):
+        updater._step_update_plugins(r)  # must not raise
+
+    # Deactivate was invoked exactly once for plugin-b
+    assert any("plugin deactivate" in c and "plugin-b" in c for c in wp_calls)
+    # verify called 4 times (3 post-update + 1 post-deactivation)
+    assert len(verify_calls) == 4
+
+    steps = {s.name: s for s in r.steps}
+    assert steps["plugin-update:plugin-a"].status == "success"
+    assert steps["plugin-update:plugin-b"].status == "degraded"
+    assert "deactivated" in steps["plugin-update:plugin-b"].detail
+    assert steps["plugin-update:plugin-c"].status == "success"
+
+
+def test_step_update_plugins_fatal_deactivation_fails_escalates(tmp_path: Path) -> None:
+    """plugin 2 update succeeds but verify fails; deactivation runs but
+    re-verify still fails → SSHError raised."""
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    r.baseline = {
+        "plugin_updates": [
+            {"name": "plugin-a", "version": "1.0", "update_version": "2.0"},
+            {"name": "plugin-b", "version": "1.0", "update_version": "2.0"},
+        ]
+    }
+
+    # verify: a-post(OK), b-post(FAIL), b-after-deactivate(FAIL)
+    verify_returns = iter([None,
+                           wp_update.HealthCheckError("500 after update"),
+                           wp_update.HealthCheckError("still 500 after deactivate")])
+
+    def fake_verify(report: wp_update.SiteReport) -> None:
+        nxt = next(verify_returns)
+        if isinstance(nxt, Exception):
+            raise nxt
+
+    def fake_structured(report: wp_update.SiteReport, slug: str) -> dict:
+        return {"name": slug, "status": "Updated", "version": "2.0"}
+
+    with (
+        patch.object(updater, "_run_plugin_update_structured", side_effect=fake_structured),
+        patch.object(updater, "_verify", side_effect=fake_verify),
+        patch.object(updater, "_wp", return_value="Plugin deactivated."),
+        pytest.raises(wp_update.SSHError, match="plugin plugin-b"),
     ):
         updater._step_update_plugins(r)
 
     steps = {s.name: s for s in r.steps}
-    assert steps["plugin-update:bad-plugin"].status == "failed"
+    assert steps["plugin-update:plugin-a"].status == "success"
+    assert steps["plugin-update:plugin-b"].status == "failed"
 
 
-# ---------------------------------------------------------------------------
-# Part 2 — Per-plugin incremental snapshots
-# ---------------------------------------------------------------------------
-
-def test_step_backup_creates_plugins_subdir_in_script(tmp_path: Path) -> None:
+def test_step_update_plugins_verify_called_after_each(tmp_path: Path) -> None:
+    """On the happy path, _verify is called exactly once per plugin."""
     updater = _make_updater(tmp_path)
     r = _make_exec_report()
-    r.backup_dir = None  # will be set by _step_backup
+    slugs = [f"plugin-{i}" for i in range(5)]
+    r.baseline = {
+        "plugin_updates": [
+            {"name": s, "version": "1.0", "update_version": "2.0"} for s in slugs
+        ]
+    }
+
+    with (
+        patch.object(updater, "_run_plugin_update_structured",
+                     side_effect=lambda rep, slug: {"name": slug, "status": "Updated"}),
+        patch.object(updater, "_verify") as mock_verify,
+    ):
+        updater._step_update_plugins(r)
+
+    assert mock_verify.call_count == len(slugs)
+
+
+def test_extract_plugin_error_prefers_message(tmp_path: Path) -> None:
+    assert wp_update._extract_plugin_error(
+        {"name": "x", "status": "Error", "message": "license expired"}
+    ) == "license expired"
+
+
+def test_extract_plugin_error_truncates_long_raw() -> None:
+    long = "x" * 500
+    err = wp_update._extract_plugin_error({"name": "x", "status": "Error", "_raw": long})
+    assert len(err) <= 200
+
+
+def test_step_backup_still_creates_backup_dir_without_plugins_subdir(tmp_path: Path) -> None:
+    """Regression: the plugins/ subdir mkdir has been removed; the main
+    backup dir mkdir and all other backup steps remain."""
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    r.backup_dir = ""  # will be set by _step_backup
 
     captured: list[str] = []
 
@@ -919,93 +999,10 @@ def test_step_backup_creates_plugins_subdir_in_script(tmp_path: Path) -> None:
     with patch.object(updater, "_ssh", side_effect=fake_ssh):
         updater._step_backup(r)
 
-    assert captured, "expected _ssh to be called"
-    script = captured[0]
-    assert "/plugins" in script
-    assert "mkdir -p" in script
-
-
-def test_snapshot_plugin_tars_slug_from_plugins_root(tmp_path: Path) -> None:
-    updater = _make_updater(tmp_path)
-    r = _make_exec_report()
-    captured: list[str] = []
-
-    def fake_ssh(report: wp_update.SiteReport, script: str, **kw: object) -> str:
-        captured.append(script)
-        return ""
-
-    with patch.object(updater, "_ssh", side_effect=fake_ssh):
-        updater._snapshot_plugin(r, "my-plugin")
-
     assert captured
     script = captured[0]
-    assert "wp-content/plugins" in script
-    assert "my-plugin.tar.gz" in script
-    assert "tar -czf" in script
-
-
-def test_snapshot_plugin_records_skipped_when_dir_missing(tmp_path: Path) -> None:
-    updater = _make_updater(tmp_path)
-    r = _make_exec_report()
-
-    with patch.object(updater, "_ssh", return_value="no-plugin-dir"):
-        updater._snapshot_plugin(r, "gone-plugin")
-
-    steps = {s.name: s for s in r.steps}
-    assert steps["plugin-snapshot:gone-plugin"].status == "skipped"
-
-
-def test_try_restore_plugin_success_returns_true(tmp_path: Path) -> None:
-    updater = _make_updater(tmp_path)
-    r = _make_exec_report()
-
-    with (
-        patch.object(updater, "_ssh", return_value=""),
-        patch.object(updater, "_verify"),
-    ):
-        result = updater._try_restore_plugin(r, "my-plugin")
-
-    assert result is True
-    steps = {s.name: s for s in r.steps}
-    assert steps["plugin-restore:my-plugin"].status == "success"
-
-
-def test_try_restore_plugin_returns_false_when_tarball_missing(tmp_path: Path) -> None:
-    updater = _make_updater(tmp_path)
-    r = _make_exec_report()
-
-    with patch.object(updater, "_ssh",
-                      side_effect=wp_update.SSHError("exit=1: no-tarball")):
-        result = updater._try_restore_plugin(r, "missing-plugin")
-
-    assert result is False
-    steps = {s.name: s for s in r.steps}
-    assert steps["plugin-restore:missing-plugin"].status == "failed"
-
-
-def test_try_restore_plugin_returns_false_when_verify_fails(tmp_path: Path) -> None:
-    updater = _make_updater(tmp_path)
-    r = _make_exec_report()
-
-    with (
-        patch.object(updater, "_ssh", return_value=""),
-        patch.object(updater, "_verify",
-                     side_effect=wp_update.HealthCheckError("site down after restore")),
-    ):
-        result = updater._try_restore_plugin(r, "broken-plugin")
-
-    assert result is False
-    steps = {s.name: s for s in r.steps}
-    assert steps["plugin-restore:broken-plugin"].status == "failed"
-    assert "verify" in steps["plugin-restore:broken-plugin"].detail
-
-
-def test_try_restore_plugin_returns_false_when_no_backup_dir(tmp_path: Path) -> None:
-    updater = _make_updater(tmp_path)
-    r = make_report()  # no backup_dir set
-
-    with patch.object(updater, "_ssh") as mock_ssh:
-        result = updater._try_restore_plugin(r, "any-plugin")
-
-    assert result is False
-    mock_ssh.assert_not_called()
+    assert "mkdir -p" in script
+    assert "preflight.sql" in script
+    assert "public_html.tar.gz" in script
+    # The per-plugin snapshot subdir is no longer created
+    assert "/plugins'" not in script  # specifically the mkdir '…/plugins' line
