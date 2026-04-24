@@ -478,6 +478,132 @@ def test_ssh_preflight_raises_when_no_master_credentials(tmp_path: Path) -> None
 
 
 # ---------------------------------------------------------------------------
+# Tier-1 multi-candidate cascade (SSH_USER_CANDIDATES)
+# ---------------------------------------------------------------------------
+
+def _make_args_with_env(tmp_path: Path, env_body: str) -> argparse.Namespace:
+    """Like make_args but lets the caller control the .env contents."""
+    args = make_args(tmp_path)
+    args.env_file.write_text(env_body)
+    return args
+
+
+def test_tier1_tries_all_candidates_until_one_succeeds(tmp_path: Path) -> None:
+    args = _make_args_with_env(
+        tmp_path,
+        "SSH_USER=wpupdates\n"
+        "SSH_USER_CANDIDATES=wpupdates-2,wpupdates-3\n"
+        "SSH_KEY=\nAPP_PW=\n",
+    )
+    updater = wp_update.WPUpdater(args)
+    r = _make_report_for_preflight(tmp_path)
+    r.ssh_user = ""  # force the updater-level candidate list to drive ordering
+
+    attempted: list[str] = []
+
+    def fake_ssh(report: wp_update.SiteReport, script: str, timeout: object = None) -> str:
+        attempted.append(report.ssh_user)
+        if report.ssh_user in ("wpupdates", "wpupdates-2"):
+            raise wp_update.SSHError("Permission denied (publickey)")
+        return "ssh-ok"
+
+    with patch.object(updater, "_ssh", side_effect=fake_ssh), \
+         patch.object(updater, "_wp", return_value=""):
+        updater._step_ssh_preflight(r)
+
+    assert r.auth_method == "key"
+    assert r.auth_user == "wpupdates-3"
+    assert attempted == ["wpupdates", "wpupdates-2", "wpupdates-3"]
+
+
+def test_tier1_falls_to_master_when_all_candidates_fail(tmp_path: Path) -> None:
+    args = _make_args_with_env(
+        tmp_path,
+        "SSH_USER=wpupdates\n"
+        "SSH_USER_CANDIDATES=wpupdates-2,wpupdates-3\n"
+        "SSH_KEY=\nAPP_PW=\n",
+    )
+    updater = wp_update.WPUpdater(args)
+    r = _make_report_for_preflight(tmp_path)
+    r.ssh_user = ""
+
+    def fake_ssh(report: wp_update.SiteReport, script: str, timeout: object = None) -> str:
+        if report.auth_method == "key":
+            raise wp_update.SSHError("Permission denied (publickey)")
+        return "ssh-ok"
+
+    with patch.object(updater, "_ssh", side_effect=fake_ssh), \
+         patch.object(updater, "_wp", return_value=""):
+        updater._step_ssh_preflight(r)
+
+    assert r.auth_method == "master-key"
+    assert r.auth_user == r.master_user
+
+
+def test_tier1_reraises_on_nonpermission_error(tmp_path: Path) -> None:
+    args = _make_args_with_env(
+        tmp_path,
+        "SSH_USER=wpupdates\n"
+        "SSH_USER_CANDIDATES=wpupdates-2,wpupdates-3\n"
+        "SSH_KEY=\nAPP_PW=\n",
+    )
+    updater = wp_update.WPUpdater(args)
+    r = _make_report_for_preflight(tmp_path)
+    r.ssh_user = ""
+
+    attempted: list[str] = []
+
+    def fake_ssh(report: wp_update.SiteReport, script: str, timeout: object = None) -> str:
+        attempted.append(report.ssh_user)
+        raise wp_update.SSHError("Connection timed out")
+
+    with patch.object(updater, "_ssh", side_effect=fake_ssh), \
+         patch.object(updater, "_wp", return_value=""), \
+         pytest.raises(wp_update.SSHError, match="Connection timed out"):
+        updater._step_ssh_preflight(r)
+
+    # Only the first candidate should have been attempted; non-permission
+    # failures short-circuit the cascade.
+    assert attempted == ["wpupdates"]
+
+
+def test_ssh_user_candidates_dedup_order(tmp_path: Path) -> None:
+    args = _make_args_with_env(
+        tmp_path,
+        "SSH_USER=foo\n"
+        "SSH_USER_CANDIDATES=foo, bar ,foo,baz\n"
+        "SSH_KEY=\nAPP_PW=\n",
+    )
+    updater = wp_update.WPUpdater(args)
+    assert updater._ssh_user_candidates == ["foo", "bar", "baz"]
+
+
+def test_summary_includes_auth_user(tmp_path: Path) -> None:
+    args = _make_args_with_env(
+        tmp_path,
+        "SSH_USER=wpupdates\n"
+        "SSH_USER_CANDIDATES=wpupdates-stage\n"
+        "SSH_KEY=\nAPP_PW=\n",
+    )
+    updater = wp_update.WPUpdater(args)
+    r = _make_report_for_preflight(tmp_path)
+    r.ssh_user = ""
+
+    def fake_ssh(report: wp_update.SiteReport, script: str, timeout: object = None) -> str:
+        if report.ssh_user == "wpupdates":
+            raise wp_update.SSHError("Permission denied (publickey)")
+        return "ssh-ok"
+
+    with patch.object(updater, "_ssh", side_effect=fake_ssh), \
+         patch.object(updater, "_wp", return_value=""):
+        updater._step_ssh_preflight(r)
+
+    serialised = r.to_dict()
+    assert "auth_user" in serialised
+    assert serialised["auth_user"] == "wpupdates-stage"
+
+
+# ---------------------------------------------------------------------------
 # _step_rollback — success and failure paths
 # ---------------------------------------------------------------------------
 

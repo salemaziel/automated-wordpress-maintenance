@@ -201,6 +201,12 @@ class SiteReport:
     # after any file-mutating operation.
     auth_method: str = "key"
 
+    # The username that actually authenticated at preflight time — either the
+    # winning tier-1 candidate (e.g. "wpupdates-stage") or the master user.
+    # Always populated post-preflight so the summary JSON records which user
+    # worked, letting us later bake it into the client JSON.
+    auth_user: str = ""
+
     # Original user:group of the wp_path directory, captured before mutations.
     # Used to chown -R back after updates when running as master user.
     original_owner: str = ""
@@ -223,6 +229,7 @@ class SiteReport:
             "has_woocommerce": self.has_woocommerce,
             "overall": self.overall,
             "auth_method": self.auth_method,
+            "auth_user": self.auth_user,
             "original_owner": self.original_owner,
             "backup_dir": self.backup_dir,
             "failure_step": self.failure_step,
@@ -378,6 +385,22 @@ class WPUpdater:
         self._ssh_key = self.env.get("SSH_KEY", "")
         self._app_pw = self.env.get("APP_PW", "")
 
+        # Build effective tier-1 candidate list: SSH_USER (back-compat)
+        # followed by any entries in SSH_USER_CANDIDATES, trimmed and
+        # de-duplicated while preserving order. Cloudways apps are
+        # provisioned with per-app users like wpupdates, wpupdates-stage,
+        # wpupdates-2 — a single SSH_USER can't cover all sites.
+        self._ssh_user_candidates: list[str] = []
+        _seen: set[str] = set()
+        if self._ssh_user and self._ssh_user not in _seen:
+            self._ssh_user_candidates.append(self._ssh_user)
+            _seen.add(self._ssh_user)
+        for raw in self.env.get("SSH_USER_CANDIDATES", "").split(","):
+            name = raw.strip()
+            if name and name not in _seen:
+                self._ssh_user_candidates.append(name)
+                _seen.add(name)
+
         # SSL context for HTTP verification
         self._ssl_ctx = ssl.create_default_context()
         if args.skip_ssl_verify:
@@ -385,8 +408,10 @@ class WPUpdater:
             self._ssl_ctx.verify_mode = ssl.CERT_NONE
 
         # Pre-flight validation. load_env already expands ~ in SSH_KEY.
-        if args.execute and not self._ssh_user:
-            self.log.error("SSH_USER is required in .env for --execute mode")
+        if args.execute and not self._ssh_user_candidates:
+            self.log.error(
+                "SSH_USER or SSH_USER_CANDIDATES is required in .env for --execute mode"
+            )
             raise SystemExit(1)
         key_path = Path(self._ssh_key) if self._ssh_key else None
         if key_path and not key_path.exists():
@@ -746,12 +771,34 @@ class WPUpdater:
     # Step: SSH preflight
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _is_permission_denied(stderr: str) -> bool:
+        """
+        Heuristic to distinguish 'this username isn't authorized here'
+        (try next candidate) from 'host is unreachable' (stop trying).
+
+        True when the error looks like an auth failure — Cloudways returns
+        either 'Permission denied' or drops the connection with
+        'Received disconnect' / exit 255 + 'publickey' mention. Anything
+        else (timeout, network unreachable, host key mismatch) is treated
+        as fatal.
+        """
+        if not stderr:
+            return False
+        low = stderr.lower()
+        if "permission denied" in low:
+            return True
+        if "received disconnect" in low:
+            return True
+        return False
+
     def _step_ssh_preflight(self, r: SiteReport) -> None:
         """
         Establish SSH connectivity and verify WordPress is installed.
 
         Three-tier auth cascade:
-          1. SSH key + wpupdates user (app-scoped).
+          1. SSH key + each candidate app-scoped user (wpupdates,
+             wpupdates-stage, wpupdates-2, ...) until one succeeds.
           2. SSH key + master username — same key, but the master user has
              server-wide access to all application directories.
           3. sshpass + master password — last resort when the key isn't
@@ -759,22 +806,57 @@ class WPUpdater:
 
         When master fallback is used (tier 2 or 3), r.auth_method is set to
         "master" so downstream steps know to capture and restore file
-        ownership after mutations.
+        ownership after mutations. r.auth_user is always populated with the
+        username that actually authenticated.
         """
         t0 = ts()
         r.auth_method = "key"
 
-        # --- Tier 1: SSH key + wpupdates (app-scoped user) ---
-        try:
-            self._ssh(r, "echo 'ssh-ok'")
-            self._wp(r, "core is-installed")
-            self._record_step(r, "ssh-preflight", "success",
-                              f"SSH reachable at {r.server_ip} (auth=key)", t0)
-            return
-        except SSHError as exc:
-            tier1_err = str(exc)
-            if "Permission denied" not in tier1_err:
-                raise  # Not a permission issue — re-raise
+        # --- Tier 1: SSH key + app-scoped candidates ---
+        #
+        # Build the per-site candidate list. If the client JSON recorded a
+        # non-placeholder username for this app, prefer it first (a stale
+        # value won't break the run because we still fall through to the
+        # global list). r.ssh_user comes from resolve(sftp["username"]) or
+        # the first global candidate — see _validate_app.
+        candidates: list[str] = []
+        seen: set[str] = set()
+        if r.ssh_user and r.ssh_user not in seen:
+            candidates.append(r.ssh_user)
+            seen.add(r.ssh_user)
+        for name in self._ssh_user_candidates:
+            if name and name not in seen:
+                candidates.append(name)
+                seen.add(name)
+
+        tier1_permission_failure = False
+        for candidate in candidates:
+            r.ssh_user = candidate  # _ssh / _wp read this
+            try:
+                self._ssh(r, "echo 'ssh-ok'")
+                self._wp(r, "core is-installed")
+                r.auth_user = candidate
+                self.log.info(
+                    "SSH tier 1 ok as %s (auth=key) | %s", candidate, r.domain
+                )
+                self._record_step(
+                    r, "ssh-preflight", "success",
+                    f"SSH reachable at {r.server_ip} as {candidate} (auth=key)", t0,
+                )
+                return
+            except SSHError as exc:
+                if self._is_permission_denied(str(exc)):
+                    self.log.debug(
+                        "Tier 1 candidate %s denied; trying next", candidate
+                    )
+                    tier1_permission_failure = True
+                    continue
+                raise  # Network / timeout / host unreachable — don't waste time
+
+        if candidates and not tier1_permission_failure:
+            # No candidates ever hit a permission error but none succeeded
+            # either — this means the list was empty. Guarded below.
+            pass
 
         # Need master credentials for tier 2 and 3
         if not r.master_user:
@@ -785,10 +867,11 @@ class WPUpdater:
 
         # --- Tier 2: SSH key + master username ---
         self.log.info(
-            "Key+wpupdates can't access %s — trying key+master user",
-            r.wp_path,
+            "SSH tier 1 failed for all candidates %s — trying key+master user | %s",
+            candidates, r.domain,
         )
         r.auth_method = "master-key"
+        r.auth_user = r.master_user
         try:
             self._ssh(r, "echo 'ssh-ok'")
             self._wp(r, "core is-installed")
@@ -815,6 +898,7 @@ class WPUpdater:
             r.wp_path,
         )
         r.auth_method = "master"
+        r.auth_user = r.master_user
         self._ssh(r, "echo 'ssh-ok'")
         self._wp(r, "core is-installed")
         self._record_step(r, "ssh-preflight", "success",
