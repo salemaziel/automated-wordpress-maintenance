@@ -44,8 +44,8 @@ Rollback mechanism:
   Before ANY update, the script creates:
     1. A full database dump via `wp db export --add-drop-table`
     2. A compressed tar of the entire public_html directory
-  Both are stored under /home/master/wp-maintenance-backups/<client>/<app>/<run_id>/
-  which is persistent storage (not /tmp/).
+  Both are stored under <app_dir>/private_html/wp-maintenance-backups/<run_id>/
+  which is persistent storage writable by the app SSH user (not /tmp/).
 
   If an update step fails:
     1. The failed state is archived (for forensic analysis)
@@ -887,9 +887,9 @@ class WPUpdater:
     # ------------------------------------------------------------------
     # Step: Pre-flight backup
     #
-    # Backups go to /home/master/wp-maintenance-backups/ which is
-    # persistent storage on Cloudways servers (not /tmp/ which can be
-    # wiped on reboot or by cron).
+    # Backups go to <app_dir>/private_html/wp-maintenance-backups/<run_id>/
+    # private_html is group-writable by www-data (same group as the app SSH
+    # user), not web-accessible, and persistent across reboots.
     # ------------------------------------------------------------------
 
     def _step_disk_check(self, r: SiteReport) -> None:
@@ -958,8 +958,8 @@ echo "${{du_bytes:-0}} ${{avail_bytes:-0}}"
         # /home/master/applications/<hash>/public_html → <hash>
         app_hash = r.wp_path.split("/")[-2]
         backup_dir = (
-            f"/home/master/wp-maintenance-backups"
-            f"/{slugify(r.client)}/{app_hash}/{self.run_id}"
+            f"/home/master/applications/{app_hash}/private_html"
+            f"/wp-maintenance-backups/{self.run_id}"
         )
         r.backup_dir = backup_dir
 
@@ -1384,7 +1384,11 @@ echo 'rollback-ok'
         where wp-config.php lives.  We must `cd` into the WordPress root
         before invoking wp-cli, otherwise the require fails.
         """
-        script = f"cd {shlex.quote(r.wp_path)} && wp --path={shlex.quote(r.wp_path)} {wp_cmd}"
+        script = (
+            f"cd {shlex.quote(r.wp_path)} && "
+            f"WP_CLI_CACHE_DIR=$HOME/tmp/.wp-cli-cache "
+            f"wp --path={shlex.quote(r.wp_path)} {wp_cmd}"
+        )
         return self._ssh(r, script, timeout)
 
     def _wp_text(self, r: SiteReport, wp_cmd: str) -> str:
