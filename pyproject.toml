@@ -1,0 +1,12 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP", "SIM", "RET"]
+ignore = [
+    # f-strings inside log calls are intentional throughout this script.
+    # Lazy %-formatting buys nothing for an operator-facing CLI.
+]

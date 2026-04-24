@@ -60,6 +60,7 @@ Rollback mechanism:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import os
@@ -69,8 +70,9 @@ import shutil
 import ssl
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib import error as urlerror
@@ -80,7 +82,7 @@ from urllib import request as urlrequest
 # Constants
 # ---------------------------------------------------------------------------
 
-SCRIPT_DIR = Path(__file__).resolve().parent            # automated-wordpress-maintenance/
+SCRIPT_DIR = Path(__file__).resolve().parent            # claude-wordpress-maintenance/
 DEFAULT_ENV = SCRIPT_DIR / ".env"
 DEFAULT_CLIENTS = SCRIPT_DIR / "clients"
 DEFAULT_LOGS = SCRIPT_DIR / "logs"
@@ -97,11 +99,10 @@ FATAL_MARKERS = (
     "stack trace",
 )
 
-# Fields that must NEVER appear in log files or summary JSON
-REDACTED_FIELDS = {"ssh_password", "ssh_key_path", "master_password"}
-
 # Known backup/migration plugins — if present, the site has an alternative
 # backup mechanism beyond our script's own pre-flight backup.
+# Note: jetpack-backup is the actual backup add-on; the base "jetpack" slug
+# does NOT imply backup capability.
 KNOWN_BACKUP_PLUGINS = {
     "updraftplus":              "UpdraftPlus",
     "backwpup":                 "BackWPup",
@@ -111,10 +112,31 @@ KNOWN_BACKUP_PLUGINS = {
     "blogvault-real-time-backup": "BlogVault",
     "wpvivid-backuprestore":    "WPvivid",
     "backup-backup":            "Backup Migration",
-    "jetpack":                  "Jetpack (includes backup)",
+    "jetpack-backup":           "Jetpack Backup",
     "backupwordpress":          "BackUpWordPress",
-    "flavstarter-flavor-starter": "flavor starter",
-    "flavor-starter":           "flavor starter",
+}
+
+# Confidence-scoring rules used by _compute_confidence. Tunable in one place.
+CONFIDENCE_RULES = {
+    "woocommerce_penalty": 15,
+    "plugin_updates_high_threshold": 10,
+    "plugin_updates_high_penalty": 20,
+    "plugin_updates_med_threshold": 5,
+    "plugin_updates_med_penalty": 10,
+    "plugin_updates_low_penalty": 3,
+    "theme_updates_penalty": 5,
+    "core_update_penalty": 5,
+    "large_site_threshold_mb": 2000,
+    "large_site_penalty": 5,
+    "tight_disk_multiplier": 3,
+    "tight_disk_penalty": 10,
+    "old_php_threshold": 8.0,
+    "old_php_penalty": 10,
+    "no_backup_plugin_penalty": 5,
+    "staging_bonus": 10,
+    "grade_high_min": 90,
+    "grade_medium_min": 70,
+    "grade_low_min": 50,
 }
 
 
@@ -206,6 +228,10 @@ class HealthCheckError(RuntimeError):
     """Post-update HTTP or WP-CLI verification failed."""
 
 
+class WPCliError(RuntimeError):
+    """A wp-cli command produced unparseable output (e.g. malformed JSON)."""
+
+
 class RollbackFailed(RuntimeError):
     """The rollback itself failed — manual intervention needed."""
 
@@ -216,7 +242,7 @@ class RollbackFailed(RuntimeError):
 
 def ts() -> str:
     """Current UTC timestamp in ISO-8601."""
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -278,8 +304,8 @@ def make_logger(log_dir: Path, run_id: str, stream: bool = False) -> logging.Log
     fmt = logging.Formatter(
         "%(asctime)s  %(levelname)-7s  %(message)s", "%Y-%m-%dT%H:%M:%SZ"
     )
-    # Force UTC
-    fmt.converter = lambda *_: datetime.now(timezone.utc).timetuple()
+    # Force UTC for log timestamps
+    fmt.converter = time.gmtime
 
     fh = logging.FileHandler(log_dir / f"wp-update-{run_id}.log", encoding="utf-8")
     fh.setFormatter(fmt)
@@ -315,10 +341,12 @@ class WPUpdater:
 
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
-        self.run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        self.run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         self.env = load_env(args.env_file)
         self.log = make_logger(args.log_dir, self.run_id, stream=args.stream)
         self.reports: list[SiteReport] = []
+        self._consecutive_execute_failures = 0
+        self._run_abort_reason = ""
 
         # Global SSH credentials from .env
         self._ssh_user = self.env.get("SSH_USER", "")
@@ -326,18 +354,16 @@ class WPUpdater:
         self._app_pw = self.env.get("APP_PW", "")
 
         # SSL context for HTTP verification
+        self._ssl_ctx = ssl.create_default_context()
         if args.skip_ssl_verify:
-            self._ssl_ctx = ssl.create_default_context()
             self._ssl_ctx.check_hostname = False
             self._ssl_ctx.verify_mode = ssl.CERT_NONE
-        else:
-            self._ssl_ctx = ssl.create_default_context()
 
-        # Pre-flight validation
+        # Pre-flight validation. load_env already expands ~ in SSH_KEY.
         if args.execute and not self._ssh_user:
             self.log.error("SSH_USER is required in .env for --execute mode")
             raise SystemExit(1)
-        key_path = Path(self._ssh_key).expanduser() if self._ssh_key else None
+        key_path = Path(self._ssh_key) if self._ssh_key else None
         if key_path and not key_path.exists():
             self.log.error("SSH_KEY points to missing file: %s", key_path)
             raise SystemExit(1)
@@ -361,14 +387,21 @@ class WPUpdater:
                        "EXECUTE" if self.args.execute else "DRY-RUN", len(files))
         self.log.info("=" * 70)
 
-        for path in files:
-            self._process_client_file(path)
+        try:
+            for path in files:
+                self._process_client_file(path)
+                if self._run_abort_reason:
+                    self.log.error("ABORTING RUN  |  %s", self._run_abort_reason)
+                    break
+        except RollbackFailed as exc:
+            self._run_abort_reason = str(exc)
+            self.log.error("ABORTING RUN  |  %s", exc)
 
         self._write_summary()
         self._print_final_report()
 
         failures = [r for r in self.reports if r.overall in ("failed",)]
-        return 1 if failures else 0
+        return 1 if failures or self._run_abort_reason else 0
 
     # ------------------------------------------------------------------
     # Client file handling (graceful on incomplete files)
@@ -420,7 +453,7 @@ class WPUpdater:
         # Validate all apps first, then sort staging before production.
         # In execute mode, staging sites are updated first so the operator
         # can review the logs before production sites are touched.
-        validated: list[tuple[int, dict, SiteReport]] = []
+        validated: list[tuple[int, dict[str, Any], SiteReport]] = []
         for idx, app in enumerate(apps, 1):
             try:
                 report = self._validate_app(doc, app, idx, path.name)
@@ -450,34 +483,79 @@ class WPUpdater:
 
             # In execute mode, if a staging site failed or rolled back,
             # skip production sites on the same server — don't risk it.
+            stop_client_file = False
             if (self.args.execute
                     and report.is_staging
                     and report.overall in ("failed", "rolled-back")):
-                remaining_prod = [
-                    v for v in validated
-                    if not v[2].is_staging and v[2] not in
-                    [r for r in self.reports]
-                ]
-                if remaining_prod:
-                    self.log.warning(
-                        "⚠ Staging site %s %s — skipping %d production "
-                        "site(s) on this server",
-                        report.domain, report.overall,
-                        len(remaining_prod),
-                    )
-                    for _, _, prod_report in remaining_prod:
-                        prod_report.overall = "skipped"
-                        prod_report.failure_detail = (
-                            f"Skipped: staging site {report.domain} "
-                            f"{report.overall}"
-                        )
-                        self._record_step(
-                            prod_report, "staging-gate", "skipped",
-                            f"staging {report.domain} {report.overall} — "
-                            "not safe to proceed",
-                        )
-                        self.reports.append(prod_report)
-                    break  # Stop processing this client file
+                self._skip_remaining_production(validated, report)
+                stop_client_file = True
+
+            self._note_execute_outcome(report)
+            if stop_client_file or self._run_abort_reason:
+                break  # Stop processing this client file
+
+    def _skip_remaining_production(
+        self,
+        validated: list[tuple[int, dict[str, Any], SiteReport]],
+        failed_staging: SiteReport,
+    ) -> None:
+        """Mark every production SiteReport in `validated` that has not yet
+        been processed as 'skipped' and append it to self.reports.
+
+        Identity-based set difference (id()) makes the not-yet-processed
+        check obviously correct and rules out double-appending if logic
+        elsewhere changes which reports are recorded.
+        """
+        processed = {id(r) for r in self.reports}
+        remaining_prod = [
+            (i, a, rpt) for i, a, rpt in validated
+            if not rpt.is_staging and id(rpt) not in processed
+        ]
+        if not remaining_prod:
+            return
+
+        self.log.warning(
+            "⚠ Staging site %s %s — skipping %d production site(s) on this "
+            "server",
+            failed_staging.domain, failed_staging.overall, len(remaining_prod),
+        )
+        for _, _, prod_report in remaining_prod:
+            prod_report.overall = "skipped"
+            prod_report.failure_detail = (
+                f"Skipped: staging site {failed_staging.domain} "
+                f"{failed_staging.overall}"
+            )
+            self._record_step(
+                prod_report, "staging-gate", "skipped",
+                f"staging {failed_staging.domain} {failed_staging.overall} — "
+                "not safe to proceed",
+            )
+            self.reports.append(prod_report)
+
+    def _note_execute_outcome(self, r: SiteReport) -> None:
+        """Track execute-mode failure streaks and open the run circuit if needed."""
+        if not self.args.execute or self.args.max_consecutive_failures <= 0:
+            return
+
+        if r.overall in ("failed", "rolled-back"):
+            self._consecutive_execute_failures += 1
+            if self._consecutive_execute_failures >= self.args.max_consecutive_failures:
+                self._run_abort_reason = (
+                    "circuit breaker opened after "
+                    f"{self._consecutive_execute_failures} consecutive "
+                    "failed/rolled-back site(s)"
+                )
+                self.log.error(
+                    "⚠ RUN CIRCUIT OPEN  |  %s  |  last site=%s",
+                    self._run_abort_reason, r.domain,
+                )
+            return
+
+        if r.overall == "success" and self._consecutive_execute_failures:
+            self.log.info(
+                "Run failure streak reset after success  |  %s", r.domain
+            )
+            self._consecutive_execute_failures = 0
 
     def _validate_app(
         self, doc: dict, app: dict, idx: int, filename: str
@@ -492,7 +570,7 @@ class WPUpdater:
         flags = app.get("environment_flags", {})
 
         if not domain or domain.startswith("["):
-            raise InventoryError(f"missing website_domain")
+            raise InventoryError("missing website_domain")
         if not VALID_PATH.match(wp_path):
             raise InventoryError(f"invalid path_to_public_html: {wp_path!r}")
         if not isinstance(sftp, dict):
@@ -604,7 +682,11 @@ class WPUpdater:
             r.overall = "success"
             self.log.info("✓ SUCCESS  |  %s", r.domain)
 
-        except (SSHError, HealthCheckError) as exc:
+        except RollbackFailed:
+            # Rollback machinery already recorded the failure on r; bubble
+            # up so the operator is forced to look at it.
+            raise
+        except (SSHError, HealthCheckError, WPCliError) as exc:
             # Use the tracked step name — falls back to last recorded step
             r.failure_step = current_step
             r.failure_detail = str(exc)
@@ -613,6 +695,23 @@ class WPUpdater:
                 r.domain, r.failure_step, exc
             )
 
+            if self.args.execute and r.backup_dir:
+                self._step_rollback(r)
+            else:
+                r.overall = "failed"
+        except (OSError, subprocess.SubprocessError) as exc:
+            # Operational failure outside the typed-exception hierarchy —
+            # transient DNS, disk full, broken pipe, subprocess crash, etc.
+            # Don't let one site's environmental hiccup tear down the whole
+            # run. Programming bugs (TypeError, AttributeError, KeyError, …)
+            # are deliberately NOT caught here — they should fast-fail so
+            # they're noticed and fixed.
+            r.failure_step = current_step
+            r.failure_detail = f"unexpected {type(exc).__name__}: {exc}"
+            self.log.exception(
+                "✗ UNEXPECTED  |  %s  |  step=%s  |  %s",
+                r.domain, r.failure_step, exc,
+            )
             if self.args.execute and r.backup_dir:
                 self._step_rollback(r)
             else:
@@ -682,8 +781,8 @@ class WPUpdater:
             )
         if not shutil.which("sshpass"):
             raise SSHError(
-                f"Key auth failed — master password fallback requires "
-                f"sshpass but it's not installed"
+                "Key auth failed — master password fallback requires "
+                "sshpass but it's not installed"
             )
 
         self.log.info(
@@ -817,15 +916,8 @@ avail_bytes=$(df -B1 {shlex.quote(r.wp_path)} 2>/dev/null | awk 'NR==2{{print $4
 echo "${{du_bytes:-0}} ${{avail_bytes:-0}}"
 """
         raw = self._ssh(r, check_script).strip()
-        parts = raw.split()
-        if len(parts) != 2:
-            self._record_step(r, "disk-check", "success",
-                              f"could not parse disk info (raw={raw!r}), proceeding", t0)
-            return
-
         try:
-            site_bytes = int(parts[0])
-            avail_bytes = int(parts[1])
+            site_bytes, avail_bytes = (int(p) for p in raw.split())
         except ValueError:
             self._record_step(r, "disk-check", "success",
                               f"could not parse disk info (raw={raw!r}), proceeding", t0)
@@ -910,11 +1002,16 @@ echo 'backup-ok'
             return
 
         t0 = ts()
+        old_version = r.baseline.get("wp_version", "?")
         self._wp(r, "core update", timeout=self.args.remote_timeout)
         self._wp(r, "core update-db", timeout=self.args.remote_timeout)
         self._verify(r)
+        # Refresh baseline so summaries report the post-update version.
+        # A transient read failure here shouldn't undo a successful update.
+        with contextlib.suppress(SSHError):
+            r.baseline["wp_version"] = self._wp_text(r, "core version")
         self._record_step(r, "core-update", "success",
-                          "core updated and verified", t0)
+                          f"core {old_version} → {r.baseline.get('wp_version', '?')}", t0)
 
     # ------------------------------------------------------------------
     # Step: Update themes (sequential, one-by-one)
@@ -929,15 +1026,22 @@ echo 'backup-ok'
 
         for theme in updates:
             slug = theme.get("name", "").strip()
+            ver_from = theme.get("version", "?")
+            ver_to = theme.get("update_version", "?")
             if not slug:
                 continue
             step = f"theme-update:{slug}"
             t0 = ts()
-            self._wp(r, f"theme update {shlex.quote(slug)}",
-                      timeout=self.args.remote_timeout)
-            self._verify(r)
+            try:
+                self._wp(r, f"theme update {shlex.quote(slug)}",
+                         timeout=self.args.remote_timeout)
+                self._verify(r)
+            except (SSHError, HealthCheckError) as exc:
+                self._record_step(r, step, "failed",
+                                  f"{slug} {ver_from}→{ver_to} FAILED: {exc}", t0)
+                raise
             self._record_step(r, step, "success",
-                              f"{slug} updated and verified", t0)
+                              f"{slug} {ver_from}→{ver_to}", t0)
 
     # ------------------------------------------------------------------
     # Step: Update plugins (atomic — one at a time with verification)
@@ -1007,6 +1111,20 @@ echo 'backup-ok'
 
         script = f"""\
 set -euo pipefail
+# 0a. Defense-in-depth on the live tree: refuse to wipe a directory that
+#     doesn't look like a WordPress install. VALID_PATH already gates this
+#     at the Python layer; this is a backstop.
+if [ ! -d {shlex.quote(r.wp_path + "/wp-content")} ]; then
+    echo "rollback-abort: {r.wp_path}/wp-content not present — refusing to wipe" >&2
+    exit 99
+fi
+# 0b. Defense-in-depth on the backup archive: refuse to extract a tarball
+#     that doesn't contain wp-content/. Catches truncated/corrupt backups
+#     and refuses to repopulate public_html with non-WP contents.
+if ! tar -tzf {shlex.quote(fs_backup)} 2>/dev/null | grep -qE '(^|/)wp-content/'; then
+    echo "rollback-abort: {fs_backup} missing wp-content/ — refusing to extract" >&2
+    exit 98
+fi
 # 1. Archive the broken state for forensic analysis
 tar -czf {shlex.quote(failed_snapshot)} -C {shlex.quote(r.wp_path)} . 2>/dev/null || true
 # 2. Wipe current public_html contents
@@ -1023,12 +1141,10 @@ echo 'rollback-ok'
             if r.auth_method in ("master", "master-key") and r.original_owner:
                 self._step_restore_ownership(r)
             self._verify(r)
-            # Deactivate maintenance mode if it was on
+            # Deactivate maintenance mode if it was on (best-effort).
             if r.has_woocommerce:
-                try:
+                with contextlib.suppress(SSHError):
                     self._wp(r, "maintenance-mode deactivate")
-                except SSHError:
-                    pass  # Best-effort
             r.rollback_result = "success"
             r.overall = "rolled-back"
             self._record_step(r, "rollback", "success",
@@ -1042,6 +1158,9 @@ echo 'rollback-ok'
                 "⚠ ROLLBACK FAILED  |  %s  |  %s  |  Manual recovery needed "
                 "from %s", r.domain, exc, r.backup_dir
             )
+            raise RollbackFailed(
+                f"rollback failed for {r.domain}: {exc}"
+            ) from exc
 
     # ------------------------------------------------------------------
     # Verification
@@ -1062,6 +1181,10 @@ echo 'rollback-ok'
         if result != "ok":
             raise HealthCheckError(result)
 
+    # Retry transient connection errors before declaring a site unhealthy.
+    # 5xx and fatal-marker matches are deterministic and never retried.
+    HTTP_RETRY_BACKOFFS = (0, 1.0, 2.0)
+
     def _http_check(self, domain: str) -> str:
         """
         Hit the site over HTTPS (fallback to HTTP) and check for 5xx
@@ -1077,31 +1200,65 @@ echo 'rollback-ok'
         for base in schemes:
             for suffix in ("", "/wp-login.php"):
                 url = f"{base}{suffix}"
-                try:
-                    req = urlrequest.Request(
-                        url, headers={"User-Agent": "wp-update/1.0 (maintenance)"}
-                    )
-                    with urlrequest.urlopen(
-                        req, timeout=self.args.http_timeout, context=self._ssl_ctx
-                    ) as resp:
-                        if resp.status >= 500:
-                            return f"{url} → HTTP {resp.status}"
-                        body = resp.read(65536).decode("utf-8", errors="ignore").lower()
-                        for marker in FATAL_MARKERS:
-                            if marker in body:
-                                return f"{url} → fatal marker: {marker!r}"
-                except urlerror.HTTPError as exc:
-                    if exc.code >= 500:
-                        return f"{url} → HTTP {exc.code}"
-                    # 3xx/4xx are not fatal — continue checking
+                outcome = self._http_check_one(url)
+                if outcome is None:
+                    # Passed — check the next suffix.
                     continue
-                except Exception as exc:
-                    last_err = f"{url} → {exc}"
+                if outcome.startswith("transient:"):
+                    # Exhausted retries on a connection-class error. Move
+                    # to the next scheme but remember the message.
+                    last_err = outcome[len("transient:"):]
                     break
+                # Definitive failure (5xx or fatal marker) — bail out.
+                return outcome
             else:
                 return "ok"
 
         return last_err
+
+    def _http_check_one(self, url: str) -> str | None:
+        """Probe a single URL with retries for transient errors.
+
+        Returns:
+            None — passed; check the next suffix on the same scheme.
+            "transient:<msg>" — transient failure exhausted retries; the
+                                caller should try the next scheme.
+            anything else — definitive failure description; caller bails.
+        """
+        last_exc: Exception | None = None
+        for backoff in self.HTTP_RETRY_BACKOFFS:
+            if backoff:
+                time.sleep(backoff)
+            try:
+                req = urlrequest.Request(
+                    url, headers={"User-Agent": "wp-update/1.0 (maintenance)"}
+                )
+                with urlrequest.urlopen(
+                    req, timeout=self.args.http_timeout, context=self._ssl_ctx
+                ) as resp:
+                    if resp.status >= 500:
+                        return f"{url} → HTTP {resp.status}"
+                    body = resp.read(65536).decode("utf-8", errors="ignore").lower()
+                    for marker in FATAL_MARKERS:
+                        if marker in body:
+                            return f"{url} → fatal marker: {marker!r}"
+                return None
+            except urlerror.HTTPError as exc:
+                if exc.code >= 500:
+                    return f"{url} → HTTP {exc.code}"
+                # 3xx/4xx are deterministic — pass and check next suffix.
+                return None
+            except OSError as exc:
+                # Includes URLError, socket.timeout, ConnectionRefusedError,
+                # name resolution failures. Worth retrying.
+                last_exc = exc
+                continue
+
+        # Exhausted retries on a transient error. Surface the actual
+        # exception text so operators can diagnose.
+        msg = f"{url} → {last_exc}" if last_exc is not None else f"{url} → unknown"
+        self.log.debug("HTTP transient failure: %s", msg)
+        return f"transient:{msg}"
 
     # ------------------------------------------------------------------
     # SSH transport
@@ -1120,10 +1277,16 @@ echo 'rollback-ok'
     def _ssh(self, r: SiteReport, script: str, timeout: int | None = None) -> str:
         """Execute a script on the remote host via SSH stdin piping."""
         target = f"{r.ssh_user}@{r.server_ip}"
-        cmd = self._ssh_cmd(r)
+        cmd, sshpass_password = self._ssh_cmd(r)
         effective_timeout = timeout or self.args.remote_timeout
 
         self.log.debug("SSH → %s  |  %s", target, script.replace("\n", " \\n "))
+
+        # Pass sshpass passwords via SSHPASS env var (`sshpass -e`) instead
+        # of argv (`sshpass -p`) so they don't leak in `ps auxww` output.
+        env = None
+        if sshpass_password is not None:
+            env = {**os.environ, "SSHPASS": sshpass_password}
 
         try:
             proc = subprocess.run(
@@ -1133,9 +1296,10 @@ echo 'rollback-ok'
                 text=True,
                 timeout=effective_timeout,
                 check=False,
+                env=env,
             )
-        except subprocess.TimeoutExpired:
-            raise SSHError(f"SSH timeout ({effective_timeout}s) on {target}")
+        except subprocess.TimeoutExpired as exc:
+            raise SSHError(f"SSH timeout ({effective_timeout}s) on {target}") from exc
 
         stdout = proc.stdout.strip()
         stderr = proc.stderr.strip()
@@ -1152,8 +1316,13 @@ echo 'rollback-ok'
             )
         return stdout
 
-    def _ssh_cmd(self, r: SiteReport) -> list[str]:
-        """Build the SSH command list. Script is delivered via stdin.
+    def _ssh_cmd(self, r: SiteReport) -> tuple[list[str], str | None]:
+        """Build the SSH command list and the password (if any) for sshpass.
+
+        Returns (argv, password_for_SSHPASS_env). The caller must put the
+        password in the SSHPASS env var when it's not None and use
+        `sshpass -e` rather than `sshpass -p`, so the secret never appears
+        in `ps`.
 
         Auth methods (set by _step_ssh_preflight):
           "key"        — SSH key + wpupdates user (app-scoped)
@@ -1165,40 +1334,42 @@ echo 'rollback-ok'
             "-o", f"ConnectTimeout={self.args.connect_timeout}",
         ]
 
-        key_path = Path(r.ssh_key_path).expanduser() if r.ssh_key_path else None
+        # load_env already expanded ~ in any path read from .env, so this
+        # is just a typesafe Path() coercion.
+        key_path = Path(r.ssh_key_path) if r.ssh_key_path else None
 
         # Tier 2: SSH key + master username
         if r.auth_method == "master-key":
             target = f"{r.master_user}@{r.server_ip}"
             if key_path and key_path.exists():
-                return [
+                return ([
                     "ssh", *common_opts, "-o", "BatchMode=yes",
                     "-i", str(key_path), target, "bash", "-ls",
-                ]
+                ], None)
             raise SSHError(f"master-key auth requires SSH key but {key_path} not found")
 
-        # Tier 3: sshpass + master password
+        # Tier 3: sshpass + master password (via SSHPASS env)
         if r.auth_method == "master":
             target = f"{r.master_user}@{r.server_ip}"
-            return [
-                "sshpass", "-p", r.master_password,
+            return ([
+                "sshpass", "-e",
                 "ssh", *common_opts, target, "bash", "-ls",
-            ]
+            ], r.master_password)
 
         # Tier 1 (default): SSH key + wpupdates user
         target = f"{r.ssh_user}@{r.server_ip}"
         if key_path and key_path.exists():
-            return [
+            return ([
                 "ssh", *common_opts, "-o", "BatchMode=yes",
                 "-i", str(key_path), target, "bash", "-ls",
-            ]
+            ], None)
 
         # Password fallback for tier 1 (when no key file exists)
         if r.ssh_password and shutil.which("sshpass"):
-            return [
-                "sshpass", "-p", r.ssh_password,
+            return ([
+                "sshpass", "-e",
                 "ssh", *common_opts, target, "bash", "-ls",
-            ]
+            ], r.ssh_password)
 
         raise SSHError(
             f"No SSH auth method for {target}. "
@@ -1225,11 +1396,11 @@ echo 'rollback-ok'
         if not raw:
             if allow_empty:
                 return []
-            raise SSHError(f"Empty output from: wp {wp_cmd}")
+            raise WPCliError(f"Empty output from: wp {wp_cmd}")
         try:
             return json.loads(raw)
         except json.JSONDecodeError as exc:
-            raise SSHError(f"Bad JSON from `wp {wp_cmd}`: {exc}") from exc
+            raise WPCliError(f"Bad JSON from `wp {wp_cmd}`: {exc}") from exc
 
     # ------------------------------------------------------------------
     # Step recording
@@ -1278,72 +1449,100 @@ echo 'rollback-ok'
     # ------------------------------------------------------------------
 
     def _compute_confidence(self, r: SiteReport) -> dict[str, Any]:
+        rules = CONFIDENCE_RULES
         score = 100
         factors: list[str] = []
         b = r.baseline
 
         # WooCommerce = higher stakes (payment, orders)
         if r.has_woocommerce:
-            score -= 15
-            factors.append("-15  WooCommerce site (payment/order risk)")
+            score -= rules["woocommerce_penalty"]
+            factors.append(
+                f"-{rules['woocommerce_penalty']:<2}  WooCommerce site (payment/order risk)"
+            )
 
         # Many plugin updates = more things that can break
         n_plugins = len(b.get("plugin_updates", []))
-        if n_plugins > 10:
-            score -= 20
-            factors.append(f"-20  {n_plugins} plugin updates (>10)")
-        elif n_plugins > 5:
-            score -= 10
-            factors.append(f"-10  {n_plugins} plugin updates (>5)")
+        if n_plugins > rules["plugin_updates_high_threshold"]:
+            score -= rules["plugin_updates_high_penalty"]
+            factors.append(
+                f"-{rules['plugin_updates_high_penalty']:<2}  {n_plugins} plugin updates "
+                f"(>{rules['plugin_updates_high_threshold']})"
+            )
+        elif n_plugins > rules["plugin_updates_med_threshold"]:
+            score -= rules["plugin_updates_med_penalty"]
+            factors.append(
+                f"-{rules['plugin_updates_med_penalty']:<2}  {n_plugins} plugin updates "
+                f"(>{rules['plugin_updates_med_threshold']})"
+            )
         elif n_plugins > 0:
-            score -= 3
-            factors.append(f" -3  {n_plugins} plugin update(s)")
+            score -= rules["plugin_updates_low_penalty"]
+            factors.append(
+                f" -{rules['plugin_updates_low_penalty']}  {n_plugins} plugin update(s)"
+            )
 
         # Theme updates
         n_themes = len(b.get("theme_updates", []))
         if n_themes > 0:
-            score -= 5
-            factors.append(f" -5  {n_themes} theme update(s)")
+            score -= rules["theme_updates_penalty"]
+            factors.append(
+                f" -{rules['theme_updates_penalty']}  {n_themes} theme update(s)"
+            )
 
         # Core update pending
         if b.get("core_updates"):
-            score -= 5
-            factors.append(" -5  WordPress core update pending")
+            score -= rules["core_update_penalty"]
+            factors.append(
+                f" -{rules['core_update_penalty']}  WordPress core update pending"
+            )
 
         # Large site (backup takes longer, more to go wrong)
         disk = b.get("disk", {})
         site_mb = disk.get("site_mb", 0)
-        if site_mb > 2000:
-            score -= 5
-            factors.append(f" -5  Large site ({site_mb:.0f} MB)")
+        if site_mb > rules["large_site_threshold_mb"]:
+            score -= rules["large_site_penalty"]
+            factors.append(
+                f" -{rules['large_site_penalty']}  Large site ({site_mb:.0f} MB)"
+            )
 
         # Tight disk space
         avail_mb = disk.get("available_mb", 0)
         est_backup = disk.get("estimated_backup_mb", 0)
-        if avail_mb > 0 and est_backup > 0 and avail_mb < est_backup * 3:
-            score -= 10
-            factors.append(f"-10  Tight disk space ({avail_mb:.0f} MB avail, need {est_backup:.0f} MB)")
+        if (avail_mb > 0 and est_backup > 0
+                and avail_mb < est_backup * rules["tight_disk_multiplier"]):
+            score -= rules["tight_disk_penalty"]
+            factors.append(
+                f"-{rules['tight_disk_penalty']:<2}  Tight disk space "
+                f"({avail_mb:.0f} MB avail, need {est_backup:.0f} MB)"
+            )
 
         # PHP version (older = riskier with new plugin versions)
         php = b.get("php_version", "")
         if php:
             try:
                 major_minor = float(php.rsplit(".", 1)[0])
-                if major_minor < 8.0:
-                    score -= 10
-                    factors.append(f"-10  Outdated PHP {php} (<8.0)")
+                if major_minor < rules["old_php_threshold"]:
+                    score -= rules["old_php_penalty"]
+                    factors.append(
+                        f"-{rules['old_php_penalty']:<2}  Outdated PHP {php} "
+                        f"(<{rules['old_php_threshold']})"
+                    )
             except ValueError:
                 pass
 
         # No backup plugin = we're the only safety net
         if not b.get("backup_plugins"):
-            score -= 5
-            factors.append(" -5  No backup plugin installed")
+            score -= rules["no_backup_plugin_penalty"]
+            factors.append(
+                f" -{rules['no_backup_plugin_penalty']}  No backup plugin installed"
+            )
 
         # Staging site = lower stakes
         if r.is_staging:
-            score += 10
-            factors.append("+10  Staging site (lower risk)")
+            score += rules["staging_bonus"]
+            factors.append(
+                f"+{rules['staging_bonus']:<2}  Staging site (lower risk)"
+            )
 
         # Nothing to update = nothing to break
         if n_plugins == 0 and n_themes == 0 and not b.get("core_updates"):
@@ -1352,11 +1551,11 @@ echo 'rollback-ok'
 
         score = max(0, min(100, score))
 
-        if score >= 90:
+        if score >= rules["grade_high_min"]:
             grade = "HIGH"
-        elif score >= 70:
+        elif score >= rules["grade_medium_min"]:
             grade = "MEDIUM"
-        elif score >= 50:
+        elif score >= rules["grade_low_min"]:
             grade = "LOW"
         else:
             grade = "RISKY"
@@ -1454,7 +1653,6 @@ echo 'rollback-ok'
 
     def _print_site_execution_report(self, r: SiteReport) -> None:
         """Print a short summary of what was done on this site after execution."""
-        b = r.baseline
         L = self.log.info
 
         L("")
@@ -1489,6 +1687,10 @@ echo 'rollback-ok'
         self.log.info("=" * 70)
         self.log.info("FINAL REPORT")
         self.log.info("=" * 70)
+
+        if self._run_abort_reason:
+            self.log.error("  Run stopped early: %s", self._run_abort_reason)
+            self.log.info("")
 
         # In execute mode, print per-site execution summaries first
         if self.args.execute:
@@ -1591,6 +1793,11 @@ def build_cli() -> argparse.Namespace:
     p.add_argument(
         "--http-timeout", type=int, default=20,
         help="HTTP health check timeout in seconds (default: 20).",
+    )
+    p.add_argument(
+        "--max-consecutive-failures", type=int, default=3,
+        help="Abort an execute-mode batch after this many consecutive "
+             "failed/rolled-back sites (default: 3, use 0 to disable).",
     )
     p.add_argument(
         "--stream", action="store_true",
