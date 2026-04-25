@@ -44,8 +44,8 @@ Rollback mechanism:
   Before ANY update, the script creates:
     1. A full database dump via `wp db export --add-drop-table`
     2. A compressed tar of the entire public_html directory
-  Both are stored under /home/master/wp-maintenance-backups/<client>/<app>/<run_id>/
-  which is persistent storage (not /tmp/).
+  Both are stored under <app_dir>/private_html/wp-maintenance-backups/<run_id>/
+  which is persistent storage writable by the app SSH user (not /tmp/).
 
   If an update step fails:
     1. The failed state is archived (for forensic analysis)
@@ -139,6 +139,31 @@ CONFIDENCE_RULES = {
     "grade_low_min": 50,
 }
 
+# Tolerant classification of WP-CLI's `wp plugin update` status field.
+# WP-CLI status strings have drifted across versions (e.g. "Updated" vs
+# "updated successfully" vs "success"), so we normalise via .strip().lower()
+# before membership-testing.  Anything outside these two sets is treated as
+# an error.
+_PLUGIN_STATUS_SUCCESS = frozenset({"updated", "success", "updated successfully"})
+_PLUGIN_STATUS_UPTODATE = frozenset({"up to date", "already up to date"})
+
+
+def _extract_plugin_error(result: dict) -> str:
+    """Pull a short error message out of a wp-cli plugin-update result dict.
+
+    Prefers explicit 'message'/'error' keys, falls back to the captured
+    SSH/parse-error text, truncating to ~200 chars so we never dump a
+    full stderr into the JSON report.
+    """
+    for key in ("message", "error", "_error", "_raw"):
+        val = result.get(key)
+        if val:
+            text = str(val).strip().splitlines()[0] if "\n" in str(val) else str(val).strip()
+            return text[:200]
+    if result.get("_no_entry"):
+        return "wp-cli returned no entry for this slug"
+    return f"status={result.get('status', '?')}"
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -176,6 +201,12 @@ class SiteReport:
     # after any file-mutating operation.
     auth_method: str = "key"
 
+    # The username that actually authenticated at preflight time — either the
+    # winning tier-1 candidate (e.g. "wpupdates-stage") or the master user.
+    # Always populated post-preflight so the summary JSON records which user
+    # worked, letting us later bake it into the client JSON.
+    auth_user: str = ""
+
     # Original user:group of the wp_path directory, captured before mutations.
     # Used to chown -R back after updates when running as master user.
     original_owner: str = ""
@@ -198,6 +229,7 @@ class SiteReport:
             "has_woocommerce": self.has_woocommerce,
             "overall": self.overall,
             "auth_method": self.auth_method,
+            "auth_user": self.auth_user,
             "original_owner": self.original_owner,
             "backup_dir": self.backup_dir,
             "failure_step": self.failure_step,
@@ -353,6 +385,22 @@ class WPUpdater:
         self._ssh_key = self.env.get("SSH_KEY", "")
         self._app_pw = self.env.get("APP_PW", "")
 
+        # Build effective tier-1 candidate list: SSH_USER (back-compat)
+        # followed by any entries in SSH_USER_CANDIDATES, trimmed and
+        # de-duplicated while preserving order. Cloudways apps are
+        # provisioned with per-app users like wpupdates, wpupdates-stage,
+        # wpupdates-2 — a single SSH_USER can't cover all sites.
+        self._ssh_user_candidates: list[str] = []
+        _seen: set[str] = set()
+        if self._ssh_user and self._ssh_user not in _seen:
+            self._ssh_user_candidates.append(self._ssh_user)
+            _seen.add(self._ssh_user)
+        for raw in self.env.get("SSH_USER_CANDIDATES", "").split(","):
+            name = raw.strip()
+            if name and name not in _seen:
+                self._ssh_user_candidates.append(name)
+                _seen.add(name)
+
         # SSL context for HTTP verification
         self._ssl_ctx = ssl.create_default_context()
         if args.skip_ssl_verify:
@@ -360,8 +408,10 @@ class WPUpdater:
             self._ssl_ctx.verify_mode = ssl.CERT_NONE
 
         # Pre-flight validation. load_env already expands ~ in SSH_KEY.
-        if args.execute and not self._ssh_user:
-            self.log.error("SSH_USER is required in .env for --execute mode")
+        if args.execute and not self._ssh_user_candidates:
+            self.log.error(
+                "SSH_USER or SSH_USER_CANDIDATES is required in .env for --execute mode"
+            )
             raise SystemExit(1)
         key_path = Path(self._ssh_key) if self._ssh_key else None
         if key_path and not key_path.exists():
@@ -721,12 +771,34 @@ class WPUpdater:
     # Step: SSH preflight
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _is_permission_denied(stderr: str) -> bool:
+        """
+        Heuristic to distinguish 'this username isn't authorized here'
+        (try next candidate) from 'host is unreachable' (stop trying).
+
+        True when the error looks like an auth failure — Cloudways returns
+        either 'Permission denied' or drops the connection with
+        'Received disconnect' / exit 255 + 'publickey' mention. Anything
+        else (timeout, network unreachable, host key mismatch) is treated
+        as fatal.
+        """
+        if not stderr:
+            return False
+        low = stderr.lower()
+        if "permission denied" in low:
+            return True
+        if "received disconnect" in low:
+            return True
+        return False
+
     def _step_ssh_preflight(self, r: SiteReport) -> None:
         """
         Establish SSH connectivity and verify WordPress is installed.
 
         Three-tier auth cascade:
-          1. SSH key + wpupdates user (app-scoped).
+          1. SSH key + each candidate app-scoped user (wpupdates,
+             wpupdates-stage, wpupdates-2, ...) until one succeeds.
           2. SSH key + master username — same key, but the master user has
              server-wide access to all application directories.
           3. sshpass + master password — last resort when the key isn't
@@ -734,22 +806,57 @@ class WPUpdater:
 
         When master fallback is used (tier 2 or 3), r.auth_method is set to
         "master" so downstream steps know to capture and restore file
-        ownership after mutations.
+        ownership after mutations. r.auth_user is always populated with the
+        username that actually authenticated.
         """
         t0 = ts()
         r.auth_method = "key"
 
-        # --- Tier 1: SSH key + wpupdates (app-scoped user) ---
-        try:
-            self._ssh(r, "echo 'ssh-ok'")
-            self._wp(r, "core is-installed")
-            self._record_step(r, "ssh-preflight", "success",
-                              f"SSH reachable at {r.server_ip} (auth=key)", t0)
-            return
-        except SSHError as exc:
-            tier1_err = str(exc)
-            if "Permission denied" not in tier1_err:
-                raise  # Not a permission issue — re-raise
+        # --- Tier 1: SSH key + app-scoped candidates ---
+        #
+        # Build the per-site candidate list. If the client JSON recorded a
+        # non-placeholder username for this app, prefer it first (a stale
+        # value won't break the run because we still fall through to the
+        # global list). r.ssh_user comes from resolve(sftp["username"]) or
+        # the first global candidate — see _validate_app.
+        candidates: list[str] = []
+        seen: set[str] = set()
+        if r.ssh_user and r.ssh_user not in seen:
+            candidates.append(r.ssh_user)
+            seen.add(r.ssh_user)
+        for name in self._ssh_user_candidates:
+            if name and name not in seen:
+                candidates.append(name)
+                seen.add(name)
+
+        tier1_permission_failure = False
+        for candidate in candidates:
+            r.ssh_user = candidate  # _ssh / _wp read this
+            try:
+                self._ssh(r, "echo 'ssh-ok'")
+                self._wp(r, "core is-installed")
+                r.auth_user = candidate
+                self.log.info(
+                    "SSH tier 1 ok as %s (auth=key) | %s", candidate, r.domain
+                )
+                self._record_step(
+                    r, "ssh-preflight", "success",
+                    f"SSH reachable at {r.server_ip} as {candidate} (auth=key)", t0,
+                )
+                return
+            except SSHError as exc:
+                if self._is_permission_denied(str(exc)):
+                    self.log.debug(
+                        "Tier 1 candidate %s denied; trying next", candidate
+                    )
+                    tier1_permission_failure = True
+                    continue
+                raise  # Network / timeout / host unreachable — don't waste time
+
+        if candidates and not tier1_permission_failure:
+            # No candidates ever hit a permission error but none succeeded
+            # either — this means the list was empty. Guarded below.
+            pass
 
         # Need master credentials for tier 2 and 3
         if not r.master_user:
@@ -760,10 +867,11 @@ class WPUpdater:
 
         # --- Tier 2: SSH key + master username ---
         self.log.info(
-            "Key+wpupdates can't access %s — trying key+master user",
-            r.wp_path,
+            "SSH tier 1 failed for all candidates %s — trying key+master user | %s",
+            candidates, r.domain,
         )
         r.auth_method = "master-key"
+        r.auth_user = r.master_user
         try:
             self._ssh(r, "echo 'ssh-ok'")
             self._wp(r, "core is-installed")
@@ -790,6 +898,7 @@ class WPUpdater:
             r.wp_path,
         )
         r.auth_method = "master"
+        r.auth_user = r.master_user
         self._ssh(r, "echo 'ssh-ok'")
         self._wp(r, "core is-installed")
         self._record_step(r, "ssh-preflight", "success",
@@ -887,9 +996,9 @@ class WPUpdater:
     # ------------------------------------------------------------------
     # Step: Pre-flight backup
     #
-    # Backups go to /home/master/wp-maintenance-backups/ which is
-    # persistent storage on Cloudways servers (not /tmp/ which can be
-    # wiped on reboot or by cron).
+    # Backups go to <app_dir>/private_html/wp-maintenance-backups/<run_id>/
+    # private_html is group-writable by www-data (same group as the app SSH
+    # user), not web-accessible, and persistent across reboots.
     # ------------------------------------------------------------------
 
     def _step_disk_check(self, r: SiteReport) -> None:
@@ -958,8 +1067,8 @@ echo "${{du_bytes:-0}} ${{avail_bytes:-0}}"
         # /home/master/applications/<hash>/public_html → <hash>
         app_hash = r.wp_path.split("/")[-2]
         backup_dir = (
-            f"/home/master/wp-maintenance-backups"
-            f"/{slugify(r.client)}/{app_hash}/{self.run_id}"
+            f"/home/master/applications/{app_hash}/private_html"
+            f"/wp-maintenance-backups/{self.run_id}"
         )
         r.backup_dir = backup_dir
 
@@ -1044,13 +1153,61 @@ echo 'backup-ok'
                               f"{slug} {ver_from}→{ver_to}", t0)
 
     # ------------------------------------------------------------------
-    # Step: Update plugins (atomic — one at a time with verification)
+    # Plugin update helpers
+    # ------------------------------------------------------------------
+
+    def _run_plugin_update_structured(self, r: SiteReport, slug: str) -> dict:
+        """Run `wp plugin update <slug> --format=json` and return the result dict.
+
+        Returns a dict with at least {"name": slug, "status": "..."}.
+        On SSH/WP-CLI failure: {"name": slug, "status": "Error", "_exit_nonzero": True}.
+        On JSON parse failure: {"name": slug, "status": "Error", "_parse_error": True}.
+        When JSON parses cleanly but no entry for the slug is present, returns
+        {"name": slug, "status": "Error", "_no_entry": True} — the absence of
+        the slug in the response is a signal something went wrong, NOT a
+        silent "up to date".
+        """
+        try:
+            raw = self._wp(
+                r, f"plugin update {shlex.quote(slug)} --format=json",
+                timeout=self.args.remote_timeout,
+            )
+        except (SSHError, WPCliError) as exc:
+            return {"name": slug, "status": "Error", "_exit_nonzero": True, "_error": str(exc)}
+
+        # Strip PHP warnings / notices that may appear before the JSON array
+        bracket = raw.find("[")
+        if bracket == -1:
+            return {"name": slug, "status": "Error", "_parse_error": True, "_raw": raw}
+        try:
+            entries = json.loads(raw[bracket:])
+        except json.JSONDecodeError:
+            return {"name": slug, "status": "Error", "_parse_error": True, "_raw": raw}
+
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("name") == slug:
+                return entry
+        # JSON returned but no matching entry — treat as Error, NOT up to date.
+        # WP-CLI normally emits an entry per slug; its absence is ambiguous
+        # and the safe default is to surface it rather than silently pass.
+        return {"name": slug, "status": "Error", "_no_entry": True}
+
+    # ------------------------------------------------------------------
+    # Step: Update plugins (sequential — one at a time with verification)
     #
-    # This is the most critical section.  Plugins are the #1 cause of
-    # site breakage during WordPress maintenance.  Each plugin is updated
-    # individually, and the site is health-checked after each one.  If
-    # any single plugin breaks the site, we know EXACTLY which one did
-    # it, and we can rollback before touching the rest.
+    # Plugins are the #1 cause of site breakage during WordPress
+    # maintenance.  Each plugin is updated individually, and the site is
+    # health-checked (via _verify) after every single update.  The
+    # classification is:
+    #   * wp-cli reports success/up-to-date AND verify passes -> success
+    #   * wp-cli reports a non-fatal error (license/auth/etc.) but the
+    #     site still verifies -> skipped, continue to next plugin
+    #   * verify FAILS after an update -> attempt `wp plugin deactivate`
+    #     to isolate the offender.  If that recovers verify -> degraded
+    #     (manual review required) and continue.  If it does NOT -> raise
+    #     SSHError so _process_site escalates to the full-site rollback
+    #     (preflight.sql + public_html.tar.gz), which is the only recovery
+    #     that is safe in the presence of DB schema migrations.
     # ------------------------------------------------------------------
 
     def _step_update_plugins(self, r: SiteReport) -> None:
@@ -1062,8 +1219,8 @@ echo 'backup-ok'
 
         for plugin in updates:
             slug = plugin.get("name", "").strip()
-            ver_from = plugin.get("version", "?")
-            ver_to = plugin.get("update_version", "?")
+            ver_from = plugin.get("version", "?") or "?"
+            ver_to = plugin.get("update_version", "?") or "?"
             if not slug:
                 continue
 
@@ -1074,17 +1231,95 @@ echo 'backup-ok'
                 slug, ver_from, ver_to, r.domain,
             )
 
-            try:
-                self._wp(r, f"plugin update {shlex.quote(slug)}",
-                          timeout=self.args.remote_timeout)
-                self._verify(r)
-            except (SSHError, HealthCheckError) as exc:
-                self._record_step(r, step, "failed",
-                                  f"{slug} {ver_from}→{ver_to} FAILED: {exc}", t0)
-                raise  # Propagates to _process_site which triggers rollback
+            result = self._run_plugin_update_structured(r, slug)
+            status = (result.get("status", "") or "").strip().lower()
+            # Prefer the post-update version reported by wp-cli, fall back
+            # to the baseline's target version.
+            ver_to_reported = result.get("version") or ver_to or "?"
 
-            self._record_step(r, step, "success",
-                              f"{slug} {ver_from}→{ver_to}", t0)
+            # Always verify after the update attempt — this is the oracle
+            # that decides whether the site still works.
+            try:
+                self._verify(r)
+                verify_ok = True
+                verify_exc: HealthCheckError | None = None
+            except HealthCheckError as exc:
+                verify_ok = False
+                verify_exc = exc
+
+            if verify_ok and status in _PLUGIN_STATUS_SUCCESS:
+                self._record_step(r, step, "success",
+                                  f"{slug} {ver_from}→{ver_to_reported}", t0)
+                continue
+
+            if verify_ok and status in _PLUGIN_STATUS_UPTODATE:
+                self._record_step(r, step, "success",
+                                  f"{slug} up to date", t0)
+                continue
+
+            if verify_ok:
+                # wp-cli reported an Error / unknown status but the site
+                # is still healthy.  Typical causes: premium license not
+                # active, auth failure fetching the zip, network blip.
+                # Skip and continue.
+                err_msg = _extract_plugin_error(result)
+                detail = f"{slug} {ver_from}→{ver_to} non-fatal error: {err_msg}"
+                self._record_step(r, step, "skipped", detail, t0)
+                self.log.warning(
+                    "  ⚠ Skipping plugin  %s  (%s → %s): non-fatal error: %s  |  %s",
+                    slug, ver_from, ver_to, err_msg, r.domain,
+                )
+                continue
+
+            # verify FAILED — the update broke the site.  Attempt
+            # deactivation to isolate the offending plugin before
+            # escalating to full-site rollback.
+            self.log.warning(
+                "  ⚠ Plugin  %s  update broke site; attempting deactivation  |  %s",
+                slug, r.domain,
+            )
+            deactivate_exit_ok = True
+            try:
+                self._wp(r, f"plugin deactivate {shlex.quote(slug)}",
+                         timeout=self.args.remote_timeout)
+            except (SSHError, WPCliError) as exc:
+                deactivate_exit_ok = False
+                self.log.warning(
+                    "  ⚠ `wp plugin deactivate %s` failed: %s  |  %s",
+                    slug, exc, r.domain,
+                )
+
+            try:
+                self._verify(r)
+                recovered = True
+            except HealthCheckError:
+                recovered = False
+
+            if recovered:
+                deact_note = "ok" if deactivate_exit_ok else "non-zero exit"
+                detail = (
+                    f"{slug} {ver_from}→{ver_to} fatal update broke site; "
+                    f"plugin deactivated ({deact_note}) — requires manual review"
+                )
+                self._record_step(r, step, "degraded", detail, t0)
+                self.log.warning(
+                    "  ⚠ Plugin  %s  deactivated after fatal update — manual "
+                    "review required  |  %s",
+                    slug, r.domain,
+                )
+                continue
+
+            # Deactivation did not recover the site — escalate to
+            # full-site rollback via _process_site's handler.
+            detail = (
+                f"{slug} {ver_from}→{ver_to} fatal update broke site; "
+                f"deactivation did not recover (verify: {verify_exc})"
+            )
+            self._record_step(r, step, "failed", detail, t0)
+            raise SSHError(
+                f"plugin {slug} update broke site, deactivation failed — "
+                "escalating to full rollback"
+            )
 
     # ------------------------------------------------------------------
     # Rollback
@@ -1384,7 +1619,11 @@ echo 'rollback-ok'
         where wp-config.php lives.  We must `cd` into the WordPress root
         before invoking wp-cli, otherwise the require fails.
         """
-        script = f"cd {shlex.quote(r.wp_path)} && wp --path={shlex.quote(r.wp_path)} {wp_cmd}"
+        script = (
+            f"cd {shlex.quote(r.wp_path)} && "
+            f"WP_CLI_CACHE_DIR=$HOME/tmp/.wp-cli-cache "
+            f"wp --path={shlex.quote(r.wp_path)} {wp_cmd}"
+        )
         return self._ssh(r, script, timeout)
 
     def _wp_text(self, r: SiteReport, wp_cmd: str) -> str:

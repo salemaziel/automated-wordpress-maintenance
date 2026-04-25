@@ -478,6 +478,132 @@ def test_ssh_preflight_raises_when_no_master_credentials(tmp_path: Path) -> None
 
 
 # ---------------------------------------------------------------------------
+# Tier-1 multi-candidate cascade (SSH_USER_CANDIDATES)
+# ---------------------------------------------------------------------------
+
+def _make_args_with_env(tmp_path: Path, env_body: str) -> argparse.Namespace:
+    """Like make_args but lets the caller control the .env contents."""
+    args = make_args(tmp_path)
+    args.env_file.write_text(env_body)
+    return args
+
+
+def test_tier1_tries_all_candidates_until_one_succeeds(tmp_path: Path) -> None:
+    args = _make_args_with_env(
+        tmp_path,
+        "SSH_USER=wpupdates\n"
+        "SSH_USER_CANDIDATES=wpupdates-2,wpupdates-3\n"
+        "SSH_KEY=\nAPP_PW=\n",
+    )
+    updater = wp_update.WPUpdater(args)
+    r = _make_report_for_preflight(tmp_path)
+    r.ssh_user = ""  # force the updater-level candidate list to drive ordering
+
+    attempted: list[str] = []
+
+    def fake_ssh(report: wp_update.SiteReport, script: str, timeout: object = None) -> str:
+        attempted.append(report.ssh_user)
+        if report.ssh_user in ("wpupdates", "wpupdates-2"):
+            raise wp_update.SSHError("Permission denied (publickey)")
+        return "ssh-ok"
+
+    with patch.object(updater, "_ssh", side_effect=fake_ssh), \
+         patch.object(updater, "_wp", return_value=""):
+        updater._step_ssh_preflight(r)
+
+    assert r.auth_method == "key"
+    assert r.auth_user == "wpupdates-3"
+    assert attempted == ["wpupdates", "wpupdates-2", "wpupdates-3"]
+
+
+def test_tier1_falls_to_master_when_all_candidates_fail(tmp_path: Path) -> None:
+    args = _make_args_with_env(
+        tmp_path,
+        "SSH_USER=wpupdates\n"
+        "SSH_USER_CANDIDATES=wpupdates-2,wpupdates-3\n"
+        "SSH_KEY=\nAPP_PW=\n",
+    )
+    updater = wp_update.WPUpdater(args)
+    r = _make_report_for_preflight(tmp_path)
+    r.ssh_user = ""
+
+    def fake_ssh(report: wp_update.SiteReport, script: str, timeout: object = None) -> str:
+        if report.auth_method == "key":
+            raise wp_update.SSHError("Permission denied (publickey)")
+        return "ssh-ok"
+
+    with patch.object(updater, "_ssh", side_effect=fake_ssh), \
+         patch.object(updater, "_wp", return_value=""):
+        updater._step_ssh_preflight(r)
+
+    assert r.auth_method == "master-key"
+    assert r.auth_user == r.master_user
+
+
+def test_tier1_reraises_on_nonpermission_error(tmp_path: Path) -> None:
+    args = _make_args_with_env(
+        tmp_path,
+        "SSH_USER=wpupdates\n"
+        "SSH_USER_CANDIDATES=wpupdates-2,wpupdates-3\n"
+        "SSH_KEY=\nAPP_PW=\n",
+    )
+    updater = wp_update.WPUpdater(args)
+    r = _make_report_for_preflight(tmp_path)
+    r.ssh_user = ""
+
+    attempted: list[str] = []
+
+    def fake_ssh(report: wp_update.SiteReport, script: str, timeout: object = None) -> str:
+        attempted.append(report.ssh_user)
+        raise wp_update.SSHError("Connection timed out")
+
+    with patch.object(updater, "_ssh", side_effect=fake_ssh), \
+         patch.object(updater, "_wp", return_value=""), \
+         pytest.raises(wp_update.SSHError, match="Connection timed out"):
+        updater._step_ssh_preflight(r)
+
+    # Only the first candidate should have been attempted; non-permission
+    # failures short-circuit the cascade.
+    assert attempted == ["wpupdates"]
+
+
+def test_ssh_user_candidates_dedup_order(tmp_path: Path) -> None:
+    args = _make_args_with_env(
+        tmp_path,
+        "SSH_USER=foo\n"
+        "SSH_USER_CANDIDATES=foo, bar ,foo,baz\n"
+        "SSH_KEY=\nAPP_PW=\n",
+    )
+    updater = wp_update.WPUpdater(args)
+    assert updater._ssh_user_candidates == ["foo", "bar", "baz"]
+
+
+def test_summary_includes_auth_user(tmp_path: Path) -> None:
+    args = _make_args_with_env(
+        tmp_path,
+        "SSH_USER=wpupdates\n"
+        "SSH_USER_CANDIDATES=wpupdates-stage\n"
+        "SSH_KEY=\nAPP_PW=\n",
+    )
+    updater = wp_update.WPUpdater(args)
+    r = _make_report_for_preflight(tmp_path)
+    r.ssh_user = ""
+
+    def fake_ssh(report: wp_update.SiteReport, script: str, timeout: object = None) -> str:
+        if report.ssh_user == "wpupdates":
+            raise wp_update.SSHError("Permission denied (publickey)")
+        return "ssh-ok"
+
+    with patch.object(updater, "_ssh", side_effect=fake_ssh), \
+         patch.object(updater, "_wp", return_value=""):
+        updater._step_ssh_preflight(r)
+
+    serialised = r.to_dict()
+    assert "auth_user" in serialised
+    assert serialised["auth_user"] == "wpupdates-stage"
+
+
+# ---------------------------------------------------------------------------
 # _step_rollback — success and failure paths
 # ---------------------------------------------------------------------------
 
@@ -693,3 +819,316 @@ def test_run_aborts_after_max_consecutive_failures(tmp_path: Path) -> None:
         "circuit breaker opened after 2 consecutive failed/rolled-back site(s)"
     )
     assert [r.domain for r in updater.reports] == ["a.example.com", "b.example.com"]
+
+
+# ---------------------------------------------------------------------------
+# Plugin-update flow — sequential updates with deactivate-on-fatal recovery
+# ---------------------------------------------------------------------------
+
+
+def _make_updater(tmp_path: Path, *, execute: bool = True) -> wp_update.WPUpdater:
+    args = make_args(tmp_path, execute=execute)
+    # Write a non-empty APP_PW so execute-mode validation passes
+    args.env_file.write_text("SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=fake-pw\n")
+    return wp_update.WPUpdater(args)
+
+
+def _make_exec_report(**overrides: object) -> wp_update.SiteReport:
+    defaults = dict(
+        client="Test Client",
+        domain="example.com",
+        server_ip="203.0.113.1",
+        wp_path="/home/master/applications/abc123/public_html",
+        is_staging=False,
+        has_woocommerce=False,
+        backup_dir="/home/master/applications/abc123/private_html/wp-maintenance-backups/run1",
+    )
+    defaults.update(overrides)
+    return wp_update.SiteReport(**defaults)
+
+
+def test_run_plugin_update_structured_parses_clean_json(tmp_path: Path) -> None:
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    payload = '[{"name":"my-plugin","status":"Updated","version":"1.0","update_version":"1.1"}]'
+    with patch.object(updater, "_wp", return_value=payload):
+        result = updater._run_plugin_update_structured(r, "my-plugin")
+    assert result["status"] == "Updated"
+    assert result["name"] == "my-plugin"
+
+
+def test_run_plugin_update_structured_strips_php_warnings(tmp_path: Path) -> None:
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    raw = (
+        "PHP Warning: some-warning in /path/to/file.php on line 42\n"
+        '[{"name":"my-plugin","status":"Updated","version":"1.0","update_version":"2.0"}]'
+    )
+    with patch.object(updater, "_wp", return_value=raw):
+        result = updater._run_plugin_update_structured(r, "my-plugin")
+    assert result["status"] == "Updated"
+
+
+def test_run_plugin_update_structured_returns_error_on_malformed_json(tmp_path: Path) -> None:
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    with patch.object(updater, "_wp", return_value="garbage output no json"):
+        result = updater._run_plugin_update_structured(r, "my-plugin")
+    assert result["status"] == "Error"
+    assert result.get("_parse_error")
+
+
+def test_run_plugin_update_structured_returns_error_on_ssh_failure(tmp_path: Path) -> None:
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    with patch.object(updater, "_wp", side_effect=wp_update.SSHError("connection refused")):
+        result = updater._run_plugin_update_structured(r, "my-plugin")
+    assert result["status"] == "Error"
+    assert result.get("_exit_nonzero")
+
+
+def test_run_plugin_update_structured_no_matching_entry(tmp_path: Path) -> None:
+    """JSON parses cleanly but does not contain our slug — must be Error,
+    never silent Up to date (regression guard)."""
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    # wp-cli returns an entry for a different plugin
+    payload = '[{"name":"other-plugin","status":"Updated"}]'
+    with patch.object(updater, "_wp", return_value=payload):
+        result = updater._run_plugin_update_structured(r, "my-plugin")
+    assert result["status"] == "Error"
+    assert result.get("_no_entry") is True
+    assert result["name"] == "my-plugin"
+
+
+@pytest.mark.parametrize(
+    "raw_status",
+    ["Updated", "UPDATED", "updated", "Success", "success", "updated successfully",
+     "Updated Successfully", "UPDATED SUCCESSFULLY"],
+)
+def test_run_plugin_update_structured_tolerant_status(tmp_path: Path, raw_status: str) -> None:
+    """All these strings must classify as success after .strip().lower()."""
+    assert raw_status.strip().lower() in wp_update._PLUGIN_STATUS_SUCCESS
+
+
+@pytest.mark.parametrize(
+    "raw_status",
+    ["Up to date", "UP TO DATE", "up to date", "Already up to date",
+     "already up to date"],
+)
+def test_run_plugin_update_structured_tolerant_uptodate(tmp_path: Path, raw_status: str) -> None:
+    assert raw_status.strip().lower() in wp_update._PLUGIN_STATUS_UPTODATE
+
+
+def test_step_update_plugins_success_continues(tmp_path: Path) -> None:
+    """3 plugins, all update cleanly, verify passes after each."""
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    r.baseline = {
+        "plugin_updates": [
+            {"name": "plugin-a", "version": "1.0", "update_version": "2.0"},
+            {"name": "plugin-b", "version": "1.0", "update_version": "2.0"},
+            {"name": "plugin-c", "version": "1.0", "update_version": "2.0"},
+        ]
+    }
+
+    def fake_structured(report: wp_update.SiteReport, slug: str) -> dict:
+        return {"name": slug, "status": "Updated", "version": "2.0"}
+
+    with (
+        patch.object(updater, "_run_plugin_update_structured", side_effect=fake_structured),
+        patch.object(updater, "_verify") as mock_verify,
+        patch.object(updater, "_wp") as mock_wp,
+    ):
+        updater._step_update_plugins(r)
+
+    # No deactivation should have run on the happy path
+    mock_wp.assert_not_called()
+    assert mock_verify.call_count == 3
+
+    steps = {s.name: s for s in r.steps}
+    assert steps["plugin-update:plugin-a"].status == "success"
+    assert steps["plugin-update:plugin-b"].status == "success"
+    assert steps["plugin-update:plugin-c"].status == "success"
+
+
+def test_step_update_plugins_non_fatal_error_skips(tmp_path: Path) -> None:
+    """plugin 2 returns Error (license failure) but verify passes → skipped,
+    continues to plugin 3, no rollback."""
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    r.baseline = {
+        "plugin_updates": [
+            {"name": "plugin-a", "version": "1.0", "update_version": "2.0"},
+            {"name": "plugin-b", "version": "1.0", "update_version": "2.0"},
+            {"name": "plugin-c", "version": "1.0", "update_version": "2.0"},
+        ]
+    }
+
+    def fake_structured(report: wp_update.SiteReport, slug: str) -> dict:
+        if slug == "plugin-b":
+            return {"name": slug, "status": "Error", "_exit_nonzero": True,
+                    "_error": "license key invalid"}
+        return {"name": slug, "status": "Updated", "version": "2.0"}
+
+    with (
+        patch.object(updater, "_run_plugin_update_structured", side_effect=fake_structured),
+        patch.object(updater, "_verify"),  # always passes
+        patch.object(updater, "_wp") as mock_wp,
+    ):
+        updater._step_update_plugins(r)  # must not raise
+
+    mock_wp.assert_not_called()  # no deactivation needed
+
+    steps = {s.name: s for s in r.steps}
+    assert steps["plugin-update:plugin-a"].status == "success"
+    assert steps["plugin-update:plugin-b"].status == "skipped"
+    assert "non-fatal error" in steps["plugin-update:plugin-b"].detail
+    assert steps["plugin-update:plugin-c"].status == "success"
+
+
+def test_step_update_plugins_fatal_deactivation_recovers(tmp_path: Path) -> None:
+    """plugin 2 update 'succeeds' but verify fails; wp plugin deactivate
+    succeeds and subsequent verify passes → degraded, continues, no rollback."""
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    r.baseline = {
+        "plugin_updates": [
+            {"name": "plugin-a", "version": "1.0", "update_version": "2.0"},
+            {"name": "plugin-b", "version": "1.0", "update_version": "2.0"},
+            {"name": "plugin-c", "version": "1.0", "update_version": "2.0"},
+        ]
+    }
+
+    verify_calls: list[str] = []
+    # verify call sequence: a-post, b-post(FAIL), b-after-deactivate(OK), c-post
+    verify_returns = iter([None, wp_update.HealthCheckError("500"), None, None])
+
+    def fake_verify(report: wp_update.SiteReport) -> None:
+        verify_calls.append("v")
+        nxt = next(verify_returns)
+        if isinstance(nxt, Exception):
+            raise nxt
+
+    wp_calls: list[str] = []
+
+    def fake_wp(report: wp_update.SiteReport, cmd: str, timeout: int | None = None) -> str:
+        wp_calls.append(cmd)
+        return "Plugin deactivated."
+
+    def fake_structured(report: wp_update.SiteReport, slug: str) -> dict:
+        return {"name": slug, "status": "Updated", "version": "2.0"}
+
+    with (
+        patch.object(updater, "_run_plugin_update_structured", side_effect=fake_structured),
+        patch.object(updater, "_verify", side_effect=fake_verify),
+        patch.object(updater, "_wp", side_effect=fake_wp),
+    ):
+        updater._step_update_plugins(r)  # must not raise
+
+    # Deactivate was invoked exactly once for plugin-b
+    assert any("plugin deactivate" in c and "plugin-b" in c for c in wp_calls)
+    # verify called 4 times (3 post-update + 1 post-deactivation)
+    assert len(verify_calls) == 4
+
+    steps = {s.name: s for s in r.steps}
+    assert steps["plugin-update:plugin-a"].status == "success"
+    assert steps["plugin-update:plugin-b"].status == "degraded"
+    assert "deactivated" in steps["plugin-update:plugin-b"].detail
+    assert steps["plugin-update:plugin-c"].status == "success"
+
+
+def test_step_update_plugins_fatal_deactivation_fails_escalates(tmp_path: Path) -> None:
+    """plugin 2 update succeeds but verify fails; deactivation runs but
+    re-verify still fails → SSHError raised."""
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    r.baseline = {
+        "plugin_updates": [
+            {"name": "plugin-a", "version": "1.0", "update_version": "2.0"},
+            {"name": "plugin-b", "version": "1.0", "update_version": "2.0"},
+        ]
+    }
+
+    # verify: a-post(OK), b-post(FAIL), b-after-deactivate(FAIL)
+    verify_returns = iter([None,
+                           wp_update.HealthCheckError("500 after update"),
+                           wp_update.HealthCheckError("still 500 after deactivate")])
+
+    def fake_verify(report: wp_update.SiteReport) -> None:
+        nxt = next(verify_returns)
+        if isinstance(nxt, Exception):
+            raise nxt
+
+    def fake_structured(report: wp_update.SiteReport, slug: str) -> dict:
+        return {"name": slug, "status": "Updated", "version": "2.0"}
+
+    with (
+        patch.object(updater, "_run_plugin_update_structured", side_effect=fake_structured),
+        patch.object(updater, "_verify", side_effect=fake_verify),
+        patch.object(updater, "_wp", return_value="Plugin deactivated."),
+        pytest.raises(wp_update.SSHError, match="plugin plugin-b"),
+    ):
+        updater._step_update_plugins(r)
+
+    steps = {s.name: s for s in r.steps}
+    assert steps["plugin-update:plugin-a"].status == "success"
+    assert steps["plugin-update:plugin-b"].status == "failed"
+
+
+def test_step_update_plugins_verify_called_after_each(tmp_path: Path) -> None:
+    """On the happy path, _verify is called exactly once per plugin."""
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    slugs = [f"plugin-{i}" for i in range(5)]
+    r.baseline = {
+        "plugin_updates": [
+            {"name": s, "version": "1.0", "update_version": "2.0"} for s in slugs
+        ]
+    }
+
+    with (
+        patch.object(updater, "_run_plugin_update_structured",
+                     side_effect=lambda rep, slug: {"name": slug, "status": "Updated"}),
+        patch.object(updater, "_verify") as mock_verify,
+    ):
+        updater._step_update_plugins(r)
+
+    assert mock_verify.call_count == len(slugs)
+
+
+def test_extract_plugin_error_prefers_message(tmp_path: Path) -> None:
+    assert wp_update._extract_plugin_error(
+        {"name": "x", "status": "Error", "message": "license expired"}
+    ) == "license expired"
+
+
+def test_extract_plugin_error_truncates_long_raw() -> None:
+    long = "x" * 500
+    err = wp_update._extract_plugin_error({"name": "x", "status": "Error", "_raw": long})
+    assert len(err) <= 200
+
+
+def test_step_backup_still_creates_backup_dir_without_plugins_subdir(tmp_path: Path) -> None:
+    """Regression: the plugins/ subdir mkdir has been removed; the main
+    backup dir mkdir and all other backup steps remain."""
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    r.backup_dir = ""  # will be set by _step_backup
+
+    captured: list[str] = []
+
+    def fake_ssh(report: wp_update.SiteReport, script: str, **kw: object) -> str:
+        captured.append(script)
+        return "backup-ok"
+
+    with patch.object(updater, "_ssh", side_effect=fake_ssh):
+        updater._step_backup(r)
+
+    assert captured
+    script = captured[0]
+    assert "mkdir -p" in script
+    assert "preflight.sql" in script
+    assert "public_html.tar.gz" in script
+    # The per-plugin snapshot subdir is no longer created
+    assert "/plugins'" not in script  # specifically the mkdir '…/plugins' line
