@@ -86,6 +86,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent            # claude-wordpress-maint
 DEFAULT_ENV = SCRIPT_DIR / ".env"
 DEFAULT_CLIENTS = SCRIPT_DIR / "clients"
 DEFAULT_LOGS = SCRIPT_DIR / "logs"
+DEFAULT_SSH_CONFIG = Path(os.environ.get("WP_UPDATE_SSH_CONFIG", "/dev/null"))
 
 # Cloudways apps always live under /home/master/applications/<hash>/public_html
 VALID_PATH = re.compile(r"^/home/master/applications/[A-Za-z0-9_-]+/public_html$")
@@ -375,6 +376,8 @@ class WPUpdater:
         self.args = args
         self.run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         self.env = load_env(args.env_file)
+        if args.ssh_key:
+            self.env["SSH_KEY"] = str(args.ssh_key)
         self.log = make_logger(args.log_dir, self.run_id, stream=args.stream)
         self.reports: list[SiteReport] = []
         self._consecutive_execute_failures = 0
@@ -1565,6 +1568,7 @@ echo 'rollback-ok'
           "master"     — sshpass + master password (last resort)
         """
         common_opts = [
+            "-F", str(self.args.ssh_config),
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", f"ConnectTimeout={self.args.connect_timeout}",
         ]
@@ -2020,6 +2024,18 @@ def build_cli() -> argparse.Namespace:
     p.add_argument(
         "--skip-ssl-verify", action="store_true",
         help="Disable SSL certificate verification for HTTP health checks.",
+    )
+    p.add_argument(
+        "--ssh-config", type=Path, default=DEFAULT_SSH_CONFIG,
+        help=(
+            "SSH config file to use for outbound maintenance connections "
+            f"(default: {DEFAULT_SSH_CONFIG}; use /etc/ssh/ssh_config to opt "
+            "back into the system config)."
+        ),
+    )
+    p.add_argument(
+        "--ssh-key", type=Path, default=None,
+        help="Override SSH_KEY from .env for this run.",
     )
     p.add_argument(
         "--connect-timeout", type=int, default=20,

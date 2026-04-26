@@ -7,7 +7,12 @@ __pycache__
 .gemini/
 .omx/
 .omg/
+.omc/
 .serena/
+.webui-keys/
+db/
+memory/
+logs/
 IP_WHITELIST.txt
 notes/
 clients/*_cloudways.json

@@ -28,6 +28,8 @@ def make_args(
         include_woocommerce=False,
         skip_staging=False,
         skip_ssl_verify=False,
+        ssh_config=Path("/dev/null"),
+        ssh_key=None,
         connect_timeout=20,
         remote_timeout=600,
         http_timeout=20,
@@ -178,6 +180,24 @@ def test_validate_app_resolves_placeholders_from_env(tmp_path: Path) -> None:
     assert report.master_password == "master-secret"
     assert report.is_staging is True
     assert report.has_woocommerce is True
+
+
+def test_ssh_command_bypasses_system_config_by_default(tmp_path: Path) -> None:
+    args = make_args(tmp_path)
+    ssh_key = tmp_path / "id_rsa"
+    ssh_key.write_text("dummy-key")
+    updater = wp_update.WPUpdater(args)
+    report = make_report(
+        ssh_user="wpupdates-stage",
+        ssh_key_path=str(ssh_key),
+    )
+
+    command, password = updater._ssh_cmd(report)
+
+    assert password is None
+    assert command[:3] == ["ssh", "-F", "/dev/null"]
+    assert "-o" in command
+    assert "BatchMode=yes" in command
 
 
 def test_compute_confidence_returns_full_score_when_nothing_needs_updates(tmp_path: Path) -> None:

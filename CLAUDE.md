@@ -1,73 +1,34 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Read `.github/copilot-instructions.md` for full commands and architecture.
+Read `AGENTS.md` for key files, schema, and known limitations.
+This file captures non-obvious gotchas for AI sessions only.
 
-## What This Project Is
+## Web UI (`webui.py`)
 
-Browser-automation provisioning toolkit for Todd's WordPress clients hosted on Cloudways. Two workflows produce the same output:
+Required env vars: `WEBUI_USERNAME`, `WEBUI_PASSWORD`, `WEBUI_SECRET`.
+Optional remote vars: `WEBUI_REMOTE_HOST`, `WEBUI_REMOTE_USER`, `WEBUI_REMOTE_REPO_PATH`, `WEBUI_REMOTE_PORT`, `WEBUI_REMOTE_IDENTITY`.
+Startup: `env WEBUI_USERNAME=admin WEBUI_PASSWORD=testpass WEBUI_SECRET=testsecret python3 webui.py --host 127.0.0.1 --port 8787`
+Provider tabs (Cloudways/Siteground/Cloudron) exist in the UI but only Cloudways has a runner; others return 400.
+Uploaded SSH keys are stored in `.webui-keys/` (gitignored, dir 0700, files 0600).
 
-1. **Live browser extraction** — Chrome MCP navigates the Cloudways web console, provisions SSH/SFTP access, whitelists IPs, and extracts server details into per-client JSON files.
-2. **Offline conversion** — `scripts/convert_cloudways.py` parses the flat-text manifest (`todd-clients-cloudways.txt`) into the same JSON schema.
+## SSH Config Quirk
 
-Both paths write to `clients/<slug>_cloudways.json`. The JSON schema is defined in `example-client_cloudways.json`.
+`wp_update.py` defaults to `-F /dev/null` to avoid a broken system SSH config
+(`/etc/ssh/ssh_config.d/20-systemd-ssh-proxy.conf` has bad permissions on this machine).
+Use `--ssh-config <path>` to opt into a custom config. Use `--ssh-key <path>` to override `SSH_KEY` from `.env`.
 
-## Key Files
+## Linting
 
-| File | Purpose |
-|---|---|
-| `AGENTS.md` | Full browser-automation workflow (Phases 0-3); read this to understand the provisioning steps |
-| `.env` | `SSH_USER`, `APP_PW`, `SSH_KEY` credentials consumed during provisioning |
-| `IP_WHITELIST.txt` | IPs to whitelist on each Cloudways server (one per line) |
-| `cloudways_rsa.pub` | Public key deployed to each client's SSH/SFTP user |
-| `todd-clients-cloudways.txt` | Flat-text manifest of all client records (source of truth for offline conversion) |
-| `scripts/convert_cloudways.py` | Parses the text manifest into per-client JSON files |
-| `clients/` | Output directory — one `<slug>_cloudways.json` per client server |
+Repo-wide `ruff check .` is noisy due to generated/untracked support directories.
+Scope to changed files: `.venv/bin/python -m ruff check webui.py tests/test_webui.py`
 
-## Commands
+## Hooks (active)
 
-```bash
-# Convert text manifest to JSON files (wipes and regenerates clients/)
-python3 scripts/convert_cloudways.py
-```
+PostToolUse: ruff auto-runs `--fix` on any `.py` file after Edit/Write — no manual lint needed after edits.
+PreToolUse: editing `.env` is blocked (holds live SSH credentials). Edit manually in a terminal, or pass `--ssh-key <path>` to `wp_update.py` instead.
 
-No other build, lint, or test commands exist.
+## Skills
 
-## JSON Output Schema
-
-Every client file follows this structure. SFTP credentials are always masked as literal `$SSH_USER`, `$APP_PW`, `$SSH_KEY` — never raw values.
-
-```json
-{
-  "client_name": "...",
-  "email": "...",
-  "server_ip_address": "...",
-  "master_credentials": { "username": "...", "password": "..." },
-  "applications": [{
-    "website_domain": "...",
-    "path_to_public_html": "/home/master/applications/<dir>/public_html",
-    "sftp_credentials": { "username": "$SSH_USER", "password": "$APP_PW", "ssh_key": "$SSH_KEY" },
-    "environment_flags": { "wp_cli_installed": true, "is_staging": false, "has_woocommerce": false }
-  }]
-}
-```
-
-## Multi-Site Grouping Logic
-
-Clients with multiple Cloudways applications (e.g., Jerry has `lifeworkseducation.com` + `jerrybridge.com`) are grouped into a single JSON file when they share the same server IP, master username, or master password. The converter's `compatible()` function enforces this — distinct servers for the same client name produce separate files with `-2`, `-3` suffixes (e.g., `alfredo_cloudways.json`, `alfredo-2_cloudways.json`).
-
-## Browser Automation Notes
-
-The live workflow (AGENTS.md) uses Chrome MCP tools (`mcp__claude-in-chrome__*`). Critical constraints:
-
-- **Cloudways UI is slow** — always wait for spinners/toasts/DOM repaints after every click or form submission
-- **Active client is hidden** from the dropdown — process the currently-loaded client first, then iterate through the dropdown
-- **Shell access toggle** has high latency — poll DOM for success state before continuing
-- Incomplete clients (no email, no IP, empty paths with spaces) exist in the manifest and need data filled via browser extraction
-
-## Known Limitations
-
-- **SSH host key verification is TOFU.** `wp_update.py` connects with `StrictHostKeyChecking=accept-new`, which trusts whatever host key the server presents on first contact. A MITM at first contact would not be detected. For higher assurance, pre-populate `~/.ssh/known_hosts` with each Cloudways server's host key (e.g. `ssh-keyscan -H <ip> >> ~/.ssh/known_hosts`) and switch the option to `StrictHostKeyChecking=yes`.
-
-## Known Limitations
-
-- **SSH host key verification is TOFU.** `wp_update.py` connects with `StrictHostKeyChecking=accept-new`, which trusts whatever host key the server presents on first contact. A MITM at first contact would not be detected. For higher assurance, pre-populate `~/.ssh/known_hosts` with each Cloudways server's host key (e.g. `ssh-keyscan -H <ip> >> ~/.ssh/known_hosts`) and switch the option to `StrictHostKeyChecking=yes`.
+`/run-maintenance` — interactive prompt that constructs and runs `wp_update.py` with the right flags.
+`/read-logs` — parses `logs/` and summarizes the latest run: outcomes, failures, rollbacks, follow-ups needed.
