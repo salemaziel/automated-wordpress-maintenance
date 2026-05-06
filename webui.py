@@ -246,10 +246,16 @@ def validate_client_doc(doc: dict[str, Any]) -> list[str]:
 def client_path_for_doc(doc: dict[str, Any], clients_dir: Path = CLIENTS_DIR) -> Path:
     base = slugify(str(doc.get("client_name") or "client"))
     provider = slugify(str(doc.get("hosting_provider") or "Cloudways"))
-    candidate = clients_dir / f"{base}_{provider}.json"
+    target_dir = clients_dir / provider / base
+    candidate = target_dir / f"{base}_{provider}.json"
     suffix = 2
-    while candidate.exists():
-        candidate = clients_dir / f"{base}-{suffix}_{provider}.json"
+    # Look for collisions across both legacy flat layout and the new
+    # per-client subdir layout so the next free -N suffix is correct.
+    while (
+        candidate.exists()
+        or (clients_dir / candidate.name).exists()
+    ):
+        candidate = target_dir / f"{base}-{suffix}_{provider}.json"
         suffix += 1
     return candidate
 
@@ -265,6 +271,7 @@ def write_client_doc(doc: dict[str, Any], clients_dir: Path = CLIENTS_DIR) -> Pa
         raise ValueError("; ".join(errors))
     clients_dir.mkdir(parents=True, exist_ok=True)
     path = client_path_for_doc(doc, clients_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(doc, indent=2, sort_keys=False) + "\n", encoding="utf-8")
     return path
 
@@ -315,22 +322,169 @@ def resolve_uploaded_key(name: str, keys_dir: Path | None = None) -> Path | None
     return candidate
 
 
-def list_client_files(clients_dir: Path = CLIENTS_DIR, provider: str | None = None) -> list[dict[str, str]]:
+def _normalize_domain_key(value: str) -> str:
+    """Lowercase, strip scheme + leading www. + trailing slashes/path.
+    Old runs stored domains as written in the JSON ("http://foo.com/"),
+    current JSONs are bare hostnames — normalize for cross-version lookup."""
+    if not value:
+        return ""
+    s = str(value).strip().lower()
+    for prefix in ("https://", "http://"):
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+            break
+    if s.startswith("www."):
+        s = s[4:]
+    s = s.split("/", 1)[0]
+    return s.rstrip(".")
+
+
+def list_client_files(clients_dir: Path = CLIENTS_DIR, provider: str | None = None) -> list[dict[str, Any]]:
     selected_provider = (provider or "").casefold()
-    rows: list[dict[str, str]] = []
-    for path in sorted(clients_dir.glob("*.json")):
-        label = path.stem
-        client_provider = provider_from_client_path(path)
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    # Discover both legacy flat (clients/<slug>_<provider>.json) and
+    # per-client subdir (clients/<provider>/<base>/<slug>_<provider>.json)
+    # layouts. Filename is unique across either, so we key by `path.name`.
+    candidates: list[Path] = []
+    for pattern in ("*.json", "*/*.json", "*/*/*.json"):
+        candidates.extend(clients_dir.glob(pattern))
+    # Dedupe: when a per-domain file `<slug>_<domain>_cloudways.json` exists
+    # in a directory, suppress sibling files whose every domain is already
+    # covered by such a per-domain file. Lets us keep legacy multi-app and
+    # bare-slug files on disk without showing dup picker entries.
+    preferred: set[tuple[str, str]] = set()  # (parent_dir, domain)
+    file_domains: dict[Path, list[str]] = {}
+    for path in candidates:
         try:
             doc = json.loads(path.read_text(encoding="utf-8"))
-            label = str(doc.get("client_name") or label)
+        except (OSError, json.JSONDecodeError):
+            file_domains[path] = []
+            continue
+        apps = doc.get("applications") or []
+        ds: list[str] = []
+        if isinstance(apps, list):
+            for app in apps:
+                if isinstance(app, dict):
+                    d = str(app.get("website_domain") or "").strip()
+                    if d:
+                        ds.append(d)
+        file_domains[path] = ds
+        if len(ds) == 1:
+            stem = path.stem
+            domain = ds[0]
+            if stem.endswith(f"_{domain}_cloudways") or stem.endswith(f"_{domain}"):
+                preferred.add((str(path.parent), domain))
+    superseded: set[Path] = set()
+    for path, ds in file_domains.items():
+        if not ds:
+            continue
+        stem = path.stem
+        is_preferred = (
+            len(ds) == 1
+            and (stem.endswith(f"_{ds[0]}_cloudways") or stem.endswith(f"_{ds[0]}"))
+        )
+        if is_preferred:
+            continue
+        if all((str(path.parent), d) in preferred for d in ds):
+            superseded.add(path)
+    # Pull DB-backed last-success timestamps once per request so we can
+    # badge each client without N+1 queries.
+    # Per-domain rollup ONLY. Client-name rollup conflates multi-server
+    # splits (e.g. alfredo / alfredo-2 / alfredo-3 all share client_name
+    # "Alfredo" but live on different servers — the WC site is its own
+    # file and may not have been touched yet).
+    last_by_domain_raw: dict[str, str] = {}
+    if DB_CONN is not None:
+        with contextlib.suppress(sqlite3.Error):
+            last_by_domain_raw = db.last_success_per_domain(DB_CONN)
+    # Older runs stored domains as written in the JSON ("http://foo.com/",
+    # "foo.com/"); current JSONs are bare hostnames. Normalize both sides so
+    # the lookup hits regardless of historical formatting.
+    last_by_domain: dict[str, str] = {}
+    for raw_domain, ts in last_by_domain_raw.items():
+        key = _normalize_domain_key(raw_domain)
+        if not key:
+            continue
+        prev = last_by_domain.get(key)
+        if prev is None or (ts or "") > prev:
+            last_by_domain[key] = ts
+    for path in sorted(candidates):
+        if path.name in seen:
+            continue
+        if path in superseded:
+            continue
+        seen.add(path.name)
+        label = path.stem
+        client_provider = provider_from_client_path(path)
+        client_name = label
+        has_woo = False
+        domains: list[str] = []
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            client_name = str(doc.get("client_name") or label)
+            label = client_name
             client_provider = str(doc.get("hosting_provider") or client_provider).strip() or client_provider
+            apps = doc.get("applications") or []
+            if isinstance(apps, list):
+                for app in apps:
+                    if not isinstance(app, dict):
+                        continue
+                    flags = app.get("environment_flags") or {}
+                    if isinstance(flags, dict) and flags.get("has_woocommerce"):
+                        has_woo = True
+                    domain = str(app.get("website_domain") or "").strip()
+                    if domain:
+                        domains.append(domain)
         except (OSError, json.JSONDecodeError):
             pass
         if selected_provider and client_provider.casefold() != selected_provider:
             continue
-        rows.append({"name": path.name, "label": label, "provider": client_provider})
+        # Per-domain rollup: only mark this file as "recently run" if at
+        # least one of ITS domains has a successful execute-mode outcome.
+        # Track which specific domains have/haven't run so the UI can
+        # show "1/2 ok" for partially-completed multi-app files.
+        per_domain_last: dict[str, str | None] = {
+            d: last_by_domain.get(_normalize_domain_key(d)) for d in domains
+        }
+        run_domains = [d for d, v in per_domain_last.items() if v]
+        last_at: str | None = (
+            max(v for v in per_domain_last.values() if v) if run_domains else None
+        )
+        rows.append({
+            "name": path.name,
+            "label": label,
+            "provider": client_provider,
+            "has_woocommerce": has_woo,
+            "domains": domains,
+            "domains_run": run_domains,
+            "domains_total": len(domains),
+            "last_success_at": last_at,
+        })
     return rows
+
+
+def resolve_client_file(name: str, clients_dir: Path = CLIENTS_DIR) -> Path | None:
+    """Locate a client JSON by basename across legacy + per-client layouts."""
+    safe_name = Path(name).name
+    if not safe_name:
+        return None
+    for pattern in (safe_name, f"*/{safe_name}", f"*/*/{safe_name}"):
+        for match in clients_dir.glob(pattern):
+            return match
+    return None
+
+
+def _summarize_client_selection(payload: dict[str, Any]) -> str:
+    raw = payload.get("clientFiles")
+    if isinstance(raw, list):
+        names = [Path(str(x)).name for x in raw if str(x).strip()]
+        if not names:
+            return ""
+        if len(names) == 1:
+            return names[0]
+        return f"{len(names)} files: " + ", ".join(names[:3]) + ("..." if len(names) > 3 else "")
+    return str(payload.get("clientFile") or "").strip()
 
 
 def build_wp_args(payload: dict[str, Any], *, remote: bool = False) -> list[str]:
@@ -339,10 +493,27 @@ def build_wp_args(payload: dict[str, Any], *, remote: bool = False) -> list[str]
         args.append("--execute")
     if payload.get("includeWooCommerce"):
         args.append("--include-woocommerce")
-    client_file = str(payload.get("clientFile") or "").strip()
-    if client_file:
-        safe_name = Path(client_file).name
-        client_path = f"clients/{safe_name}" if remote else str(CLIENTS_DIR / safe_name)
+    raw_files = payload.get("clientFiles")
+    if isinstance(raw_files, list):
+        names = [str(x).strip() for x in raw_files if str(x).strip()]
+    else:
+        single = str(payload.get("clientFile") or "").strip()
+        names = [single] if single else []
+    seen: set[str] = set()
+    for name in names:
+        safe_name = Path(name).name
+        if not safe_name or safe_name in seen:
+            continue
+        seen.add(safe_name)
+        resolved = resolve_client_file(safe_name)
+        if remote:
+            if resolved is not None:
+                rel = resolved.relative_to(CLIENTS_DIR).as_posix()
+                client_path = f"clients/{rel}"
+            else:
+                client_path = f"clients/{safe_name}"
+        else:
+            client_path = str(resolved) if resolved else str(CLIENTS_DIR / safe_name)
         args.extend(["--client-file", client_path])
     selected_key = str(payload.get("sshKey") or "").strip()
     if selected_key and not remote:
@@ -412,7 +583,7 @@ def start_run(
         command=command,
         mode=mode,
         target=target,
-        client_file=str(payload.get("clientFile") or "").strip(),
+        client_file=_summarize_client_selection(payload),
         include_woo=bool(payload.get("includeWooCommerce")),
         started_by=started_by,
     )
@@ -680,12 +851,55 @@ def run_summary_payload(run_id: str) -> dict[str, Any] | None:
 
 
 def client_history_payload(client_name: str) -> dict[str, Any]:
+    notes_data = _load_client_notes_for_filename(client_name)
+    display_name = _resolve_display_name(client_name) or client_name
     if DB_CONN is None:
-        return {"client": client_name, "last_touched": None, "last_success": None,
-                "recent_failures": [], "recent_runs": []}
-    history = db.client_history(DB_CONN, client_name=client_name)
+        return {"client": display_name, "last_touched": None, "last_success": None,
+                "recent_failures": [], "recent_runs": [], **notes_data}
+    history = db.client_history(DB_CONN, client_name=display_name)
     history["recent_runs"] = [_db_run_row(r) for r in history.get("recent_runs", [])]
+    history.update(notes_data)
     return history
+
+
+def _resolve_display_name(filename: str) -> str | None:
+    """Read the client JSON to recover its `client_name` for DB lookups.
+
+    The picker passes filenames like `lisette_cloudways.json`; the DB
+    stores the display name from the JSON (e.g. "Lisette").
+    """
+    path = resolve_client_file(filename)
+    if path is None:
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) or {}
+    except (OSError, json.JSONDecodeError):
+        return None
+    name = str(data.get("client_name") or "").strip()
+    return name or None
+
+
+def _load_client_notes_for_filename(filename: str) -> dict[str, Any]:
+    """Resolve a client filename → its sibling notes.json contents.
+
+    Returns {"notes_general": str, "notes_sites": {domain: {...}}} when
+    notes are present; empty dict otherwise. UI uses this to surface
+    configured skip_items for the selected client.
+    """
+    path = resolve_client_file(filename)
+    if path is None:
+        return {}
+    notes_path = path.parent / "notes.json"
+    if not notes_path.exists():
+        return {}
+    try:
+        data = json.loads(notes_path.read_text(encoding="utf-8")) or {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {
+        "notes_general": str(data.get("general") or "").strip(),
+        "notes_sites": data.get("sites") if isinstance(data.get("sites"), dict) else {},
+    }
 
 
 def plugin_stats_payload() -> dict[str, Any]:
@@ -1133,8 +1347,32 @@ def app_html(settings: Settings) -> str:
     .modal-content{{background:var(--panel);padding:24px;border-radius:8px;width:min(900px,95vw);max-height:90vh;overflow:auto;position:relative}}
     .close-modal{{position:absolute;top:12px;right:16px;font-size:24px;cursor:pointer;background:none;border:0;color:var(--muted)}}
     .collapsible{{cursor:pointer;display:flex;align-items:center;gap:8px;user-select:none}} .collapsible::before{{content:'▶';font-size:10px;transition:transform .2s}} .collapsible.open::before{{transform:rotate(90deg)}}
+    .client-picker{{border:1px solid var(--line);border-radius:6px;background:#fff}}
+    .client-picker-toolbar{{display:flex;gap:8px;align-items:center;padding:8px;border-bottom:1px solid var(--line);flex-wrap:wrap}}
+    .client-picker-toolbar input{{flex:1;min-width:140px;font-size:12px;padding:6px 8px}}
+    .client-quick{{display:flex;gap:4px;flex-wrap:wrap}}
+    .client-quick button{{font-size:11px;height:auto;padding:4px 8px;margin:0;background:#f3f4f1;color:var(--text);font-weight:600;border:1px solid var(--line);border-radius:4px;cursor:pointer;width:auto}}
+    .client-quick button:hover{{background:#e9ebe6}}
+    .client-picker-list{{max-height:280px;overflow-y:auto;padding:4px 0}}
+    .client-picker-list label{{display:flex;align-items:flex-start;gap:8px;padding:6px 10px;font-size:12px;cursor:pointer;border-bottom:1px solid #f0f1ee;font-weight:normal;margin:0}}
+    .client-picker-list label:hover{{background:#f8faf7}}
+    .client-picker-list label.hidden{{display:none}}
+    .client-picker-list input[type=checkbox]{{width:auto;height:auto;margin:2px 0 0;flex-shrink:0}}
+    .client-picker-list .row-main{{flex:1;min-width:0;color:var(--text)}}
+    .client-picker-list .row-main>div:first-child{{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-weight:600}}
+    .client-picker-list .row-meta{{font-size:11px;color:var(--muted);margin-top:3px;word-break:break-word}}
+    .client-picker-list .row-badges{{display:inline-flex;gap:4px;flex-wrap:wrap}}
+    .client-picker-list .badge{{font-size:10px;padding:1px 5px;border-radius:3px;background:#eef0eb;color:#444}}
+    .client-picker-list .badge.woo{{background:#f4ead8;color:#7a5a17}}
+    .client-picker-list .badge.never{{background:#fde9e9;color:#902020}}
+    .client-picker-list .badge.recent{{background:#e3f0e3;color:#1d5d1d}}
+    .client-picker-footer{{display:flex;justify-content:space-between;gap:10px;padding:6px 10px;border-top:1px solid var(--line);font-size:11px;color:var(--muted);background:#fafbf8}}
+    .client-picker-footer #clientPickerCount{{font-weight:600;color:var(--text)}}
     .client-history{{background:#f8faf7;border:1px solid var(--line);border-radius:6px;padding:12px;margin-top:10px;font-size:12px}}
     .client-history h4{{margin:0 0 8px;font-size:11px;text-transform:uppercase;color:var(--muted)}}
+    .client-history .notes-site{{margin-top:6px;padding:6px 8px;background:#fff;border:1px solid var(--line);border-radius:4px}}
+    .client-history .notes-text{{color:var(--muted);font-style:italic;margin:2px 0}}
+    .client-history code{{background:#eef0eb;padding:1px 4px;border-radius:3px;font-family:var(--mono);font-size:11px}}
     .stat-card{{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:12px;margin-top:10px}}
     .stat-item{{background:#f8faf7;border:1px solid var(--line);padding:10px;border-radius:6px}}
     .stat-value{{font-size:18px;font-weight:800;color:var(--accent)}} .stat-label{{font-size:10px;color:var(--muted);text-transform:uppercase}}
@@ -1168,7 +1406,23 @@ def app_html(settings: Settings) -> str:
           <label class="check"><input id="includeWoo" type="checkbox"> Include WooCommerce</label>
         </div>
         <label>Client scope</label>
-        <select id="clientFile"><option value="">All client files</option></select>
+        <div class="client-picker">
+          <div class="client-picker-toolbar">
+            <input id="clientFilterText" type="search" placeholder="Filter clients...">
+            <div class="client-quick">
+              <button type="button" data-quick="all">All</button>
+              <button type="button" data-quick="none">None</button>
+              <button type="button" data-quick="never">Never run</button>
+              <button type="button" data-quick="stale">Not run 24h+</button>
+              <button type="button" data-quick="woo">WooCommerce</button>
+            </div>
+          </div>
+          <div id="clientFileList" class="client-picker-list"></div>
+          <div class="client-picker-footer">
+            <span id="clientPickerCount">0 selected</span>
+            <span id="clientListSummary"></span>
+          </div>
+        </div>
         <div id="clientHistory" class="client-history hidden"></div>
         <label>SSH key</label>
         <select id="sshKey"><option value="">Use .env / remote default</option></select>
@@ -1289,16 +1543,140 @@ def app_html(settings: Settings) -> str:
       if (!res.ok) throw new Error(body.error || res.statusText);
       return body;
     }}
+    function parseIso(iso) {{
+      if (!iso) return NaN;
+      // Accept "2026-04-28T02:57:53+00:00", "2026-04-28T02:57:53Z",
+      // or naive "2026-04-28T02:57:53" (assume UTC).
+      let s = String(iso);
+      if (!/[zZ]|[+-]\\d{{2}}:?\\d{{2}}$/.test(s)) s += 'Z';
+      const t = new Date(s).getTime();
+      return Number.isFinite(t) ? t : NaN;
+    }}
+    function fmtAge(iso) {{
+      const t = parseIso(iso);
+      if (!Number.isFinite(t)) return null;
+      const d = new Date(t);
+      const mins = Math.max(0, Math.round((Date.now() - t) / 60000));
+      let rel;
+      if (mins < 60) rel = `${{mins}} min ago`;
+      else if (mins < 60*36) rel = `${{Math.round(mins/60)}} hr ago`;
+      else rel = `${{Math.round(mins/1440)}} days ago`;
+      const abs = d.toLocaleString(undefined, {{
+        month: 'short', day: 'numeric',
+        hour: 'numeric', minute: '2-digit'
+      }});
+      return `${{abs}} (${{rel}})`;
+    }}
+    let clientsCache = [];
     async function loadClients() {{
       const data = await api(`/api/clients?provider=${{encodeURIComponent(selectedProvider)}}`);
-      const select = $('clientFile');
-      select.innerHTML = '<option value="">All client files</option>';
-      data.clients.forEach((client) => {{
-        const option = document.createElement('option');
-        option.value = client.name;
-        option.textContent = `${{client.label}} (${{client.name}})`;
-        select.appendChild(option);
+      clientsCache = data.clients || [];
+      const list = $('clientFileList');
+      list.innerHTML = '';
+      const now = Date.now();
+      const DAY = 24*3600*1000;
+      clientsCache.forEach((client) => {{
+        const t = parseIso(client.last_success_at);
+        const recent = Number.isFinite(t) && (now - t) < DAY;
+        const never = !Number.isFinite(t);
+        const woo = !!client.has_woocommerce;
+        const total = client.domains_total || (client.domains ? client.domains.length : 0);
+        const ranCount = client.domains_run ? client.domains_run.length : 0;
+        const doms = client.domains || [];
+        let domainStr = '';
+        if (doms.length === 1) domainStr = doms[0];
+        else if (doms.length > 1) domainStr = `${{doms.length}} sites: ${{doms.slice(0, 2).join(', ')}}${{doms.length > 2 ? ` +${{doms.length - 2}}` : ''}}`;
+        const badges = [];
+        if (woo) badges.push('<span class="badge woo">Woo</span>');
+        if (never) badges.push('<span class="badge never">never run</span>');
+        else if (recent) badges.push('<span class="badge recent">' + fmtAge(client.last_success_at) + '</span>');
+        else badges.push('<span class="badge">' + fmtAge(client.last_success_at) + '</span>');
+        if (total > 1) badges.push(`<span class="badge">${{ranCount}}/${{total}}</span>`);
+        const label = document.createElement('label');
+        label.dataset.name = client.name;
+        if (woo) label.dataset.woo = '1';
+        if (recent) label.dataset.recent = '1';
+        if (never) label.dataset.never = '1';
+        label.dataset.search = (client.label + ' ' + doms.join(' ')).toLowerCase();
+        label.innerHTML = `
+          <input type="checkbox" value="${{client.name}}">
+          <div class="row-main">
+            <div>${{client.label}}<span class="row-badges">${{badges.join('')}}</span></div>
+            ${{domainStr ? `<div class="row-meta">${{domainStr}}</div>` : ''}}
+          </div>
+        `;
+        list.appendChild(label);
       }});
+      list.querySelectorAll('input[type=checkbox]').forEach(cb => cb.addEventListener('change', onClientSelectionChange));
+      const wooCount = clientsCache.filter(c => c.has_woocommerce).length;
+      const recentCount = clientsCache.filter(c => {{
+        const t = parseIso(c.last_success_at);
+        return Number.isFinite(t) && (now - t) < DAY;
+      }}).length;
+      const neverCount = clientsCache.filter(c => !c.last_success_at).length;
+      const status = $('clientListSummary');
+      if (status) status.textContent = `${{clientsCache.length}} clients · ${{wooCount}} Woo · ${{recentCount}} run <24h · ${{neverCount}} never`;
+      onClientSelectionChange();
+    }}
+    function selectedClientNames() {{
+      return [...document.querySelectorAll('#clientFileList input[type=checkbox]:checked')].map(cb => cb.value);
+    }}
+    function onClientSelectionChange() {{
+      const sel = selectedClientNames();
+      $('clientPickerCount').textContent = sel.length === 0 ? 'All clients (none selected)' : `${{sel.length}} selected`;
+      const container = $('clientHistory');
+      if (sel.length === 1) {{
+        loadClientHistory(sel[0]);
+      }} else {{
+        container.classList.add('hidden');
+      }}
+    }}
+    async function loadClientHistory(name) {{
+      const container = $('clientHistory');
+      try {{
+        const data = await api(`/api/clients/${{encodeURIComponent(name)}}/history`);
+        const sites = data.notes_sites || {{}};
+        const skipBlocks = [];
+        Object.keys(sites).forEach(domain => {{
+          const entry = sites[domain] || {{}};
+          const items = entry.skip_items || [];
+          const dnote = (entry.notes || '').trim();
+          if (!items.length && !dnote) return;
+          const itemHtml = items.map(it => {{
+            const reason = it.reason ? ` — ${{it.reason}}` : '';
+            return `<div>· <code>${{it.type}}:${{it.slug}}</code>${{reason}}</div>`;
+          }}).join('');
+          skipBlocks.push(`<div class="notes-site"><strong>${{domain}}</strong>${{dnote ? `<div class="notes-text">${{dnote}}</div>` : ''}}${{itemHtml}}</div>`);
+        }});
+        const generalNote = (data.notes_general || '').trim();
+        container.innerHTML = `
+          <h4>${{data.client}} History</h4>
+          <div>Last touched: ${{data.last_touched}}</div>
+          <div>Last success: ${{data.last_success}}</div>
+          ${{data.recent_failures && data.recent_failures.length ? `<div class="warn">Recent failures: ${{data.recent_failures.length}}</div>` : ''}}
+          ${{generalNote ? `<div class="notes-text" style="margin-top:8px"><strong>Notes:</strong> ${{generalNote}}</div>` : ''}}
+          ${{skipBlocks.length ? `<div style="margin-top:8px"><strong>Configured skips:</strong>${{skipBlocks.join('')}}</div>` : ''}}
+        `;
+        container.classList.remove('hidden');
+      }} catch (e) {{ console.error('Failed to load client history', e); }}
+    }}
+    function applyClientFilter() {{
+      const q = ($('clientFilterText').value || '').toLowerCase().trim();
+      document.querySelectorAll('#clientFileList label').forEach(label => {{
+        label.classList.toggle('hidden', q && !label.dataset.search.includes(q));
+      }});
+    }}
+    function quickSelect(kind) {{
+      const labels = [...document.querySelectorAll('#clientFileList label')].filter(l => !l.classList.contains('hidden'));
+      labels.forEach(l => {{
+        const cb = l.querySelector('input[type=checkbox]');
+        if (kind === 'all') cb.checked = true;
+        else if (kind === 'none') cb.checked = false;
+        else if (kind === 'never') cb.checked = l.dataset.never === '1';
+        else if (kind === 'stale') cb.checked = l.dataset.recent !== '1';
+        else if (kind === 'woo') cb.checked = l.dataset.woo === '1';
+      }});
+      onClientSelectionChange();
     }}
     async function loadSshKeys() {{
       const data = await api('/api/ssh-keys');
@@ -1319,7 +1697,7 @@ def app_html(settings: Settings) -> str:
         target: $('target').value,
         execute: $('execute').checked,
         includeWooCommerce: $('includeWoo').checked,
-        clientFile: $('clientFile').value,
+        clientFiles: selectedClientNames(),
         sshKey: $('sshKey').value,
         remoteHost: $('remoteHost').value,
         remotePort: Number($('remotePort').value || 22),
@@ -1454,21 +1832,10 @@ def app_html(settings: Settings) -> str:
       }});
     }}
 
-    // B2: Client history
-    $('clientFile').addEventListener('change', async () => {{
-      const name = $('clientFile').value;
-      const container = $('clientHistory');
-      if (!name) {{ container.classList.add('hidden'); return; }}
-      try {{
-        const data = await api(`/api/clients/${{encodeURIComponent(name)}}/history`);
-        container.innerHTML = `
-          <h4>${{data.client}} History</h4>
-          <div>Last touched: ${{data.last_touched}}</div>
-          <div>Last success: ${{data.last_success}}</div>
-          ${{data.recent_failures.length ? `<div class="warn">Recent failures: ${{data.recent_failures.length}}</div>` : ''}}
-        `;
-        container.classList.remove('hidden');
-      }} catch (e) {{ console.error('Failed to load client history', e); }}
+    // B2: Client picker filter + quick-select wiring
+    $('clientFilterText').addEventListener('input', applyClientFilter);
+    document.querySelectorAll('.client-quick button').forEach(btn => {{
+      btn.addEventListener('click', () => quickSelect(btn.dataset.quick));
     }});
 
     // B3: Plugin health

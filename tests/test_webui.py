@@ -145,7 +145,13 @@ def test_local_command_defaults_to_dry_run_and_stream() -> None:
     assert command[:2] == [sys.executable, str(webui.SCRIPT_PATH)]
     assert "--stream" in command
     assert "--execute" not in command
-    assert command[-2:] == ["--client-file", str(webui.CLIENTS_DIR / "example-client_cloudways.json")]
+    # Path resolution walks both flat and per-client subdir layouts; pin the
+    # assertion to whatever resolve_client_file returns (or the flat fallback
+    # if the file isn't on disk in this environment).
+    expected = webui.resolve_client_file("example-client_cloudways.json") or (
+        webui.CLIENTS_DIR / "example-client_cloudways.json"
+    )
+    assert command[-2:] == ["--client-file", str(expected)]
 
 
 def test_local_command_can_use_uploaded_ssh_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -166,6 +172,32 @@ def test_local_command_adds_execute_and_woocommerce_flags() -> None:
 
     assert "--execute" in command
     assert "--include-woocommerce" in command
+
+
+def test_local_command_supports_multiple_client_files() -> None:
+    command = webui.build_local_command(
+        {"clientFiles": ["a_cloudways.json", "b_cloudways.json", "a_cloudways.json"]}
+    )
+
+    # Each unique file gets its own --client-file flag; duplicates collapsed.
+    flag_positions = [i for i, x in enumerate(command) if x == "--client-file"]
+    assert len(flag_positions) == 2
+    paths = [command[i + 1] for i in flag_positions]
+    assert all(p.endswith("a_cloudways.json") or p.endswith("b_cloudways.json") for p in paths)
+    assert paths[0] != paths[1]
+
+
+def test_local_command_empty_client_files_means_all() -> None:
+    command = webui.build_local_command({"clientFiles": []})
+    assert "--client-file" not in command
+
+
+def test_summarize_client_selection_for_multi() -> None:
+    summary = webui._summarize_client_selection(
+        {"clientFiles": ["a.json", "b.json", "c.json", "d.json"]}
+    )
+    assert summary.startswith("4 files: ")
+    assert summary.endswith("...")
 
 
 def test_remote_command_wraps_streaming_script_with_ssh() -> None:
@@ -200,9 +232,18 @@ def test_remote_command_uses_repo_relative_client_file() -> None:
         settings,
     )
 
-    assert command[-1].endswith(
-        "wp_update.py --stream --client-file clients/example-client_cloudways.json"
-    )
+    # The remote arg is `clients/<resolved-relpath>` when the file exists
+    # locally (so both ends use the same relative path), or
+    # `clients/<basename>` as a fallback. Either form is acceptable.
+    resolved = webui.resolve_client_file("example-client_cloudways.json")
+    if resolved is not None:
+        rel = resolved.relative_to(webui.CLIENTS_DIR).as_posix()
+        expected = f"wp_update.py --stream --client-file clients/{rel}"
+    else:
+        expected = (
+            "wp_update.py --stream --client-file clients/example-client_cloudways.json"
+        )
+    assert command[-1].endswith(expected)
 
 
 def test_start_run_rejects_provider_without_runner() -> None:

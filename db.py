@@ -739,3 +739,138 @@ def load_summary_file(path: Path) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
     return data if isinstance(data, dict) else None
+
+
+def last_success_per_client(
+    conn: sqlite3.Connection,
+) -> dict[str, str]:
+    """Return {client_name: max(finished_at)} across execute-mode successes.
+
+    Used by the web UI to badge "recently run" clients in the picker.
+    """
+    with _read(conn):
+        rows = conn.execute(
+            """
+            SELECT s.client_name, MAX(s.finished_at) AS last_at
+              FROM site_outcomes s
+              JOIN runs r ON r.webui_run_id = s.webui_run_id
+             WHERE s.outcome = 'success'
+               AND r.mode = 'execute'
+             GROUP BY s.client_name
+            """
+        ).fetchall()
+    return {row["client_name"]: row["last_at"] for row in rows if row["client_name"]}
+
+
+def last_success_per_domain(
+    conn: sqlite3.Connection,
+) -> dict[str, str]:
+    """Return {domain: max(finished_at)} across execute-mode successes."""
+    with _read(conn):
+        rows = conn.execute(
+            """
+            SELECT s.domain, MAX(s.finished_at) AS last_at
+              FROM site_outcomes s
+              JOIN runs r ON r.webui_run_id = s.webui_run_id
+             WHERE s.outcome = 'success'
+               AND r.mode = 'execute'
+             GROUP BY s.domain
+            """
+        ).fetchall()
+    return {row["domain"]: row["last_at"] for row in rows if row["domain"]}
+
+
+def recent_successful_domains(
+    conn: sqlite3.Connection, hours: int
+) -> set[str]:
+    """Return domains with a successful execute-mode run in the last N hours.
+
+    Used by wp_update.py --skip-recent to dedupe daily reruns.
+    """
+    if hours <= 0:
+        return set()
+    cutoff = _now_iso(time.time() - hours * 3600)
+    with _read(conn):
+        rows = conn.execute(
+            """
+            SELECT DISTINCT s.domain
+              FROM site_outcomes s
+              JOIN runs r ON r.webui_run_id = s.webui_run_id
+             WHERE s.outcome = 'success'
+               AND r.mode = 'execute'
+               AND s.finished_at >= ?
+            """,
+            (cutoff,),
+        ).fetchall()
+    return {row["domain"] for row in rows if row["domain"]}
+
+
+def _summary_run_status(summary: dict[str, Any]) -> str:
+    sites = summary.get("sites") or []
+    if not isinstance(sites, list):
+        return "unknown"
+    outcomes = [
+        str(s.get("overall") or "").strip()
+        for s in sites if isinstance(s, dict)
+    ]
+    if any(o == "failed" for o in outcomes):
+        return "failed"
+    if any(o == "rolled-back" for o in outcomes):
+        return "failed"
+    return "success"
+
+
+def ingest_cli_summary(
+    conn: sqlite3.Connection,
+    *,
+    summary_path: Path,
+    started_by: str = "cli",
+) -> str | None:
+    """Ingest a wp_update.py CLI run from its summary JSON.
+
+    Synthesizes webui_run_id = "cli-<run_id>", upserts the runs row, then
+    delegates to ingest_run_summary. Idempotent — safe to call repeatedly
+    for the same summary file. Returns the synthetic webui_run_id, or None
+    if the summary is missing/unparseable/has no run_id.
+    """
+    summary = load_summary_file(summary_path)
+    if summary is None:
+        return None
+    run_id = str(summary.get("run_id") or "").strip()
+    if not run_id:
+        return None
+    cli_webui_run_id = f"cli-{run_id}"
+    mode = str(summary.get("mode") or "dry-run").strip() or "dry-run"
+    generated_at = str(summary.get("generated_at") or _now_iso()).strip()
+    sites = summary.get("sites") or []
+    has_woo = any(
+        s.get("has_woocommerce")
+        for s in sites if isinstance(s, dict)
+    )
+    status = _summary_run_status(summary)
+    exit_code = 0 if status == "success" else 1
+    with _txn(conn):
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO runs(
+                webui_run_id, run_id, provider, mode, target, client_file,
+                include_woo, started_at, finished_at, exit_code, status,
+                summary_path, started_by, ingest_status
+            ) VALUES (?, ?, 'cloudways', ?, 'all', NULL,
+                      ?, ?, ?, ?, ?, ?, ?, 'pending')
+            """,
+            (
+                cli_webui_run_id, run_id, mode,
+                1 if has_woo else 0, generated_at, generated_at,
+                exit_code, status, str(summary_path), started_by,
+            ),
+        )
+        # If a runs row already exists for this run_id (e.g. it was
+        # registered by the web UI before wp_update.py finished), reuse
+        # its webui_run_id so FK references resolve.
+        row = conn.execute(
+            "SELECT webui_run_id FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        webui_run_id = row["webui_run_id"] if row else cli_webui_run_id
+    ingest_run_summary(conn, webui_run_id=webui_run_id, summary=summary)
+    return webui_run_id

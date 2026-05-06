@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -14,7 +15,7 @@ def make_args(
     tmp_path: Path,
     *,
     execute: bool = False,
-    client_file: Path | None = None,
+    client_file: Path | list[Path] | None = None,
     clients_dir: Path | None = None,
 ) -> argparse.Namespace:
     env_file = tmp_path / ".env"
@@ -142,6 +143,33 @@ def test_gather_client_files_returns_sorted_cloudways_files(tmp_path: Path) -> N
         "alpha_cloudways.json",
         "zeta_cloudways.json",
     ]
+
+
+def test_gather_client_files_accepts_multiple_explicit_paths(tmp_path: Path) -> None:
+    clients_dir = tmp_path / "clients"
+    clients_dir.mkdir()
+    a = clients_dir / "alpha_cloudways.json"
+    b = clients_dir / "beta_cloudways.json"
+    c = clients_dir / "gamma_cloudways.json"
+    for p in (a, b, c):
+        p.write_text("{}")
+
+    args = make_args(tmp_path, clients_dir=clients_dir, client_file=[a, b, a])
+    updater = wp_update.WPUpdater(args)
+
+    files = updater._gather_client_files()
+
+    # Duplicates collapsed; gamma not requested so excluded.
+    assert sorted(p.name for p in files) == ["alpha_cloudways.json", "beta_cloudways.json"]
+
+
+def test_client_file_argparse_is_repeatable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys, "argv",
+        ["wp_update.py", "--client-file", "x.json", "--client-file", "y.json"],
+    )
+    ns = wp_update.build_cli()
+    assert [Path(p).name for p in ns.client_file] == ["x.json", "y.json"]
 
 
 def test_validate_app_resolves_placeholders_from_env(tmp_path: Path) -> None:
@@ -1152,3 +1180,67 @@ def test_step_backup_still_creates_backup_dir_without_plugins_subdir(tmp_path: P
     assert "public_html.tar.gz" in script
     # The per-plugin snapshot subdir is no longer created
     assert "/plugins'" not in script  # specifically the mkdir '…/plugins' line
+
+
+def test_load_client_notes_missing_returns_empty(tmp_path: Path) -> None:
+    client = tmp_path / "lisette_yogabranch.com_cloudways.json"
+    client.write_text("{}")
+    assert wp_update.load_client_notes(client) == {}
+
+
+def test_load_client_notes_parses_sites(tmp_path: Path) -> None:
+    client = tmp_path / "lisette_yogabranch.com_cloudways.json"
+    client.write_text("{}")
+    (tmp_path / "notes.json").write_text(
+        '{"general": "n", "sites": {"yogabranch.com": '
+        '{"skip_items": [{"type": "theme", "slug": "yogabranch-pro", '
+        '"reason": "license expired"}]}}}'
+    )
+    notes = wp_update.load_client_notes(client)
+    items = wp_update.skip_items_for_domain(notes, "yogabranch.com")
+    assert items == [{"type": "theme", "slug": "yogabranch-pro", "reason": "license expired"}]
+
+
+def test_skip_items_for_domain_normalizes_scheme_and_slash() -> None:
+    notes = {
+        "sites": {
+            "https://Foo.example.com/": {
+                "skip_items": [{"type": "plugin", "slug": "ninja-forms", "reason": "PHP 8"}]
+            }
+        }
+    }
+    assert wp_update.skip_items_for_domain(notes, "foo.example.com") == [
+        {"type": "plugin", "slug": "ninja-forms", "reason": "PHP 8"}
+    ]
+    assert wp_update.skip_items_for_domain(notes, "http://foo.example.com/") == [
+        {"type": "plugin", "slug": "ninja-forms", "reason": "PHP 8"}
+    ]
+
+
+def test_skip_items_for_domain_filters_invalid_entries() -> None:
+    notes = {
+        "sites": {
+            "x.com": {
+                "skip_items": [
+                    {"type": "plugin", "slug": "ok"},
+                    {"type": "core", "slug": "wp"},  # not plugin/theme
+                    {"type": "plugin"},               # missing slug
+                    "not-a-dict",
+                ]
+            }
+        }
+    }
+    items = wp_update.skip_items_for_domain(notes, "x.com")
+    assert items == [{"type": "plugin", "slug": "ok", "reason": ""}]
+
+
+def test_skip_items_for_domain_returns_empty_for_unknown_domain() -> None:
+    notes = {"sites": {"a.com": {"skip_items": [{"type": "plugin", "slug": "x"}]}}}
+    assert wp_update.skip_items_for_domain(notes, "b.com") == []
+
+
+def test_to_dict_includes_skip_items() -> None:
+    report = make_report(skip_items=[{"type": "plugin", "slug": "ninja-forms", "reason": "PHP 8"}])
+    assert report.to_dict()["skip_items"] == [
+        {"type": "plugin", "slug": "ninja-forms", "reason": "PHP 8"}
+    ]

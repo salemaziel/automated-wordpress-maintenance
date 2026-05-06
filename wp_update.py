@@ -72,7 +72,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib import error as urlerror
@@ -86,6 +86,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent            # claude-wordpress-maint
 DEFAULT_ENV = SCRIPT_DIR / ".env"
 DEFAULT_CLIENTS = SCRIPT_DIR / "clients"
 DEFAULT_LOGS = SCRIPT_DIR / "logs"
+DEFAULT_DB = SCRIPT_DIR / "db" / "wpmaint.db"
 DEFAULT_SSH_CONFIG = Path(os.environ.get("WP_UPDATE_SSH_CONFIG", "/dev/null"))
 
 # Cloudways apps always live under /home/master/applications/<hash>/public_html
@@ -163,6 +164,11 @@ def _extract_plugin_error(result: dict) -> str:
             return text[:200]
     if result.get("_no_entry"):
         return "wp-cli returned no entry for this slug"
+    if result.get("_parse_error"):
+        # Reached when _raw is empty/whitespace: wp-cli exited 0 but emitted
+        # nothing on stdout or stderr. Surfaces as its own diagnostic so we
+        # don't conflate it with a real wp-cli "Error" status.
+        return "wp-cli produced no output (likely transient)"
     return f"status={result.get('status', '?')}"
 
 
@@ -196,6 +202,9 @@ class SiteReport:
     rollback_result: str = ""
     baseline: dict[str, Any] = field(default_factory=dict)
     steps: list[StepResult] = field(default_factory=list)
+    # Per-site configured skips loaded from sibling notes.json. Each entry:
+    # {"type": "plugin"|"theme", "slug": "...", "reason": "..."}
+    skip_items: list[dict[str, Any]] = field(default_factory=list)
 
     # Auth method: "key" (wpupdates SSH key) or "master" (master_xxx + password)
     # Determined during ssh-preflight. When "master", ownership must be restored
@@ -237,6 +246,7 @@ class SiteReport:
             "failure_detail": self.failure_detail,
             "rollback_result": self.rollback_result,
             "baseline": self.baseline,
+            "skip_items": self.skip_items,
             "steps": [
                 {"name": s.name, "status": s.status,
                  "started": s.started, "ended": s.ended, "detail": s.detail}
@@ -308,6 +318,73 @@ def load_env(path: Path) -> dict[str, str]:
         val = os.path.expanduser(os.path.expandvars(val))
         env[key] = val
     return env
+
+
+def load_client_notes(client_path: Path) -> dict[str, Any]:
+    """Read sibling notes.json next to a client JSON.
+
+    Schema (all keys optional):
+      {
+        "general": "free-text client-level notes",
+        "sites": {
+          "<domain>": {
+            "notes": "...",
+            "skip_items": [
+              {"type": "plugin"|"theme", "slug": "...", "reason": "..."}
+            ]
+          }
+        }
+      }
+    Returns {} when the file is missing or unparseable. Domain keys are
+    matched leniently (lowercase, no scheme/trailing slash) at lookup time.
+    """
+    notes_path = client_path.parent / "notes.json"
+    if not notes_path.exists():
+        return {}
+    try:
+        return json.loads(notes_path.read_text(encoding="utf-8")) or {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _normalize_domain(value: str) -> str:
+    s = (value or "").strip().lower()
+    for prefix in ("https://", "http://"):
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+            break
+    if s.startswith("www."):
+        s = s[4:]
+    return s.split("/", 1)[0].rstrip(".")
+
+
+def skip_items_for_domain(notes: dict[str, Any], domain: str) -> list[dict[str, Any]]:
+    """Pull the skip_items list for the given domain from a notes dict."""
+    sites = notes.get("sites") if isinstance(notes, dict) else None
+    if not isinstance(sites, dict):
+        return []
+    target = _normalize_domain(domain)
+    for key, entry in sites.items():
+        if _normalize_domain(str(key)) != target:
+            continue
+        if not isinstance(entry, dict):
+            return []
+        items = entry.get("skip_items") or []
+        if not isinstance(items, list):
+            return []
+        out: list[dict[str, Any]] = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            t = str(it.get("type") or "").strip().lower()
+            slug = str(it.get("slug") or "").strip()
+            if t in ("plugin", "theme") and slug:
+                out.append({
+                    "type": t, "slug": slug,
+                    "reason": str(it.get("reason") or "").strip(),
+                })
+        return out
+    return []
 
 
 def resolve(raw: str | None, env: dict[str, str]) -> str:
@@ -382,6 +459,13 @@ class WPUpdater:
         self.reports: list[SiteReport] = []
         self._consecutive_execute_failures = 0
         self._run_abort_reason = ""
+        self._db = self._open_db()
+        self._recent_successes: set[str] = self._load_recent_successes()
+        if self._recent_successes:
+            self.log.info(
+                "Dedupe active: %d domain(s) already succeeded within last %dh — will be skipped",
+                len(self._recent_successes), self.args.skip_recent,
+            )
 
         # Global SSH credentials from .env
         self._ssh_user = self.env.get("SSH_USER", "")
@@ -462,12 +546,90 @@ class WPUpdater:
 
     def _gather_client_files(self) -> list[Path]:
         if self.args.client_file:
-            p = Path(self.args.client_file).resolve()
-            if not p.exists():
-                self.log.error("Client file not found: %s", p)
-                return []
-            return [p]
-        return sorted(self.args.clients_dir.glob("*_cloudways.json"))
+            raw_files = self.args.client_file
+            if isinstance(raw_files, (str, Path)):
+                raw_files = [raw_files]
+            paths: list[Path] = []
+            seen: set[Path] = set()
+            for raw in raw_files:
+                p = Path(raw).resolve()
+                if not p.exists():
+                    self.log.error("Client file not found: %s", p)
+                    continue
+                if p in seen:
+                    continue
+                seen.add(p)
+                paths.append(p)
+            return paths
+        # Supports both the legacy flat layout (clients/<slug>_cloudways.json)
+        # and the per-provider/per-client subdir layout
+        # (clients/cloudways/<base>/<slug>_cloudways.json).
+        base = self.args.clients_dir
+        found: set[Path] = set()
+        for pattern in (
+            "*_cloudways.json",
+            "*/*_cloudways.json",
+            "*/*/*_cloudways.json",
+        ):
+            for path in base.glob(pattern):
+                found.add(path.resolve())
+        return sorted(found)
+
+    def _open_db(self) -> Any:
+        """Open the SQLite history DB. Returns None on any failure or
+        when --no-db is set; callers must tolerate that."""
+        if getattr(self.args, "no_db", False):
+            return None
+        try:
+            import db as _db
+            self.args.db_path.parent.mkdir(parents=True, exist_ok=True)
+            return _db.open_db(self.args.db_path)
+        except Exception as exc:  # pragma: no cover - defensive
+            self.log.warning("DB unavailable (%s) — proceeding without history", exc)
+            return None
+
+    def _load_recent_successes(self) -> set[str]:
+        """Return domains whose execute-mode runs succeeded within --skip-recent hours.
+
+        Prefers the SQLite DB (db/wpmaint.db) and falls back to scanning
+        logs/wp-update-summary-*.json when the DB is unavailable or empty.
+        Failed/rolled-back/skipped entries are NOT included; dry-run
+        summaries are ignored.
+        """
+        hours = getattr(self.args, "skip_recent", 0) or 0
+        if hours <= 0:
+            return set()
+        if self._db is not None:
+            try:
+                import db as _db
+                domains = _db.recent_successful_domains(self._db, hours)
+                if domains:
+                    return domains
+            except Exception as exc:  # pragma: no cover - defensive
+                self.log.warning("DB dedupe query failed (%s) — falling back to logs", exc)
+        # Log-scan fallback (covers fresh DB / pre-ingest history)
+        cutoff = datetime.now(UTC) - timedelta(hours=hours)
+        domains: set[str] = set()
+        for path in sorted(self.args.log_dir.glob("wp-update-summary-*.json")):
+            stem_ts = path.stem.replace("wp-update-summary-", "", 1)
+            try:
+                run_dt = datetime.strptime(
+                    stem_ts, "%Y%m%dT%H%M%SZ"
+                ).replace(tzinfo=UTC)
+            except ValueError:
+                continue
+            if run_dt < cutoff:
+                continue
+            try:
+                data = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if data.get("mode") != "execute":
+                continue
+            for entry in data.get("sites", []):
+                if entry.get("overall") == "success" and entry.get("domain"):
+                    domains.add(entry["domain"])
+        return domains
 
     def _process_client_file(self, path: Path) -> None:
         """
@@ -480,8 +642,13 @@ class WPUpdater:
 
         try:
             doc = json.loads(path.read_text())
-        except json.JSONDecodeError as exc:
-            self.log.warning("SKIP  %s — invalid JSON: %s", path.name, exc)
+        except FileNotFoundError:
+            self.log.warning(
+                "SKIP  %s — file disappeared between gather and read", path.name
+            )
+            return
+        except (OSError, json.JSONDecodeError) as exc:
+            self.log.warning("SKIP  %s — unreadable: %s", path.name, exc)
             return
 
         # Validate required top-level fields
@@ -506,6 +673,7 @@ class WPUpdater:
         # Validate all apps first, then sort staging before production.
         # In execute mode, staging sites are updated first so the operator
         # can review the logs before production sites are touched.
+        notes = load_client_notes(path)
         validated: list[tuple[int, dict[str, Any], SiteReport]] = []
         for idx, app in enumerate(apps, 1):
             try:
@@ -515,6 +683,13 @@ class WPUpdater:
                     "SKIP  %s app #%d — %s", path.name, idx, exc
                 )
                 continue
+            report.skip_items = skip_items_for_domain(notes, report.domain)
+            if report.skip_items:
+                self.log.info(
+                    "  notes.json: %d configured skip(s) for %s — %s",
+                    len(report.skip_items), report.domain,
+                    ", ".join(f"{i['type']}:{i['slug']}" for i in report.skip_items),
+                )
             validated.append((idx, app, report))
 
         # Sort: staging sites first (is_staging=True sorts before False
@@ -531,6 +706,22 @@ class WPUpdater:
                 )
 
         for _idx, _app, report in validated:
+            if report.domain in self._recent_successes:
+                report.overall = "skipped"
+                report.failure_detail = (
+                    f"already succeeded within last {self.args.skip_recent}h"
+                    " (--skip-recent dedupe)"
+                )
+                self._record_step(
+                    report, "dedupe", "skipped",
+                    f"recent successful run within {self.args.skip_recent}h",
+                )
+                self.log.info(
+                    "SKIP  %s — already succeeded within last %dh",
+                    report.domain, self.args.skip_recent,
+                )
+                self.reports.append(report)
+                continue
             self.reports.append(report)
             self._process_site(report)
 
@@ -702,24 +893,53 @@ class WPUpdater:
             self._step_capture_ownership(r)
 
             # --- WooCommerce maintenance mode ---
+            # Wrap the mutating section in try/finally so maint-mode is
+            # ALWAYS deactivated on the way out — including when an
+            # update step raises. Without this, a mid-update exception
+            # would leave the site in maintenance mode until rollback's
+            # own deactivate ran (or never, on the no-rollback paths).
+            maint_mode_on = False
             if r.has_woocommerce:
                 current_step = "woocommerce-maintenance-on"
                 self._wp(r, "maintenance-mode activate")
+                maint_mode_on = True
                 self.log.info("Maintenance mode ON  |  %s", r.domain)
 
-            current_step = "core-update"
-            self._step_update_core(r)
+            try:
+                current_step = "core-update"
+                self._step_update_core(r)
 
-            current_step = "theme-update"
-            self._step_update_themes(r)
+                current_step = "theme-update"
+                self._step_update_themes(r)
 
-            current_step = "plugin-update"
-            self._step_update_plugins(r)
+                current_step = "plugin-update"
+                self._step_update_plugins(r)
 
-            # --- Restore ownership if running as master user ---
-            if r.auth_method in ("master", "master-key") and r.original_owner:
-                current_step = "restore-ownership"
-                self._step_restore_ownership(r)
+                # --- Restore ownership if running as master user ---
+                if r.auth_method in ("master", "master-key") and r.original_owner:
+                    current_step = "restore-ownership"
+                    self._step_restore_ownership(r)
+            finally:
+                # Deactivate maint-mode BEFORE final-verification (so the
+                # site is live when we test it) and on every exception
+                # path (so rollback / failure paths don't leave the site
+                # stuck on the 503 maintenance page). WP-CLI updates may
+                # have already toggled it off internally — a redundant
+                # deactivate is benign, suppress.
+                if maint_mode_on:
+                    try:
+                        self._wp(r, "maintenance-mode deactivate")
+                        self.log.info("Maintenance mode OFF  |  %s", r.domain)
+                    except (SSHError, WPCliError) as exc:
+                        # Don't re-raise: a redundant deactivate after wp-cli
+                        # already toggled it off is the common benign case.
+                        # But log so a real PHP fatal that prevents wp-cli
+                        # from booting isn't completely invisible —
+                        # final-verification will still catch it.
+                        self.log.warning(
+                            "Maintenance mode deactivate failed (continuing to verify): "
+                            "%s  |  %s", exc, r.domain,
+                        )
 
             # --- Final verification ---
             current_step = "final-verification"
@@ -727,13 +947,14 @@ class WPUpdater:
             self._record_step(r, "final-verification", "success",
                               "site healthy after all updates")
 
-            # --- WooCommerce maintenance mode off ---
-            if r.has_woocommerce:
-                self._wp(r, "maintenance-mode deactivate")
-                self.log.info("Maintenance mode OFF  |  %s", r.domain)
-
             r.overall = "success"
             self.log.info("✓ SUCCESS  |  %s", r.domain)
+
+            if r.backup_dir:
+                with contextlib.suppress(SSHError, OSError, subprocess.SubprocessError):
+                    self._ssh(r, f"rm -rf {shlex.quote(r.backup_dir)}\n")
+                    self.log.info("Backup removed  |  %s  |  %s", r.domain, r.backup_dir)
+                    r.backup_dir = ""
 
         except RollbackFailed:
             # Rollback machinery already recorded the failure on r; bubble
@@ -789,11 +1010,7 @@ class WPUpdater:
         if not stderr:
             return False
         low = stderr.lower()
-        if "permission denied" in low:
-            return True
-        if "received disconnect" in low:
-            return True
-        return False
+        return "permission denied" in low or "received disconnect" in low
 
     def _step_ssh_preflight(self, r: SiteReport) -> None:
         """
@@ -1093,10 +1310,20 @@ mkdir -p {shlex.quote(backup_dir)}
 wp --path={shlex.quote(r.wp_path)} db export {shlex.quote(backup_dir + '/preflight.sql')} --add-drop-table 2>&1
 wp --path={shlex.quote(r.wp_path)} plugin list --format=json > {shlex.quote(backup_dir + '/plugins.json')} 2>&1
 wp --path={shlex.quote(r.wp_path)} theme list --format=json > {shlex.quote(backup_dir + '/themes.json')} 2>&1
-tar -czf {shlex.quote(backup_dir + '/public_html.tar.gz')} -C {shlex.quote(r.wp_path)} . 2>&1
+# tar may exit 1 on benign warnings ("file changed as we read it" on live sites
+# under low write load — Breeze cache, session files, etc.). Tolerate exit ≤1
+# but fail on >1. The `|| _tar_rc=$?` is required: without it, `set -e` fires
+# on tar's non-zero exit before the rc capture runs, killing the script.
+_tar_rc=0
+tar -czf {shlex.quote(backup_dir + '/public_html.tar.gz')} -C {shlex.quote(r.wp_path)} . 2>&1 || _tar_rc=$?
+[ "$_tar_rc" -le 1 ] || exit "$_tar_rc"
 # Verify both backup files are non-empty
 test -s {shlex.quote(backup_dir + '/preflight.sql')}
 test -s {shlex.quote(backup_dir + '/public_html.tar.gz')}
+# Verify archive is readable and contains wp-content/ (guards against partial writes).
+# Run in a subshell with pipefail disabled: grep -q exits on first match sending SIGPIPE
+# to tar, which would otherwise cause pipefail to report a false failure.
+(set +o pipefail; tar -tzf {shlex.quote(backup_dir + '/public_html.tar.gz')} 2>/dev/null | grep -qE '(^|/)wp-content/') || {{ echo 'backup-integrity-fail: wp-content/ missing from archive'; exit 1; }}
 echo 'backup-ok'
 """
         self._ssh(r, script, timeout=self.args.remote_timeout)
@@ -1131,6 +1358,10 @@ echo 'backup-ok'
 
     def _step_update_themes(self, r: SiteReport) -> None:
         updates = r.baseline.get("theme_updates", [])
+        skip_map = {
+            i["slug"]: i.get("reason", "")
+            for i in r.skip_items if i.get("type") == "theme"
+        }
         if not updates:
             self._record_step(r, "theme-update", "success",
                               "no theme updates pending")
@@ -1141,6 +1372,17 @@ echo 'backup-ok'
             ver_from = theme.get("version", "?")
             ver_to = theme.get("update_version", "?")
             if not slug:
+                continue
+            if slug in skip_map:
+                reason = skip_map[slug] or "configured in notes.json"
+                self._record_step(
+                    r, f"theme-update:{slug}", "skipped",
+                    f"{slug} {ver_from}→{ver_to} configured skip: {reason}",
+                )
+                self.log.info(
+                    "  ⤼ Skipping theme  %s  (configured: %s)  |  %s",
+                    slug, reason, r.domain,
+                )
                 continue
             step = f"theme-update:{slug}"
             t0 = ts()
@@ -1215,6 +1457,10 @@ echo 'backup-ok'
 
     def _step_update_plugins(self, r: SiteReport) -> None:
         updates = r.baseline.get("plugin_updates", [])
+        skip_map = {
+            i["slug"]: i.get("reason", "")
+            for i in r.skip_items if i.get("type") == "plugin"
+        }
         if not updates:
             self._record_step(r, "plugin-update", "success",
                               "no plugin updates pending")
@@ -1227,6 +1473,18 @@ echo 'backup-ok'
             if not slug:
                 continue
 
+            if slug in skip_map:
+                reason = skip_map[slug] or "configured in notes.json"
+                self._record_step(
+                    r, f"plugin-update:{slug}", "skipped",
+                    f"{slug} {ver_from}→{ver_to} configured skip: {reason}",
+                )
+                self.log.info(
+                    "  ⤼ Skipping plugin  %s  (configured: %s)  |  %s",
+                    slug, reason, r.domain,
+                )
+                continue
+
             step = f"plugin-update:{slug}"
             t0 = ts()
             self.log.info(
@@ -1235,6 +1493,26 @@ echo 'backup-ok'
             )
 
             result = self._run_plugin_update_structured(r, slug)
+            # Retry once on transient signals: empty wp-cli output (parse
+            # error with no raw text), or "no entry" responses. These have
+            # been observed under WC-maintenance-mode contention and brief
+            # network blips; a single retry usually resolves them.
+            if result.get("_parse_error") and not (result.get("_raw") or "").strip():
+                self.log.info("  ↻ Retrying plugin update (empty output)  |  %s", slug)
+                result = self._run_plugin_update_structured(r, slug)
+            elif result.get("_no_entry"):
+                self.log.info("  ↻ Retrying plugin update (no entry)  |  %s", slug)
+                result = self._run_plugin_update_structured(r, slug)
+            elif result.get("_exit_nonzero"):
+                # SSH transport failed or wp-cli aborted before producing
+                # parseable output. Cloudways occasionally returns SSH
+                # exit 255 mid-update on a slow shell; retry once before
+                # treating as fatal.
+                self.log.info(
+                    "  ↻ Retrying plugin update (ssh/wpcli failure: %s)  |  %s",
+                    result.get("_error", "?"), slug,
+                )
+                result = self._run_plugin_update_structured(r, slug)
             status = (result.get("status", "") or "").strip().lower()
             # Prefer the post-update version reported by wp-cli, fall back
             # to the baseline's target version.
@@ -1328,11 +1606,15 @@ echo 'backup-ok'
     # Rollback
     #
     # Restore sequence:
+    #   0. Backstop: refuse if live wp-content/ missing or backup tarball
+    #      doesn't contain wp-content/ (corrupt/wrong archive)
     #   1. Archive the failed state (for post-mortem analysis)
-    #   2. Wipe public_html contents
-    #   3. Extract the pre-flight tar over public_html
-    #   4. Import the pre-flight database dump
-    #   5. Verify the site is back to healthy
+    #   2. Best-effort chown so wipe can recurse into restrictive-mode dirs
+    #   3. Wipe public_html contents (tolerate partial; verify-empty after)
+    #   4. Extract the pre-flight tar (only if wipe completed)
+    #   5. Backstop: verify wp-content/ landed
+    #   6. Import the pre-flight database dump
+    #   7. Verify the site is back to healthy
     #
     # If any of these steps fail, the rollback is marked as failed and
     # the operator must intervene manually.  The backup files remain on
@@ -1359,17 +1641,43 @@ fi
 # 0b. Defense-in-depth on the backup archive: refuse to extract a tarball
 #     that doesn't contain wp-content/. Catches truncated/corrupt backups
 #     and refuses to repopulate public_html with non-WP contents.
-if ! tar -tzf {shlex.quote(fs_backup)} 2>/dev/null | grep -qE '(^|/)wp-content/'; then
+# Subshell with pipefail off: grep -q exits on first match and SIGPIPEs tar,
+# which would otherwise make pipefail report a false integrity failure on
+# large archives.
+if ! (set +o pipefail; tar -tzf {shlex.quote(fs_backup)} 2>/dev/null | grep -qE '(^|/)wp-content/'); then
     echo "rollback-abort: {fs_backup} missing wp-content/ — refusing to extract" >&2
     exit 98
 fi
 # 1. Archive the broken state for forensic analysis
 tar -czf {shlex.quote(failed_snapshot)} -C {shlex.quote(r.wp_path)} . 2>/dev/null || true
-# 2. Wipe current public_html contents
-find {shlex.quote(r.wp_path)} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} +
-# 3. Restore filesystem from pre-flight backup
+# 2. Best-effort ownership recovery before the wipe. rm -rf normally
+#    succeeds via parent-dir perms regardless of child ownership, but
+#    a child directory with restrictive mode can block recursion. If
+#    we own the tree we can fix it; if not, this no-ops and the
+#    verify-empty backstop below catches any residual files.
+chown -R "$(id -u):$(id -g)" {shlex.quote(r.wp_path)} 2>/dev/null || true
+# 3. Wipe current public_html contents. Tolerate partial failure; we
+#    verify-empty below before any extract. If extract ran on a half-
+#    wiped tree, leftover files from the failed state would mix with
+#    restored files and produce a corrupted live site.
+find {shlex.quote(r.wp_path)} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + 2>&1 || true
+if [ -n "$(ls -A {shlex.quote(r.wp_path)} 2>/dev/null)" ]; then
+    echo "rollback-abort: could not fully wipe {r.wp_path} (residual files present); failed-state snapshot preserved at {failed_snapshot}, backup intact at {fs_backup} — manual recovery required" >&2
+    exit 97
+fi
+# 4. Restore filesystem from pre-flight backup
 tar -xzf {shlex.quote(fs_backup)} -C {shlex.quote(r.wp_path)}
-# 4. Restore database from pre-flight dump
+# 5. Backstop: verify wp-content/ landed (catches a tar that exited 0 but
+#    extracted nothing useful — vanishingly rare but the cost of checking
+#    is one stat call).
+if [ ! -d {shlex.quote(r.wp_path + "/wp-content")} ]; then
+    echo "rollback-abort: extract completed but {r.wp_path}/wp-content/ missing — manual recovery required" >&2
+    exit 96
+fi
+# 6. Restore database from pre-flight dump.
+#    cd into wp_path so wp-config.php's relative require (e.g. require 'wp-salt.php')
+#    resolves against the WP root, not the SSH login home dir.
+cd {shlex.quote(r.wp_path)}
 wp --path={shlex.quote(r.wp_path)} db import {shlex.quote(db_backup)} 2>&1
 echo 'rollback-ok'
 """
@@ -1464,6 +1772,7 @@ echo 'rollback-ok'
             anything else — definitive failure description; caller bails.
         """
         last_exc: Exception | None = None
+        last_5xx: str | None = None
         for backoff in self.HTTP_RETRY_BACKOFFS:
             if backoff:
                 time.sleep(backoff)
@@ -1475,7 +1784,11 @@ echo 'rollback-ok'
                     req, timeout=self.args.http_timeout, context=self._ssl_ctx
                 ) as resp:
                     if resp.status >= 500:
-                        return f"{url} → HTTP {resp.status}"
+                        # Retry 5xx within this URL: WC + Breeze can
+                        # serve a stale 503 for 1–3s after wp-cli
+                        # internally deactivates maintenance mode.
+                        last_5xx = f"{url} → HTTP {resp.status}"
+                        continue
                     body = resp.read(65536).decode("utf-8", errors="ignore").lower()
                     for marker in FATAL_MARKERS:
                         if marker in body:
@@ -1483,7 +1796,8 @@ echo 'rollback-ok'
                 return None
             except urlerror.HTTPError as exc:
                 if exc.code >= 500:
-                    return f"{url} → HTTP {exc.code}"
+                    last_5xx = f"{url} → HTTP {exc.code}"
+                    continue
                 # 3xx/4xx are deterministic — pass and check next suffix.
                 return None
             except OSError as exc:
@@ -1492,8 +1806,11 @@ echo 'rollback-ok'
                 last_exc = exc
                 continue
 
-        # Exhausted retries on a transient error. Surface the actual
-        # exception text so operators can diagnose.
+        # Exhausted retries. A repeated 5xx is now definitive (caller bails).
+        if last_5xx is not None:
+            self.log.debug("HTTP 5xx persisted across retries: %s", last_5xx)
+            return last_5xx
+        # Otherwise it's a transient connection-class failure.
         msg = f"{url} → {last_exc}" if last_exc is not None else f"{url} → unknown"
         self.log.debug("HTTP transient failure: %s", msg)
         return f"transient:{msg}"
@@ -1623,9 +1940,14 @@ echo 'rollback-ok'
         where wp-config.php lives.  We must `cd` into the WordPress root
         before invoking wp-cli, otherwise the require fails.
         """
+        # error_reporting=5  (E_ERROR | E_PARSE) silences wp-cli's noisy
+        # PHP warnings on PHP 8.x — notably the "Undefined property:
+        # stdClass::$requires" warning emitted by Plugin_Command.php when
+        # plugin metadata lacks a 'requires' field. Fatals still surface.
         script = (
             f"cd {shlex.quote(r.wp_path)} && "
             f"WP_CLI_CACHE_DIR=$HOME/tmp/.wp-cli-cache "
+            f"WP_CLI_PHP_ARGS='-d error_reporting=5' "
             f"wp --path={shlex.quote(r.wp_path)} {wp_cmd}"
         )
         return self._ssh(r, script, timeout)
@@ -1679,6 +2001,13 @@ echo 'rollback-ok'
         path = self.args.log_dir / f"wp-update-summary-{self.run_id}.json"
         path.write_text(json.dumps(summary, indent=2) + "\n")
         self.log.info("Summary written to %s", path)
+        if self._db is not None:
+            try:
+                import db as _db
+                _db.ingest_cli_summary(self._db, summary_path=path)
+                self.log.info("Run history ingested into %s", self.args.db_path)
+            except Exception as exc:  # pragma: no cover - defensive
+                self.log.warning("DB ingest failed (%s) — summary file is still on disk", exc)
 
     # ------------------------------------------------------------------
     # Confidence scoring
@@ -2006,8 +2335,11 @@ def build_cli() -> argparse.Namespace:
         help=f"Directory with *_cloudways.json files (default: {DEFAULT_CLIENTS})",
     )
     p.add_argument(
-        "--client-file", type=Path, default=None,
-        help="Process a single client JSON file instead of all.",
+        "--client-file", type=Path, action="append", default=None,
+        help=(
+            "Process specific client JSON file(s) instead of all. "
+            "Repeatable: pass --client-file once per file to process a subset."
+        ),
     )
     p.add_argument(
         "--log-dir", type=Path, default=DEFAULT_LOGS,
@@ -2048,6 +2380,23 @@ def build_cli() -> argparse.Namespace:
     p.add_argument(
         "--http-timeout", type=int, default=20,
         help="HTTP health check timeout in seconds (default: 20).",
+    )
+    p.add_argument(
+        "--skip-recent", type=int, default=24, metavar="HOURS",
+        help="Skip sites that succeeded in an execute-mode run within the "
+             "last N hours (default: 24; 0 = disabled). Queries the SQLite "
+             "DB at --db-path, falling back to logs/wp-update-summary-*.json "
+             "if the DB is empty. Makes daily reruns idempotent.",
+    )
+    p.add_argument(
+        "--db-path", type=Path, default=DEFAULT_DB,
+        help=f"SQLite DB for run history + dedupe (default: {DEFAULT_DB}). "
+             "Used by --skip-recent and to ingest this run's summary at end.",
+    )
+    p.add_argument(
+        "--no-db", action="store_true",
+        help="Disable DB integration entirely (no dedupe via DB, no ingest "
+             "at end of run). --skip-recent falls back to log scanning.",
     )
     p.add_argument(
         "--max-consecutive-failures", type=int, default=3,
