@@ -150,6 +150,34 @@ def test_gather_client_files_returns_sorted_cloudways_files(tmp_path: Path) -> N
     ]
 
 
+def test_gather_client_files_excludes_archived_subdir(tmp_path: Path) -> None:
+    """Files under clients/_archived/ are soft-deleted from the webui and
+    must not be picked up by fleet runs that scan the inventory dir."""
+    clients_dir = tmp_path / "clients"
+    clients_dir.mkdir()
+    # Active files at multiple depths
+    (clients_dir / "alpha_cloudways.json").write_text("{}")
+    cloudways_dir = clients_dir / "cloudways" / "beta"
+    cloudways_dir.mkdir(parents=True)
+    (cloudways_dir / "beta_cloudways.json").write_text("{}")
+    # Archived siblings at corresponding depths
+    archived_flat = clients_dir / "_archived" / "gone_cloudways.json"
+    archived_flat.parent.mkdir(parents=True)
+    archived_flat.write_text("{}")
+    archived_nested = clients_dir / "_archived" / "cloudways" / "ditched" / "ditched_cloudways.json"
+    archived_nested.parent.mkdir(parents=True)
+    archived_nested.write_text("{}")
+
+    updater = wp_update.WPUpdater(make_args(tmp_path, clients_dir=clients_dir))
+    files = updater._gather_client_files()
+
+    names = [p.name for p in files]
+    assert "alpha_cloudways.json" in names
+    assert "beta_cloudways.json" in names
+    assert "gone_cloudways.json" not in names
+    assert "ditched_cloudways.json" not in names
+
+
 def test_gather_client_files_accepts_multiple_explicit_paths(tmp_path: Path) -> None:
     clients_dir = tmp_path / "clients"
     clients_dir.mkdir()

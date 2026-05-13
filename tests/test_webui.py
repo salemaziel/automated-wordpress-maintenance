@@ -515,3 +515,121 @@ def test_start_run_raises_when_db_insert_fails(monkeypatch: pytest.MonkeyPatch) 
     with webui.RUNS_LOCK:
         assert not any(r.target == "local" and r.command for r in webui.RUNS.values()
                        if r.run_id not in {"live123", "rem1", "done1", "live1"})
+
+
+# ---------------------------------------------------------------------------
+# Archive / restore client files (soft-delete from the UI)
+# ---------------------------------------------------------------------------
+
+def _write_client_json(path: Path, client_name: str = "Test Client") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "client_name": client_name,
+        "applications": [{"website_domain": "example.com"}],
+    }))
+
+
+def test_archive_moves_active_file_into_archived_subdir(tmp_path: Path) -> None:
+    """Per-provider/per-client layout (3 levels deep)."""
+    source = tmp_path / "cloudways" / "acme" / "acme_cloudways.json"
+    _write_client_json(source)
+    target = webui.archive_client_file("acme_cloudways.json", clients_dir=tmp_path)
+    assert not source.exists()
+    assert target.exists()
+    assert target == tmp_path / "_archived" / "cloudways" / "acme" / "acme_cloudways.json"
+
+
+def test_archive_preserves_legacy_flat_layout(tmp_path: Path) -> None:
+    """Legacy flat layout (1 level): archived target sits directly under _archived/."""
+    source = tmp_path / "legacy_cloudways.json"
+    _write_client_json(source)
+    target = webui.archive_client_file("legacy_cloudways.json", clients_dir=tmp_path)
+    assert not source.exists()
+    assert target == tmp_path / "_archived" / "legacy_cloudways.json"
+
+
+def test_archive_raises_when_file_missing(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        webui.archive_client_file("nope.json", clients_dir=tmp_path)
+
+
+def test_archive_raises_when_target_already_exists(tmp_path: Path) -> None:
+    """Re-archive after archive+manual-restore-of-archive-copy must not
+    silently overwrite the existing archived copy."""
+    source = tmp_path / "cloudways" / "foo" / "foo_cloudways.json"
+    _write_client_json(source)
+    webui.archive_client_file("foo_cloudways.json", clients_dir=tmp_path)
+    # Operator manually re-creates the active file at the same path
+    _write_client_json(source, client_name="Test Client 2")
+    with pytest.raises(FileExistsError):
+        webui.archive_client_file("foo_cloudways.json", clients_dir=tmp_path)
+
+
+def test_restore_round_trip(tmp_path: Path) -> None:
+    source = tmp_path / "cloudways" / "acme" / "acme_cloudways.json"
+    _write_client_json(source)
+    webui.archive_client_file("acme_cloudways.json", clients_dir=tmp_path)
+    restored = webui.restore_client_file("acme_cloudways.json", clients_dir=tmp_path)
+    assert restored == source
+    assert source.exists()
+    assert not (tmp_path / "_archived" / "cloudways" / "acme" / "acme_cloudways.json").exists()
+
+
+def test_restore_raises_when_active_file_already_exists(tmp_path: Path) -> None:
+    """If an operator manually re-creates the active file while another copy
+    sits in _archived/, restore must refuse rather than overwrite."""
+    source = tmp_path / "cloudways" / "acme" / "acme_cloudways.json"
+    _write_client_json(source)
+    webui.archive_client_file("acme_cloudways.json", clients_dir=tmp_path)
+    _write_client_json(source, client_name="Manually Recreated")
+    with pytest.raises(FileExistsError):
+        webui.restore_client_file("acme_cloudways.json", clients_dir=tmp_path)
+
+
+def test_restore_raises_when_no_archive(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        webui.restore_client_file("phantom.json", clients_dir=tmp_path)
+
+
+def test_list_client_files_excludes_archived(tmp_path: Path) -> None:
+    """Hard requirement: an archived file must disappear from the picker."""
+    active = tmp_path / "cloudways" / "acme" / "acme_cloudways.json"
+    archived = tmp_path / "cloudways" / "broken" / "broken_cloudways.json"
+    _write_client_json(active, client_name="Acme")
+    _write_client_json(archived, client_name="Broken")
+    webui.archive_client_file("broken_cloudways.json", clients_dir=tmp_path)
+    rows = webui.list_client_files(clients_dir=tmp_path)
+    names = {r["name"] for r in rows}
+    assert "acme_cloudways.json" in names
+    assert "broken_cloudways.json" not in names
+
+
+def test_list_archived_client_files_enumerates_archive(tmp_path: Path) -> None:
+    _write_client_json(tmp_path / "cloudways" / "a" / "a_cloudways.json", "A")
+    _write_client_json(tmp_path / "cloudways" / "b" / "b_cloudways.json", "B")
+    webui.archive_client_file("a_cloudways.json", clients_dir=tmp_path)
+    webui.archive_client_file("b_cloudways.json", clients_dir=tmp_path)
+    rows = webui.list_archived_client_files(clients_dir=tmp_path)
+    assert {r["name"] for r in rows} == {"a_cloudways.json", "b_cloudways.json"}
+    # Sorted by client_name
+    assert [r["client_name"] for r in rows] == ["A", "B"]
+    # archived_path is the relative location *from CLIENTS_DIR* — drives the UI hint
+    assert all(r["archived_path"].startswith("_archived/") for r in rows)
+
+
+def test_resolve_client_file_skips_archived_matches(tmp_path: Path) -> None:
+    """resolve_client_file must never return an archived match — otherwise
+    a run that names the file would resurrect it."""
+    active = tmp_path / "cloudways" / "acme" / "acme_cloudways.json"
+    _write_client_json(active)
+    webui.archive_client_file("acme_cloudways.json", clients_dir=tmp_path)
+    assert webui.resolve_client_file("acme_cloudways.json", clients_dir=tmp_path) is None
+
+
+def test_resolve_archived_client_file_finds_archive(tmp_path: Path) -> None:
+    active = tmp_path / "cloudways" / "acme" / "acme_cloudways.json"
+    _write_client_json(active)
+    webui.archive_client_file("acme_cloudways.json", clients_dir=tmp_path)
+    found = webui.resolve_archived_client_file("acme_cloudways.json", clients_dir=tmp_path)
+    assert found is not None
+    assert "_archived" in found.parts

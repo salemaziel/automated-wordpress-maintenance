@@ -758,6 +758,11 @@ class WPUpdater:
                 f"*/*/*{suffix}",
             ):
                 for path in base.glob(pattern):
+                    # Files moved to clients/_archived/ are excluded from
+                    # fleet runs; restore via the webui (or by moving the
+                    # file out of _archived/) to put them back in scope.
+                    if "_archived" in path.parts:
+                        continue
                     found.add(path.resolve())
         return sorted(found)
 

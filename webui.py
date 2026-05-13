@@ -35,6 +35,11 @@ CLIENTS_DIR = ROOT / "clients"
 SCRIPT_PATH = ROOT / "wp_update.py"
 KEYS_DIR = ROOT / ".webui-keys"
 LOGS_DIR = ROOT / "logs"
+# Directory under CLIENTS_DIR used to soft-delete client JSON files. Files
+# inside it are hidden from the picker and excluded by wp_update.py's
+# inventory scan; restoring moves them back to their original active path.
+ARCHIVE_SEGMENT = "_archived"
+ARCHIVE_DIR = CLIENTS_DIR / ARCHIVE_SEGMENT
 DB_PATH = ROOT / "db" / "wpmaint.db"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
@@ -372,7 +377,13 @@ def list_client_files(clients_dir: Path = CLIENTS_DIR, provider: str | None = No
     # layouts. Filename is unique across either, so we key by `path.name`.
     candidates: list[Path] = []
     for pattern in ("*.json", "*/*.json", "*/*/*.json"):
-        candidates.extend(clients_dir.glob(pattern))
+        for p in clients_dir.glob(pattern):
+            # Archived clients live under clients/_archived/ and are hidden
+            # from the picker. Use list_archived_client_files() to surface
+            # them in the "Archived" panel for restoration.
+            if ARCHIVE_SEGMENT in p.parts:
+                continue
+            candidates.append(p)
     # Dedupe: when a per-domain file `<slug>_<domain>_cloudways.json` exists
     # in a directory, suppress sibling files whose every domain is already
     # covered by such a per-domain file. Lets us keep legacy multi-app and
@@ -502,14 +513,93 @@ def list_client_files(clients_dir: Path = CLIENTS_DIR, provider: str | None = No
 
 
 def resolve_client_file(name: str, clients_dir: Path = CLIENTS_DIR) -> Path | None:
-    """Locate a client JSON by basename across legacy + per-client layouts."""
+    """Locate an active client JSON by basename. Archived files are
+    ignored — call resolve_archived_client_file() for those."""
     safe_name = Path(name).name
     if not safe_name:
         return None
     for pattern in (safe_name, f"*/{safe_name}", f"*/*/{safe_name}"):
         for match in clients_dir.glob(pattern):
+            if ARCHIVE_SEGMENT in match.parts:
+                continue
             return match
     return None
+
+
+def resolve_archived_client_file(name: str, clients_dir: Path = CLIENTS_DIR) -> Path | None:
+    """Locate an archived client JSON by basename under clients/_archived/.
+
+    Mirrors resolve_client_file()'s shape so restore endpoints can find a
+    soft-deleted file regardless of how deeply it was nested at archive
+    time (legacy flat layout vs per-provider/per-client subdirs)."""
+    safe_name = Path(name).name
+    if not safe_name:
+        return None
+    archive_root = clients_dir / ARCHIVE_SEGMENT
+    if not archive_root.exists():
+        return None
+    for pattern in (safe_name, f"*/{safe_name}", f"*/*/{safe_name}", f"*/*/*/{safe_name}"):
+        for match in archive_root.glob(pattern):
+            return match
+    return None
+
+
+def archive_client_file(name: str, clients_dir: Path = CLIENTS_DIR) -> Path:
+    """Move an active client JSON into clients/_archived/, preserving its
+    relative path. Returns the new archive path. Idempotent only in the
+    sense that re-archiving raises FileExistsError so the caller knows."""
+    source = resolve_client_file(name, clients_dir)
+    if source is None or not source.exists():
+        raise FileNotFoundError(f"client file not found: {name}")
+    rel = source.resolve().relative_to(clients_dir.resolve())
+    target = clients_dir / ARCHIVE_SEGMENT / rel
+    if target.exists():
+        raise FileExistsError(f"archive target already exists: {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    source.rename(target)
+    return target
+
+
+def restore_client_file(name: str, clients_dir: Path = CLIENTS_DIR) -> Path:
+    """Move an archived client JSON back to its active path. Returns the
+    restored path. Raises if no archived file matches or if a file already
+    exists at the active target (we don't silently overwrite)."""
+    source = resolve_archived_client_file(name, clients_dir)
+    if source is None or not source.exists():
+        raise FileNotFoundError(f"archived client file not found: {name}")
+    archive_root = clients_dir / ARCHIVE_SEGMENT
+    rel = source.resolve().relative_to(archive_root.resolve())
+    target = clients_dir / rel
+    if target.exists():
+        raise FileExistsError(f"active file already exists: {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    source.rename(target)
+    return target
+
+
+def list_archived_client_files(clients_dir: Path = CLIENTS_DIR) -> list[dict[str, Any]]:
+    """Enumerate archived client files for the 'Archived' panel UI."""
+    archive_root = clients_dir / ARCHIVE_SEGMENT
+    if not archive_root.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for pattern in ("*.json", "*/*.json", "*/*/*.json", "*/*/*/*.json"):
+        for path in archive_root.glob(pattern):
+            if path.name in seen:
+                continue
+            seen.add(path.name)
+            try:
+                doc = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                doc = {}
+            rows.append({
+                "name": path.name,
+                "client_name": str(doc.get("client_name") or "").strip(),
+                "archived_path": path.relative_to(clients_dir).as_posix(),
+            })
+    rows.sort(key=lambda r: (r["client_name"].casefold(), r["name"]))
+    return rows
 
 
 def _summarize_client_selection(payload: dict[str, Any]) -> str:
@@ -1043,6 +1133,9 @@ class WebUIHandler(BaseHTTPRequestHandler):
             provider = query.get("provider", [""])[0]
             json_response(self, HTTPStatus.OK, {"clients": list_client_files(provider=provider)})
             return
+        if path == "/api/clients/archived":
+            json_response(self, HTTPStatus.OK, {"clients": list_archived_client_files()})
+            return
         if path == "/api/ssh-keys":
             json_response(self, HTTPStatus.OK, {"keys": list_ssh_keys()})
             return
@@ -1110,6 +1203,32 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 json_response(self, HTTPStatus.NOT_FOUND, {"error": "unknown run"})
                 return
             json_response(self, HTTPStatus.OK, result)
+            return
+        if path.startswith("/api/clients/") and path.endswith("/archive"):
+            name = Path(path[len("/api/clients/") : -len("/archive")]).name
+            try:
+                target = archive_client_file(name)
+                json_response(self, HTTPStatus.OK, {
+                    "name": name,
+                    "archived_path": target.relative_to(CLIENTS_DIR).as_posix(),
+                })
+            except FileNotFoundError as exc:
+                json_response(self, HTTPStatus.NOT_FOUND, {"error": str(exc)})
+            except FileExistsError as exc:
+                json_response(self, HTTPStatus.CONFLICT, {"error": str(exc)})
+            return
+        if path.startswith("/api/clients/") and path.endswith("/restore"):
+            name = Path(path[len("/api/clients/") : -len("/restore")]).name
+            try:
+                target = restore_client_file(name)
+                json_response(self, HTTPStatus.OK, {
+                    "name": name,
+                    "active_path": target.relative_to(CLIENTS_DIR).as_posix(),
+                })
+            except FileNotFoundError as exc:
+                json_response(self, HTTPStatus.NOT_FOUND, {"error": str(exc)})
+            except FileExistsError as exc:
+                json_response(self, HTTPStatus.CONFLICT, {"error": str(exc)})
             return
         try:
             payload = self._read_json()
@@ -1433,6 +1552,16 @@ def app_html(settings: Settings) -> str:
     .client-picker-list .badge.woo{{background:#f4ead8;color:#7a5a17}}
     .client-picker-list .badge.never{{background:#fde9e9;color:#902020}}
     .client-picker-list .badge.recent{{background:#e3f0e3;color:#1d5d1d}}
+    .client-picker-list .archive-btn{{font-size:10px;padding:2px 8px;height:auto;background:#eef0eb;color:#555;border:1px solid var(--line);border-radius:3px;flex-shrink:0;align-self:center;cursor:pointer;opacity:0;transition:opacity .15s}}
+    .client-picker-list label:hover .archive-btn{{opacity:1}}
+    .client-picker-list .archive-btn:hover{{background:#fde9e9;color:#902020}}
+    .client-picker-list .archive-btn:disabled{{opacity:0.5;cursor:wait}}
+    .archived-list{{font-size:11px;max-height:200px;overflow-y:auto;border:1px solid var(--line);border-radius:4px;margin-top:4px}}
+    .archived-list .archived-row{{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:5px 8px;border-bottom:1px solid #f0f1ee}}
+    .archived-list .archived-row:last-child{{border-bottom:none}}
+    .archived-list .archived-row .restore-btn{{font-size:10px;padding:2px 8px;height:auto;background:#e3f0e3;color:#1d5d1d;border:1px solid #c4ddc4;border-radius:3px;cursor:pointer}}
+    .archived-list .archived-row .restore-btn:hover{{background:#d2e6d2}}
+    .archived-list .archived-row .restore-btn:disabled{{opacity:0.5;cursor:wait}}
     .client-picker-footer{{display:flex;justify-content:space-between;gap:10px;padding:6px 10px;border-top:1px solid var(--line);font-size:11px;color:var(--muted);background:#fafbf8}}
     .client-picker-footer #clientPickerCount{{font-weight:600;color:var(--text)}}
     .client-history{{background:#f8faf7;border:1px solid var(--line);border-radius:6px;padding:12px;margin-top:10px;font-size:12px}}
@@ -1499,6 +1628,11 @@ def app_html(settings: Settings) -> str:
           </div>
         </div>
         <div id="clientHistory" class="client-history hidden"></div>
+        <h3 class="collapsible" id="toggleArchived" style="font-size:12px;margin-top:8px">Archived clients</h3>
+        <div id="archivedPanel" class="hidden">
+          <div id="archivedList" class="archived-list"></div>
+          <p class="status" id="archivedStatus" style="font-size:11px;opacity:0.7;margin:6px 0 0"></p>
+        </div>
         <label>SSH key</label>
         <select id="sshKey"><option value="">Use .env / remote default</option></select>
         <div class="actions">
@@ -1682,10 +1816,27 @@ def app_html(settings: Settings) -> str:
             <div>${{client.label}}<span class="row-badges">${{badges.join('')}}</span></div>
             ${{domainStr ? `<div class="row-meta">${{domainStr}}</div>` : ''}}
           </div>
+          <button type="button" class="archive-btn" data-name="${{client.name}}" title="Archive — hide from runs until restored">Archive</button>
         `;
         list.appendChild(label);
       }});
       list.querySelectorAll('input[type=checkbox]').forEach(cb => cb.addEventListener('change', onClientSelectionChange));
+      list.querySelectorAll('.archive-btn').forEach(btn => {{
+        btn.addEventListener('click', async (event) => {{
+          event.preventDefault();
+          event.stopPropagation();
+          const name = btn.dataset.name;
+          if (!confirm(`Archive ${{name}}?\n\nWill be hidden from runs and from the picker. Restore from the Archived panel.`)) return;
+          btn.disabled = true;
+          try {{
+            await api(`/api/clients/${{encodeURIComponent(name)}}/archive`, {{method:'POST'}});
+            await Promise.all([loadClients(), loadArchivedClients()]);
+          }} catch (e) {{
+            alert('Archive failed: ' + e.message);
+            btn.disabled = false;
+          }}
+        }});
+      }});
       const wooCount = clientsCache.filter(c => c.has_woocommerce).length;
       const recentCount = clientsCache.filter(c => {{
         const t = parseIso(c.last_success_at);
@@ -1698,6 +1849,42 @@ def app_html(settings: Settings) -> str:
     }}
     function selectedClientNames() {{
       return [...document.querySelectorAll('#clientFileList input[type=checkbox]:checked')].map(cb => cb.value);
+    }}
+    async function loadArchivedClients() {{
+      const list = $('archivedList');
+      const status = $('archivedStatus');
+      try {{
+        const data = await api('/api/clients/archived');
+        list.innerHTML = '';
+        const rows = data.clients || [];
+        rows.forEach((c) => {{
+          const item = document.createElement('div');
+          item.className = 'archived-row';
+          const label = c.client_name || c.name;
+          item.innerHTML = `
+            <div><strong>${{label}}</strong><span style="opacity:0.6;font-family:var(--mono)"> · ${{c.archived_path}}</span></div>
+            <button type="button" class="restore-btn" data-name="${{c.name}}">Restore</button>
+          `;
+          list.appendChild(item);
+        }});
+        status.textContent = rows.length === 0 ? 'No archived clients.' : `${{rows.length}} archived`;
+        list.querySelectorAll('.restore-btn').forEach(btn => {{
+          btn.addEventListener('click', async () => {{
+            const name = btn.dataset.name;
+            btn.disabled = true;
+            try {{
+              await api(`/api/clients/${{encodeURIComponent(name)}}/restore`, {{method:'POST'}});
+              await Promise.all([loadClients(), loadArchivedClients()]);
+            }} catch (e) {{
+              alert('Restore failed: ' + e.message);
+              btn.disabled = false;
+            }}
+          }});
+        }});
+      }} catch (e) {{
+        status.textContent = 'Failed to load archived clients.';
+        console.error('archived load', e);
+      }}
     }}
     function onClientSelectionChange() {{
       const sel = selectedClientNames();
@@ -2078,6 +2265,7 @@ def app_html(settings: Settings) -> str:
     renderProviders();
     loadSshKeys().catch((error) => $('runStatus').textContent = error.message);
     loadClients().catch((error) => $('runStatus').textContent = error.message);
+    loadArchivedClients();
     loadRecentRuns();
     loadPluginStats();
     loadLogs();
