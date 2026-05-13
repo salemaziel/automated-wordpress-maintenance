@@ -279,6 +279,15 @@ class SiteReport:
     # cache-flush behavior in the plugin update loop.
     capabilities: SiteCapabilities | None = None
 
+    # Pre-mutation HTTP status from a single GET against the siteurl,
+    # captured at the end of _step_collect_baseline. When the baseline is a
+    # persistent 5xx (e.g. SeedProd "Coming Soon" plugin serves 503 by
+    # design), _verify treats post-update responses with the same status as
+    # healthy — without this, every plugin update on such a site would
+    # false-positive as "broke the site" and roll back. None means we
+    # never captured one (connection failure, or pre-fix run).
+    baseline_http_status: int | None = None
+
     # These are used at runtime but NEVER serialised (see to_dict)
     ssh_user: str = ""
     ssh_password: str = ""
@@ -309,6 +318,7 @@ class SiteReport:
             "baseline": self.baseline,
             "skip_items": self.skip_items,
             "capabilities": self.capabilities.to_dict() if self.capabilities else None,
+            "baseline_http_status": self.baseline_http_status,
             "steps": [
                 {"name": s.name, "status": s.status,
                  "started": s.started, "ended": s.ended, "detail": s.detail}
@@ -713,6 +723,7 @@ class WPUpdater:
             self.log.error("ABORTING RUN  |  %s", exc)
 
         self._write_summary()
+        self._maybe_update_sheet()
         self._print_final_report()
 
         failures = [r for r in self.reports if r.overall in ("failed",)]
@@ -1708,6 +1719,22 @@ class WPUpdater:
             "theme_slugs": [t.get("name", "") for t in pending["themes"]],
         }
 
+        # Capture the live HTTP status BEFORE any mutation. SeedProd
+        # "Coming Soon", UnderConstructionPage, WPMaintenance, etc. all
+        # serve a styled splash page with HTTP 503 + Retry-After by design.
+        # Without this snapshot, the post-update HTTP verifier would
+        # interpret that 503 as evidence we broke the site and trigger an
+        # unnecessary rollback (which then also "fails" verification for
+        # the same reason — the splash is still 503).
+        r.baseline_http_status = self._capture_http_status(r.domain)
+        if r.baseline_http_status and r.baseline_http_status >= 500:
+            self.log.info(
+                "Baseline HTTP %d for %s — treating as the healthy "
+                "state for post-mutation verify checks (likely an "
+                "intentional under-construction / archive splash plugin).",
+                r.baseline_http_status, r.domain,
+            )
+
         self._record_step(
             r, "baseline", "success",
             f"WP {r.baseline['wp_version']}  |  "
@@ -2241,20 +2268,57 @@ echo 'rollback-ok'
         # Layer 1: WP-CLI sanity
         self._wp(r, "core is-installed")
 
-        # Layer 2: HTTP health
-        result = self._http_check(r.domain)
+        # Layer 2: HTTP health. When the site's pre-mutation baseline was a
+        # persistent 5xx (a Coming-Soon / archive plugin serving 503 by
+        # design), the same status post-mutation is the *expected* healthy
+        # state, not a regression.
+        accept_5xx: set[int] | None = None
+        if r.baseline_http_status and r.baseline_http_status >= 500:
+            accept_5xx = {r.baseline_http_status}
+
+        result = self._http_check(r.domain, accept_5xx=accept_5xx)
         if result != "ok":
             raise HealthCheckError(result)
+
+    def _capture_http_status(self, domain: str) -> int | None:
+        """Return the HTTP status code from a single GET against the
+        siteurl (tries https first, then http). Returns None on a
+        connection-class failure. Used to snapshot a site's
+        intentional-non-2xx baseline before any mutation."""
+        schemes = (
+            [domain] if domain.startswith(("http://", "https://"))
+            else [f"https://{domain}", f"http://{domain}"]
+        )
+        for base in schemes:
+            try:
+                req = urlrequest.Request(
+                    base, headers={"User-Agent": "wp-update/1.0 (maintenance)"},
+                )
+                with urlrequest.urlopen(
+                    req, timeout=self.args.http_timeout, context=self._ssl_ctx,
+                ) as resp:
+                    return resp.status
+            except urlerror.HTTPError as exc:
+                return exc.code
+            except OSError:
+                continue
+        return None
 
     # Retry transient connection errors before declaring a site unhealthy.
     # 5xx and fatal-marker matches are deterministic and never retried.
     HTTP_RETRY_BACKOFFS = (0, 1.0, 2.0)
 
-    def _http_check(self, domain: str) -> str:
+    def _http_check(
+        self, domain: str, *, accept_5xx: set[int] | None = None,
+    ) -> str:
         """
         Hit the site over HTTPS (fallback to HTTP) and check for 5xx
         status codes or fatal error markers in the response body.
         Returns "ok" or a description of the problem.
+
+        `accept_5xx` is the set of 5xx status codes that should be treated
+        as healthy (typically `{baseline_http_status}` for sites that
+        intentionally serve a 5xx splash page).
         """
         schemes = (
             [domain] if domain.startswith(("http://", "https://"))
@@ -2265,7 +2329,7 @@ echo 'rollback-ok'
         for base in schemes:
             for suffix in ("", "/wp-login.php"):
                 url = f"{base}{suffix}"
-                outcome = self._http_check_one(url)
+                outcome = self._http_check_one(url, accept_5xx=accept_5xx)
                 if outcome is None:
                     # Passed — check the next suffix.
                     continue
@@ -2281,7 +2345,9 @@ echo 'rollback-ok'
 
         return last_err
 
-    def _http_check_one(self, url: str) -> str | None:
+    def _http_check_one(
+        self, url: str, *, accept_5xx: set[int] | None = None,
+    ) -> str | None:
         """Probe a single URL with retries for transient errors.
 
         Returns:
@@ -2292,6 +2358,7 @@ echo 'rollback-ok'
         """
         last_exc: Exception | None = None
         last_5xx: str | None = None
+        last_5xx_status: int | None = None
         for backoff in self.HTTP_RETRY_BACKOFFS:
             if backoff:
                 time.sleep(backoff)
@@ -2307,6 +2374,7 @@ echo 'rollback-ok'
                         # serve a stale 503 for 1–3s after wp-cli
                         # internally deactivates maintenance mode.
                         last_5xx = f"{url} → HTTP {resp.status}"
+                        last_5xx_status = resp.status
                         continue
                     body = resp.read(65536).decode("utf-8", errors="ignore").lower()
                     for marker in FATAL_MARKERS:
@@ -2316,6 +2384,7 @@ echo 'rollback-ok'
             except urlerror.HTTPError as exc:
                 if exc.code >= 500:
                     last_5xx = f"{url} → HTTP {exc.code}"
+                    last_5xx_status = exc.code
                     continue
                 # 3xx/4xx are deterministic — pass and check next suffix.
                 return None
@@ -2325,8 +2394,16 @@ echo 'rollback-ok'
                 last_exc = exc
                 continue
 
-        # Exhausted retries. A repeated 5xx is now definitive (caller bails).
+        # Exhausted retries. A repeated 5xx is now definitive (caller bails),
+        # *unless* it matches the pre-mutation baseline — see _verify's
+        # accept_5xx for the SeedProd-style intentional-503 case.
         if last_5xx is not None:
+            if accept_5xx and last_5xx_status in accept_5xx:
+                self.log.debug(
+                    "HTTP %d matches baseline_http_status — accepting as "
+                    "healthy: %s", last_5xx_status, last_5xx,
+                )
+                return None
             self.log.debug("HTTP 5xx persisted across retries: %s", last_5xx)
             return last_5xx
         # Otherwise it's a transient connection-class failure.
@@ -2562,6 +2639,44 @@ echo 'rollback-ok'
                 self.log.info("Run history ingested into %s", self.args.db_path)
             except Exception as exc:  # pragma: no cover - defensive
                 self.log.warning("DB ingest failed (%s) — summary file is still on disk", exc)
+
+    def _maybe_update_sheet(self) -> None:
+        """Update the 'Plugin Updates' Google Sheet (or whichever sheet
+        --update-sheet points at) for every site that finished with
+        overall='success'. No-op unless --update-sheet (or UPDATE_SHEET_ID
+        in .env) is set and we're in execute mode."""
+        spreadsheet_id = (getattr(self.args, "update_sheet", "") or "").strip()
+        if not spreadsheet_id:
+            spreadsheet_id = (self.env.get("UPDATE_SHEET_ID", "") or "").strip()
+        if not spreadsheet_id or not self.args.execute:
+            return
+
+        success_domains = [
+            r.domain for r in self.reports
+            if r.overall == "success" and r.domain
+        ]
+        if not success_domains:
+            self.log.info(
+                "Sheet update skipped: no sites completed with overall='success'",
+            )
+            return
+
+        try:
+            import sheet_update as _sheet
+        except ImportError as exc:  # pragma: no cover - defensive
+            self.log.warning("Sheet update unavailable (%s) — skipping", exc)
+            return
+
+        from datetime import date as _date
+        _sheet.update_sheet_for_successes(
+            spreadsheet_id=spreadsheet_id,
+            tab_name=getattr(self.args, "update_sheet_tab", "Plugin Updates"),
+            success_domains=success_domains,
+            today=_date.today(),
+            gws_path=getattr(self.args, "gws_path", "gws"),
+            dry_run=getattr(self.args, "update_sheet_dry_run", False),
+            log=self.log,
+        )
 
     # ------------------------------------------------------------------
     # Confidence scoring
@@ -3021,6 +3136,31 @@ def build_cli() -> argparse.Namespace:
         "--stream", action="store_true",
         help="Stream all activity to stdout (tail -f style). Shows SSH "
              "commands, remote output, and all debug-level detail in real time.",
+    )
+    p.add_argument(
+        "--update-sheet", default="", metavar="SPREADSHEET_ID",
+        help="At end of an execute run, update this Google Sheet's 'Next "
+             "Update' (col B → next Monday) and 'Last Updated' (col C → "
+             "today) columns for every site that finished with overall="
+             "'success'. Matches sheet col E (wp-admin URL) to SiteReport "
+             "domain. Failed/skipped/rolled-back sites are never written. "
+             "Requires `gws` CLI auth (run `gws auth login` once). Falls "
+             "back to UPDATE_SHEET_ID in .env if not passed. Disabled by "
+             "default.",
+    )
+    p.add_argument(
+        "--update-sheet-tab", default="Plugin Updates", metavar="TAB_NAME",
+        help="Tab name in the spreadsheet to update (default: 'Plugin Updates').",
+    )
+    p.add_argument(
+        "--update-sheet-dry-run", action="store_true",
+        help="With --update-sheet, log the rows that would be written but "
+             "do not call the Sheets batchUpdate API.",
+    )
+    p.add_argument(
+        "--gws-path", default="gws", metavar="PATH",
+        help="Path to the `gws` (Google Workspace CLI) binary used by "
+             "--update-sheet (default: `gws` on PATH).",
     )
     return p.parse_args()
 

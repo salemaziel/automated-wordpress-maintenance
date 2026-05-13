@@ -377,6 +377,145 @@ def test_http_check_flags_fatal_error_markers(
 
 
 # ---------------------------------------------------------------------------
+# Baseline HTTP status snapshot — avoids false-positive rollbacks on
+# Coming-Soon / archive plugins that intentionally serve 5xx.
+# ---------------------------------------------------------------------------
+
+def test_capture_http_status_returns_200_on_normal_site(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    updater = wp_update.WPUpdater(make_args(tmp_path))
+
+    def fake_urlopen(req, timeout, context):  # noqa: ANN001
+        return DummyResponse(200, "<html></html>")
+
+    monkeypatch.setattr(wp_update.urlrequest, "urlopen", fake_urlopen)
+    assert updater._capture_http_status("example.com") == 200
+
+
+def test_capture_http_status_returns_503_for_intentional_splash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SeedProd 'Coming Soon' returns 503 + a full HTML body. The captured
+    baseline status must be the integer 503 so _verify can later accept
+    matching 503s as healthy."""
+    updater = wp_update.WPUpdater(make_args(tmp_path))
+
+    def fake_urlopen(req, timeout, context):  # noqa: ANN001
+        raise wp_update.urlerror.HTTPError(
+            req.full_url, 503, "Service Unavailable", None, None,
+        )
+
+    monkeypatch.setattr(wp_update.urlrequest, "urlopen", fake_urlopen)
+    assert updater._capture_http_status("archive.example.com") == 503
+
+
+def test_capture_http_status_returns_none_on_connection_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    updater = wp_update.WPUpdater(make_args(tmp_path))
+
+    def fake_urlopen(req, timeout, context):  # noqa: ANN001
+        raise OSError("DNS failure")
+
+    monkeypatch.setattr(wp_update.urlrequest, "urlopen", fake_urlopen)
+    assert updater._capture_http_status("nope.example.com") is None
+
+
+def test_verify_accepts_5xx_matching_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Site whose baseline was 503 (e.g. SeedProd Coming-Soon plugin) and
+    is still 503 post-mutation must pass _verify — that's the expected
+    healthy state, not a regression."""
+    updater = wp_update.WPUpdater(make_args(tmp_path))
+    monkeypatch.setattr(wp_update.time, "sleep", lambda _s: None)
+
+    def fake_urlopen(req, timeout, context):  # noqa: ANN001
+        raise wp_update.urlerror.HTTPError(
+            req.full_url, 503, "Service Unavailable", None, None,
+        )
+
+    monkeypatch.setattr(wp_update.urlrequest, "urlopen", fake_urlopen)
+    # Bypass the wp-cli sanity check (Layer 1 of _verify).
+    monkeypatch.setattr(updater, "_wp", lambda r, cmd: "")
+
+    report = make_report(domain="archive.example.com", baseline_http_status=503)
+    updater._verify(report)  # no HealthCheckError raised
+
+
+def test_verify_still_rejects_5xx_that_differs_from_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Baseline 503 / post-mutation 502 means our update *did* change the
+    site's response — that's a real regression, not the intentional
+    Coming-Soon splash. _verify must still raise."""
+    updater = wp_update.WPUpdater(make_args(tmp_path))
+    monkeypatch.setattr(wp_update.time, "sleep", lambda _s: None)
+
+    def fake_urlopen(req, timeout, context):  # noqa: ANN001
+        raise wp_update.urlerror.HTTPError(
+            req.full_url, 502, "Bad Gateway", None, None,
+        )
+
+    monkeypatch.setattr(wp_update.urlrequest, "urlopen", fake_urlopen)
+    monkeypatch.setattr(updater, "_wp", lambda r, cmd: "")
+
+    report = make_report(domain="archive.example.com", baseline_http_status=503)
+    with pytest.raises(wp_update.HealthCheckError, match="502"):
+        updater._verify(report)
+
+
+def test_verify_rejects_5xx_when_baseline_was_200(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Site that was healthy at baseline (200) but now returns 503 — the
+    update genuinely broke something and _verify must still raise."""
+    updater = wp_update.WPUpdater(make_args(tmp_path))
+    monkeypatch.setattr(wp_update.time, "sleep", lambda _s: None)
+
+    def fake_urlopen(req, timeout, context):  # noqa: ANN001
+        raise wp_update.urlerror.HTTPError(
+            req.full_url, 503, "Service Unavailable", None, None,
+        )
+
+    monkeypatch.setattr(wp_update.urlrequest, "urlopen", fake_urlopen)
+    monkeypatch.setattr(updater, "_wp", lambda r, cmd: "")
+
+    report = make_report(domain="example.com", baseline_http_status=200)
+    with pytest.raises(wp_update.HealthCheckError, match="503"):
+        updater._verify(report)
+
+
+def test_verify_rejects_5xx_when_no_baseline_captured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a baseline (None — e.g. capture failed at collect-baseline
+    time), a persistent 5xx must still be treated as a failure. We never
+    accept 5xx implicitly."""
+    updater = wp_update.WPUpdater(make_args(tmp_path))
+    monkeypatch.setattr(wp_update.time, "sleep", lambda _s: None)
+
+    def fake_urlopen(req, timeout, context):  # noqa: ANN001
+        raise wp_update.urlerror.HTTPError(
+            req.full_url, 503, "Service Unavailable", None, None,
+        )
+
+    monkeypatch.setattr(wp_update.urlrequest, "urlopen", fake_urlopen)
+    monkeypatch.setattr(updater, "_wp", lambda r, cmd: "")
+
+    report = make_report(domain="example.com", baseline_http_status=None)
+    with pytest.raises(wp_update.HealthCheckError, match="503"):
+        updater._verify(report)
+
+
+def test_to_dict_includes_baseline_http_status() -> None:
+    report = make_report(baseline_http_status=503)
+    out = report.to_dict()
+    assert out["baseline_http_status"] == 503
+
+
+# ---------------------------------------------------------------------------
 # VALID_PATH regex edge cases
 # ---------------------------------------------------------------------------
 
@@ -2143,3 +2282,90 @@ def test_process_site_skip_lookup_uses_normalized_domain(tmp_path: Path) -> None
     raw_inventory_domain = "https://WWW.Normalized.example.com/"
     norm = wp_update._normalize_domain(raw_inventory_domain)
     assert norm in updater._no_update_domains
+
+
+# ---------------------------------------------------------------------------
+# --update-sheet end-of-run hook
+# ---------------------------------------------------------------------------
+
+def _make_args_with_sheet(
+    tmp_path: Path,
+    *,
+    execute: bool,
+    update_sheet: str = "",
+    update_sheet_dry_run: bool = False,
+) -> argparse.Namespace:
+    args = make_args(tmp_path, execute=execute)
+    # WPUpdater.__init__ validates that SSH_KEY or APP_PW is set when
+    # execute=True; the empty .env that make_args() writes otherwise fails.
+    args.env_file.write_text("SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=pw\n")
+    args.update_sheet = update_sheet
+    args.update_sheet_tab = "Plugin Updates"
+    args.update_sheet_dry_run = update_sheet_dry_run
+    args.gws_path = "gws"
+    return args
+
+
+def test_maybe_update_sheet_skipped_when_flag_unset(tmp_path: Path) -> None:
+    args = _make_args_with_sheet(tmp_path, execute=True, update_sheet="")
+    updater = wp_update.WPUpdater(args)
+    updater.reports = [make_report(domain="example.com", overall="success")]
+    with patch("sheet_update.update_sheet_for_successes") as mock_call:
+        updater._maybe_update_sheet()
+    assert mock_call.call_count == 0
+
+
+def test_maybe_update_sheet_skipped_in_dryrun_mode(tmp_path: Path) -> None:
+    """Even with --update-sheet set, dry-run mode (i.e. no --execute) must
+    never write to the sheet."""
+    args = _make_args_with_sheet(tmp_path, execute=False, update_sheet="SHEET_ID")
+    updater = wp_update.WPUpdater(args)
+    updater.reports = [make_report(domain="example.com", overall="dry-run")]
+    with patch("sheet_update.update_sheet_for_successes") as mock_call:
+        updater._maybe_update_sheet()
+    assert mock_call.call_count == 0
+
+
+def test_maybe_update_sheet_filters_to_success_only(tmp_path: Path) -> None:
+    """Only sites with overall='success' should be forwarded — failed,
+    rolled-back, and skipped sites must never end up writing dates."""
+    args = _make_args_with_sheet(tmp_path, execute=True, update_sheet="SHEET_ID")
+    updater = wp_update.WPUpdater(args)
+    updater.reports = [
+        make_report(domain="good.com", overall="success"),
+        make_report(domain="bad.com", overall="failed"),
+        make_report(domain="rolled.com", overall="rolled-back"),
+        make_report(domain="skip.com", overall="skipped"),
+        make_report(domain="other-good.com", overall="success"),
+    ]
+    with patch("sheet_update.update_sheet_for_successes") as mock_call:
+        updater._maybe_update_sheet()
+    assert mock_call.call_count == 1
+    forwarded = sorted(mock_call.call_args.kwargs["success_domains"])
+    assert forwarded == ["good.com", "other-good.com"]
+
+
+def test_maybe_update_sheet_noop_when_no_successes(tmp_path: Path) -> None:
+    args = _make_args_with_sheet(tmp_path, execute=True, update_sheet="SHEET_ID")
+    updater = wp_update.WPUpdater(args)
+    updater.reports = [
+        make_report(domain="bad.com", overall="failed"),
+        make_report(domain="skip.com", overall="skipped"),
+    ]
+    with patch("sheet_update.update_sheet_for_successes") as mock_call:
+        updater._maybe_update_sheet()
+    assert mock_call.call_count == 0
+
+
+def test_maybe_update_sheet_forwards_dry_run_flag(tmp_path: Path) -> None:
+    args = _make_args_with_sheet(
+        tmp_path, execute=True, update_sheet="SHEET_ID",
+        update_sheet_dry_run=True,
+    )
+    updater = wp_update.WPUpdater(args)
+    updater.reports = [make_report(domain="example.com", overall="success")]
+    with patch("sheet_update.update_sheet_for_successes") as mock_call:
+        updater._maybe_update_sheet()
+    assert mock_call.call_args.kwargs["dry_run"] is True
+    assert mock_call.call_args.kwargs["spreadsheet_id"] == "SHEET_ID"
+    assert mock_call.call_args.kwargs["tab_name"] == "Plugin Updates"
