@@ -2326,35 +2326,78 @@ def test_maybe_update_sheet_skipped_in_dryrun_mode(tmp_path: Path) -> None:
     assert mock_call.call_count == 0
 
 
-def test_maybe_update_sheet_filters_to_success_only(tmp_path: Path) -> None:
-    """Only sites with overall='success' should be forwarded — failed,
-    rolled-back, and skipped sites must never end up writing dates."""
+def test_maybe_update_sheet_filters_to_verified_current(tmp_path: Path) -> None:
+    """Sites that ended in a verified-current state (needs_update=False)
+    are forwarded — that covers both successful updates and auto-skipped
+    up-to-date sites. Failed, rolled-back, and skip-without-verification
+    sites (WooCommerce gate, staging gate, dedupe) must never be stamped.
+    """
     args = _make_args_with_sheet(tmp_path, execute=True, update_sheet="SHEET_ID")
     updater = wp_update.WPUpdater(args)
     updater.reports = [
-        make_report(domain="good.com", overall="success"),
-        make_report(domain="bad.com", overall="failed"),
-        make_report(domain="rolled.com", overall="rolled-back"),
-        make_report(domain="skip.com", overall="skipped"),
-        make_report(domain="other-good.com", overall="success"),
+        # success → needs_update=False (set by the success path)
+        make_report(domain="updated.com", overall="success", needs_update=False),
+        # auto-skip after inline baseline found nothing pending
+        make_report(domain="uptodate.com", overall="skipped", needs_update=False),
+        # WooCommerce gate / staging gate / dedupe — never ran a check
+        make_report(domain="wc-gate.com", overall="skipped", needs_update=None),
+        # failure paths intentionally retain pre-failure needs_update
+        make_report(domain="bad.com", overall="failed", needs_update=True),
+        make_report(domain="rolled.com", overall="rolled-back", needs_update=True),
+        make_report(domain="other-updated.com", overall="success", needs_update=False),
     ]
     with patch("sheet_update.update_sheet_for_successes") as mock_call:
         updater._maybe_update_sheet()
     assert mock_call.call_count == 1
     forwarded = sorted(mock_call.call_args.kwargs["success_domains"])
-    assert forwarded == ["good.com", "other-good.com"]
+    assert forwarded == ["other-updated.com", "updated.com", "uptodate.com"]
 
 
-def test_maybe_update_sheet_noop_when_no_successes(tmp_path: Path) -> None:
+def test_maybe_update_sheet_noop_when_nothing_verified(tmp_path: Path) -> None:
+    """If no site reached needs_update=False (all failed, all rolled back,
+    or all skipped without verification), the sheet step is a no-op."""
     args = _make_args_with_sheet(tmp_path, execute=True, update_sheet="SHEET_ID")
     updater = wp_update.WPUpdater(args)
     updater.reports = [
-        make_report(domain="bad.com", overall="failed"),
-        make_report(domain="skip.com", overall="skipped"),
+        make_report(domain="bad.com", overall="failed", needs_update=True),
+        make_report(domain="wc-gate.com", overall="skipped", needs_update=None),
     ]
     with patch("sheet_update.update_sheet_for_successes") as mock_call:
         updater._maybe_update_sheet()
     assert mock_call.call_count == 0
+
+
+def test_maybe_update_sheet_falls_back_to_env_var(tmp_path: Path) -> None:
+    """When --update-sheet is empty, UPDATE_SHEET_ID from .env is used."""
+    args = _make_args_with_sheet(tmp_path, execute=True, update_sheet="")
+    args.env_file.write_text(
+        "SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=pw\n"
+        "UPDATE_SHEET_ID=ENV_SHEET_ID\n"
+    )
+    updater = wp_update.WPUpdater(args)
+    updater.reports = [
+        make_report(domain="example.com", overall="success", needs_update=False),
+    ]
+    with patch("sheet_update.update_sheet_for_successes") as mock_call:
+        updater._maybe_update_sheet()
+    assert mock_call.call_count == 1
+    assert mock_call.call_args.kwargs["spreadsheet_id"] == "ENV_SHEET_ID"
+
+
+def test_maybe_update_sheet_cli_overrides_env_var(tmp_path: Path) -> None:
+    """An explicit --update-sheet wins over UPDATE_SHEET_ID in .env."""
+    args = _make_args_with_sheet(tmp_path, execute=True, update_sheet="CLI_SHEET_ID")
+    args.env_file.write_text(
+        "SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=pw\n"
+        "UPDATE_SHEET_ID=ENV_SHEET_ID\n"
+    )
+    updater = wp_update.WPUpdater(args)
+    updater.reports = [
+        make_report(domain="example.com", overall="success", needs_update=False),
+    ]
+    with patch("sheet_update.update_sheet_for_successes") as mock_call:
+        updater._maybe_update_sheet()
+    assert mock_call.call_args.kwargs["spreadsheet_id"] == "CLI_SHEET_ID"
 
 
 def test_maybe_update_sheet_forwards_dry_run_flag(tmp_path: Path) -> None:
@@ -2363,7 +2406,9 @@ def test_maybe_update_sheet_forwards_dry_run_flag(tmp_path: Path) -> None:
         update_sheet_dry_run=True,
     )
     updater = wp_update.WPUpdater(args)
-    updater.reports = [make_report(domain="example.com", overall="success")]
+    updater.reports = [
+        make_report(domain="example.com", overall="success", needs_update=False),
+    ]
     with patch("sheet_update.update_sheet_for_successes") as mock_call:
         updater._maybe_update_sheet()
     assert mock_call.call_args.kwargs["dry_run"] is True

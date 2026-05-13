@@ -2642,22 +2642,33 @@ echo 'rollback-ok'
 
     def _maybe_update_sheet(self) -> None:
         """Update the 'Plugin Updates' Google Sheet (or whichever sheet
-        --update-sheet points at) for every site that finished with
-        overall='success'. No-op unless --update-sheet (or UPDATE_SHEET_ID
-        in .env) is set and we're in execute mode."""
+        --update-sheet points at) for every site that this run verified as
+        current — i.e. needs_update=False after the run. That covers two
+        equivalent end states:
+
+          * overall='success'   — updates were applied and verified
+          * overall='skipped'   — inline/cached check found nothing pending
+
+        Skip reasons that don't set needs_update (WooCommerce gate, staging
+        gate, --skip-recent dedupe, staging-cascade) are intentionally
+        excluded so the sheet only reflects sites we actually confirmed.
+
+        No-op unless --update-sheet (or UPDATE_SHEET_ID in .env) is set and
+        we're in execute mode."""
         spreadsheet_id = (getattr(self.args, "update_sheet", "") or "").strip()
         if not spreadsheet_id:
             spreadsheet_id = (self.env.get("UPDATE_SHEET_ID", "") or "").strip()
         if not spreadsheet_id or not self.args.execute:
             return
 
-        success_domains = [
+        verified_domains = [
             r.domain for r in self.reports
-            if r.overall == "success" and r.domain
+            if r.needs_update is False and r.domain
         ]
-        if not success_domains:
+        if not verified_domains:
             self.log.info(
-                "Sheet update skipped: no sites completed with overall='success'",
+                "Sheet update skipped: no sites ended in a verified-current "
+                "state (needs_update=False)",
             )
             return
 
@@ -2671,7 +2682,7 @@ echo 'rollback-ok'
         _sheet.update_sheet_for_successes(
             spreadsheet_id=spreadsheet_id,
             tab_name=getattr(self.args, "update_sheet_tab", "Plugin Updates"),
-            success_domains=success_domains,
+            success_domains=verified_domains,
             today=_date.today(),
             gws_path=getattr(self.args, "gws_path", "gws"),
             dry_run=getattr(self.args, "update_sheet_dry_run", False),
@@ -3141,9 +3152,12 @@ def build_cli() -> argparse.Namespace:
         "--update-sheet", default="", metavar="SPREADSHEET_ID",
         help="At end of an execute run, update this Google Sheet's 'Next "
              "Update' (col B → next Monday) and 'Last Updated' (col C → "
-             "today) columns for every site that finished with overall="
-             "'success'. Matches sheet col E (wp-admin URL) to SiteReport "
-             "domain. Failed/skipped/rolled-back sites are never written. "
+             "today) columns for every site this run verified as current "
+             "— either a successful update OR an auto-skip that confirmed "
+             "needs_update=False. Sites skipped by the WooCommerce gate, "
+             "staging gate, --skip-recent dedupe, or a staging-cascade are "
+             "left alone. Matches sheet col E (wp-admin URL) to SiteReport "
+             "domain. Failed and rolled-back sites are never written. "
              "Requires `gws` CLI auth (run `gws auth login` once). Falls "
              "back to UPDATE_SHEET_ID in .env if not passed. Disabled by "
              "default.",
