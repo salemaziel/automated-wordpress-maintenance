@@ -92,6 +92,15 @@ DEFAULT_SSH_CONFIG = Path(os.environ.get("WP_UPDATE_SSH_CONFIG", "/dev/null"))
 # Cloudways apps always live under /home/master/applications/<hash>/public_html
 VALID_PATH = re.compile(r"^/home/master/applications/[A-Za-z0-9_-]+/public_html$")
 
+# Siteground sites live under /home/<ssh_user>/www/<domain>/public_html.
+# The home dir is symlinked to /home/customer on the actual host but the
+# path through the symlink is the canonical inventory form.
+VALID_PATH_SG = re.compile(r"^/home/[A-Za-z0-9_-]+/www/[A-Za-z0-9._-]+/public_html$")
+
+# Siteground SSH always uses port 18765 — non-standard, must be passed
+# explicitly to ssh(1).
+SITEGROUND_SSH_PORT = 18765
+
 # Strings that indicate a fatal PHP crash when found in page body
 FATAL_MARKERS = (
     "fatal error",
@@ -116,6 +125,22 @@ KNOWN_BACKUP_PLUGINS = {
     "backup-backup":            "Backup Migration",
     "jetpack-backup":           "Jetpack Backup",
     "backupwordpress":          "BackUpWordPress",
+}
+
+# Page-cache plugins — slug → (label, wp-cli flush subcommand).
+# When detected at baseline, the plugin update loop runs the mapped flush
+# command after each plugin update so verify sees fresh content (not a
+# stale cached error page from before the fix). When no entry matches, the
+# loop falls back to "wp cache flush" (WP core object cache, always
+# available even without a cache plugin).
+KNOWN_CACHE_PLUGINS = {
+    "w3-total-cache":      ("W3 Total Cache",       "w3-total-cache flush all"),
+    "wp-super-cache":      ("WP Super Cache",       "super-cache flush"),
+    "litespeed-cache":     ("LiteSpeed Cache",      "litespeed-purge all"),
+    "wp-rocket":           ("WP Rocket",            "rocket clean --confirm"),
+    "wp-fastest-cache":    ("WP Fastest Cache",     "fastest-cache clear"),
+    "sg-cachepress":       ("SG Optimizer",         "sg purge"),
+    "cache-enabler":       ("Cache Enabler",        "cache-enabler clear"),
 }
 
 # Confidence-scoring rules used by _compute_confidence. Tunable in one place.
@@ -187,6 +212,25 @@ class StepResult:
 
 
 @dataclass
+class SiteCapabilities:
+    """Plugin capabilities detected at baseline-collection time.
+
+    Drives cache-flush behavior in the plugin update loop. Future tracks
+    will use this for backup-plugin selection (UpdraftPlus CLI vs tar).
+    """
+    backup_plugin: str = ""       # KNOWN_BACKUP_PLUGINS label, "" if none active
+    cache_plugin: str = ""        # KNOWN_CACHE_PLUGINS label, "" if none active
+    cache_flush_cmd: str = ""     # wp-cli subcommand; "" → fallback "cache flush"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "backup_plugin": self.backup_plugin,
+            "cache_plugin": self.cache_plugin,
+            "cache_flush_cmd": self.cache_flush_cmd,
+        }
+
+
+@dataclass
 class SiteReport:
     """Aggregate result for one WordPress application."""
     client: str
@@ -195,7 +239,17 @@ class SiteReport:
     wp_path: str
     is_staging: bool
     has_woocommerce: bool
+    # Hosting provider — "cloudways" (default for back-compat) or "siteground".
+    # Drives path validation, SSH preflight tier, backup dest, and ownership steps.
+    provider: str = "cloudways"
+    # SSH port. Cloudways uses 22; Siteground uses 18765.
+    ssh_port: int = 22
     overall: str = "pending"       # pending | dry-run | success | failed | rolled-back | skipped
+    # Tri-state pending-updates flag set by baseline collection:
+    #   None  — not yet computed
+    #   True  — at least one core/theme/plugin update is available (and not in skip_items)
+    #   False — site is fully up to date (or only skipped slugs have updates)
+    needs_update: bool | None = None
     backup_dir: str = ""
     failure_step: str = ""
     failure_detail: str = ""
@@ -221,6 +275,10 @@ class SiteReport:
     # Used to chown -R back after updates when running as master user.
     original_owner: str = ""
 
+    # Plugin capabilities detected during baseline collection. Drives
+    # cache-flush behavior in the plugin update loop.
+    capabilities: SiteCapabilities | None = None
+
     # These are used at runtime but NEVER serialised (see to_dict)
     ssh_user: str = ""
     ssh_password: str = ""
@@ -237,7 +295,10 @@ class SiteReport:
             "wp_path": self.wp_path,
             "is_staging": self.is_staging,
             "has_woocommerce": self.has_woocommerce,
+            "provider": self.provider,
+            "ssh_port": self.ssh_port,
             "overall": self.overall,
+            "needs_update": self.needs_update,
             "auth_method": self.auth_method,
             "auth_user": self.auth_user,
             "original_owner": self.original_owner,
@@ -247,6 +308,7 @@ class SiteReport:
             "rollback_result": self.rollback_result,
             "baseline": self.baseline,
             "skip_items": self.skip_items,
+            "capabilities": self.capabilities.to_dict() if self.capabilities else None,
             "steps": [
                 {"name": s.name, "status": s.status,
                  "started": s.started, "ended": s.ended, "detail": s.detail}
@@ -277,6 +339,17 @@ class WPCliError(RuntimeError):
 
 class RollbackFailed(RuntimeError):
     """The rollback itself failed — manual intervention needed."""
+
+
+def _is_already_deactivated(exc: BaseException) -> bool:
+    """True if the wp-cli error means maintenance-mode was already off.
+
+    The X/Pro theme updater self-disables maintenance mode after its own
+    update, so our later `wp maintenance-mode deactivate` call is a no-op
+    that exits 1 with `Error: Maintenance mode already deactivated.`. This
+    is the discriminator that lets us demote that benign case to DEBUG.
+    """
+    return "already deactivated" in str(exc).lower()
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +460,43 @@ def skip_items_for_domain(notes: dict[str, Any], domain: str) -> list[dict[str, 
     return []
 
 
+def baseline_pending_updates(
+    baseline: dict[str, Any],
+    skip_items: list[dict[str, Any]] | None = None,
+) -> dict[str, list[Any]]:
+    """Return the subset of baseline updates that would actually run.
+
+    Filters out plugins/themes whose slug is configured as a skip in
+    notes.json — those will never be touched even if WP-CLI reports an
+    update available, so they shouldn't count toward "this site needs work".
+
+    Returns a dict with keys 'core', 'plugins', 'themes'. Empty lists mean
+    nothing pending in that category. A site is fully up to date when all
+    three lists are empty.
+    """
+    skip_plugin_slugs = {
+        (it.get("slug") or "").strip()
+        for it in (skip_items or [])
+        if (it.get("type") or "").strip().lower() == "plugin"
+    }
+    skip_theme_slugs = {
+        (it.get("slug") or "").strip()
+        for it in (skip_items or [])
+        if (it.get("type") or "").strip().lower() == "theme"
+    }
+    return {
+        "core": list(baseline.get("core_updates") or []),
+        "plugins": [
+            p for p in (baseline.get("plugin_updates") or [])
+            if (p.get("name") or "").strip() not in skip_plugin_slugs
+        ],
+        "themes": [
+            t for t in (baseline.get("theme_updates") or [])
+            if (t.get("name") or "").strip() not in skip_theme_slugs
+        ],
+    }
+
+
 def resolve(raw: str | None, env: dict[str, str]) -> str:
     """Resolve $VAR placeholders against the loaded env dict."""
     if not raw:
@@ -399,6 +509,54 @@ def resolve(raw: str | None, env: dict[str, str]) -> str:
 
 def slugify(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "unknown"
+
+
+def is_siteground_doc(doc: dict[str, Any]) -> bool:
+    """Detect a Siteground per-domain inventory doc by its schema marker."""
+    schema = (doc.get("schema") or "").strip().lower()
+    if schema.startswith("siteground_"):
+        return True
+    return (doc.get("provider") or "").strip().lower() == "siteground"
+
+
+def siteground_to_internal_doc(doc: dict[str, Any]) -> dict[str, Any]:
+    """Convert a Siteground v1 inventory doc into the internal Cloudways-
+    shaped dict that _process_client_file consumes.
+
+    No values are invented — SSH host, user, port, key env, and WordPress
+    path are read from the SG doc and placed into the Cloudways field shape
+    with provider markers attached. The result has exactly one application.
+    """
+    domain = (doc.get("domain") or "").strip()
+    ssh = doc.get("ssh") or {}
+    wp = doc.get("wordpress") or {}
+    key_env = (ssh.get("key_env") or "SSH_KEY_SG").strip()
+    return {
+        "_provider": "siteground",
+        "client_name": domain or "siteground-site",
+        # Cloudways stores an IP here; on Siteground it's an SSH hostname.
+        # ssh(1) accepts either form, so we just store it verbatim.
+        "server_ip_address": (ssh.get("host") or "").strip(),
+        "master_credentials": {},  # SG has no master concept
+        "applications": [{
+            "website_domain": domain,
+            "path_to_public_html": (wp.get("path") or "").strip(),
+            "sftp_credentials": {
+                "username": (ssh.get("user") or "").strip(),
+                "ssh_key": f"${key_env}",
+                "password": "",  # SG is key-only
+            },
+            "environment_flags": {
+                "wp_cli_installed": True,
+                "is_staging": bool(doc.get("is_staging", False)),
+                "has_woocommerce": bool(doc.get("has_woocommerce", False)),
+            },
+            "_provider": "siteground",
+            "_ssh_port": int(ssh.get("port") or SITEGROUND_SSH_PORT),
+            "_enabled": bool(doc.get("enabled", True)),
+            "_skip_reason": doc.get("skip_reason"),
+        }],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -465,6 +623,26 @@ class WPUpdater:
             self.log.info(
                 "Dedupe active: %d domain(s) already succeeded within last %dh — will be skipped",
                 len(self._recent_successes), self.args.skip_recent,
+            )
+
+        # Summary-driven "no updates available" skip state.
+        # Maps domain -> {"pending_plugin_slugs", "pending_theme_slugs",
+        # "core_count"} captured from the most recent eligible dry-run.
+        # _process_client_file re-applies the CURRENT notes.json skip_items
+        # to those cached lists before honoring the skip, so a notes.json
+        # edit between dry-run and execute can't cause us to skip a site
+        # whose previously-skipped plugin update is now actionable.
+        # Populated only in execute mode, and only when neither --recheck-updates
+        # nor --no-skip-up-to-date is in effect. Inline-recheck handles its own
+        # skip path inside _process_site.
+        self._no_update_domains: dict[str, dict[str, Any]] = \
+            self._load_no_update_domains()
+        if self._no_update_domains:
+            self.log.info(
+                "Up-to-date skip active: %d domain(s) had needs_update=false "
+                "in a dry-run within the last %dm — will be skipped if "
+                "current notes.json skip rules still cover the cached pending set",
+                len(self._no_update_domains), self.args.skip_up_to_date_ttl,
             )
 
         # Global SSH credentials from .env
@@ -563,16 +741,24 @@ class WPUpdater:
             return paths
         # Supports both the legacy flat layout (clients/<slug>_cloudways.json)
         # and the per-provider/per-client subdir layout
-        # (clients/cloudways/<base>/<slug>_cloudways.json).
+        # (clients/cloudways/<base>/<slug>_cloudways.json or
+        #  clients/siteground/<domain>/<domain>_siteground.json).
         base = self.args.clients_dir
+        provider = (getattr(self.args, "provider", "auto") or "auto").lower()
+        suffixes: list[str] = []
+        if provider in ("auto", "cloudways"):
+            suffixes.append("_cloudways.json")
+        if provider in ("auto", "siteground"):
+            suffixes.append("_siteground.json")
         found: set[Path] = set()
-        for pattern in (
-            "*_cloudways.json",
-            "*/*_cloudways.json",
-            "*/*/*_cloudways.json",
-        ):
-            for path in base.glob(pattern):
-                found.add(path.resolve())
+        for suffix in suffixes:
+            for pattern in (
+                f"*{suffix}",
+                f"*/*{suffix}",
+                f"*/*/*{suffix}",
+            ):
+                for path in base.glob(pattern):
+                    found.add(path.resolve())
         return sorted(found)
 
     def _open_db(self) -> Any:
@@ -604,7 +790,9 @@ class WPUpdater:
                 import db as _db
                 domains = _db.recent_successful_domains(self._db, hours)
                 if domains:
-                    return domains
+                    # Normalize so callers comparing report.domain match
+                    # rows written from differently-formatted inventory.
+                    return {_normalize_domain(d) for d in domains if d}
             except Exception as exc:  # pragma: no cover - defensive
                 self.log.warning("DB dedupe query failed (%s) — falling back to logs", exc)
         # Log-scan fallback (covers fresh DB / pre-ingest history)
@@ -624,12 +812,145 @@ class WPUpdater:
                 data = json.loads(path.read_text())
             except (OSError, json.JSONDecodeError):
                 continue
+            if not isinstance(data, dict):
+                continue
             if data.get("mode") != "execute":
                 continue
-            for entry in data.get("sites", []):
+            sites = data.get("sites")
+            if not isinstance(sites, list):
+                continue
+            for entry in sites:
+                if not isinstance(entry, dict):
+                    continue
                 if entry.get("overall") == "success" and entry.get("domain"):
-                    domains.add(entry["domain"])
-        return domains
+                    domains.add(_normalize_domain(str(entry["domain"])))
+        return {d for d in domains if d}
+
+    def _load_no_update_domains(self) -> dict[str, dict[str, Any]]:
+        """Return a mapping of domains whose most recent dry-run summary
+        (within the TTL) reported needs_update=false, along with the
+        pre-skip pending slug lists from that summary.
+
+        Each value: {"pending_plugin_slugs", "pending_theme_slugs",
+        "core_count"}. The caller (_process_client_file) re-applies the
+        CURRENT notes.json skip_items to those cached lists; only
+        domains where current skips still cover every cached pending
+        slug are eligible for the skip. This guards against an operator
+        removing a notes.json skip between dry-run and execute.
+
+        Only active in execute mode. Disabled when --recheck-updates is set
+        (the caller wants a fresh inline check) or --no-skip-up-to-date is
+        set (operator override).
+
+        Multiple summaries may mention the same domain; the most recent
+        one wins. If the most-recent record has needs_update=true (or is
+        missing the flag — older summary file format), the domain is NOT
+        added to the returned mapping.
+        """
+        if not self.args.execute:
+            return {}
+        if getattr(self.args, "no_skip_up_to_date", False):
+            return {}
+        if getattr(self.args, "recheck_updates", False):
+            return {}
+        minutes = getattr(self.args, "skip_up_to_date_ttl", 0) or 0
+        if minutes <= 0:
+            return {}
+
+        cutoff = datetime.now(UTC) - timedelta(minutes=minutes)
+        # Per-domain latest record across BOTH dry-run and execute summaries.
+        # Execute entries are tracked only to *invalidate* an older dry-run
+        # for the same domain: if anything happened between the cached
+        # needs_update=false dry-run and now, we won't trust the cache.
+        # Result filter below keeps only domains whose most-recent record
+        # is a dry-run with needs_update=false AND a valid baseline.
+        latest_per_domain: dict[
+            str, tuple[datetime, str, bool | None, dict[str, Any] | None]
+        ] = {}
+        for path in sorted(self.args.log_dir.glob("wp-update-summary-*.json")):
+            stem_ts = path.stem.replace("wp-update-summary-", "", 1)
+            try:
+                run_dt = datetime.strptime(
+                    stem_ts, "%Y%m%dT%H%M%SZ"
+                ).replace(tzinfo=UTC)
+            except ValueError:
+                continue
+            if run_dt < cutoff:
+                continue
+            try:
+                data = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            mode = data.get("mode")
+            if mode not in ("dry-run", "execute"):
+                continue
+            sites = data.get("sites")
+            if not isinstance(sites, list):
+                continue
+            for entry in sites:
+                if not isinstance(entry, dict):
+                    continue
+                raw_domain = entry.get("domain")
+                if not raw_domain:
+                    continue
+                domain = _normalize_domain(str(raw_domain))
+                if not domain:
+                    continue
+                # Dry-run entries only count if baseline was actually
+                # collected — a site that errored out pre-baseline has no
+                # signal. Execute entries count regardless of outcome;
+                # they're only noted to supersede older dry-runs.
+                if mode == "dry-run" and entry.get("overall") != "dry-run":
+                    continue
+                needs = entry.get("needs_update")
+                baseline = entry.get("baseline")
+                if not isinstance(baseline, dict):
+                    baseline = None
+                existing = latest_per_domain.get(domain)
+                if existing is None or existing[0] < run_dt:
+                    latest_per_domain[domain] = (run_dt, mode, needs, baseline)
+
+        result: dict[str, dict[str, Any]] = {}
+        for domain, (_, mode, needs, baseline) in latest_per_domain.items():
+            # Only dry-run summaries qualify as cache hits. A newer execute
+            # summary (success, failed, or rolled-back) for the same domain
+            # invalidates any older dry-run within the TTL — see codex G4
+            # (mixed dry-run/execute history stale-skip hole).
+            if mode != "dry-run":
+                continue
+            if needs is not False:
+                continue
+            # Require a structurally-valid baseline. A dry-run that claims
+            # needs_update=false but has no/invalid baseline lists cannot
+            # validate skip-drift, so refuse the cache hit rather than
+            # degrade silently to empty pending lists (codex G2).
+            if baseline is None:
+                continue
+            plugins = baseline.get("plugin_updates")
+            themes = baseline.get("theme_updates")
+            core = baseline.get("core_updates")
+            if not (
+                isinstance(plugins, list)
+                and isinstance(themes, list)
+                and isinstance(core, list)
+            ):
+                continue
+            result[domain] = {
+                "pending_plugin_slugs": [
+                    (p.get("name") or "").strip()
+                    for p in plugins
+                    if isinstance(p, dict)
+                ],
+                "pending_theme_slugs": [
+                    (t.get("name") or "").strip()
+                    for t in themes
+                    if isinstance(t, dict)
+                ],
+                "core_count": len(core),
+            }
+        return result
 
     def _process_client_file(self, path: Path) -> None:
         """
@@ -650,6 +971,13 @@ class WPUpdater:
         except (OSError, json.JSONDecodeError) as exc:
             self.log.warning("SKIP  %s — unreadable: %s", path.name, exc)
             return
+
+        # Siteground per-domain inventory has a different shape (one site
+        # per file, no client_name/applications array). Translate it into
+        # the internal Cloudways-shaped dict so the rest of this method
+        # can stay schema-agnostic.
+        if is_siteground_doc(doc):
+            doc = siteground_to_internal_doc(doc)
 
         # Validate required top-level fields
         client_name = doc.get("client_name", "")
@@ -706,7 +1034,11 @@ class WPUpdater:
                 )
 
         for _idx, _app, report in validated:
-            if report.domain in self._recent_successes:
+            # Domain matching is normalized so inventory entries that differ
+            # only by scheme/www/case still hit the same cache rows that the
+            # dry-run wrote.
+            norm_domain = _normalize_domain(report.domain)
+            if norm_domain in self._recent_successes:
                 report.overall = "skipped"
                 report.failure_detail = (
                     f"already succeeded within last {self.args.skip_recent}h"
@@ -722,6 +1054,60 @@ class WPUpdater:
                 )
                 self.reports.append(report)
                 continue
+            cached = self._no_update_domains.get(norm_domain)
+            if cached is not None:
+                # Re-apply *current* skip rules to the cached pre-filter
+                # pending slugs. If current skips still cover every slug
+                # that had an update available at dry-run time, the cached
+                # decision is still valid. Otherwise — e.g. an operator
+                # just removed a skip — fall through and run the site.
+                current_skip_plugins = {
+                    (it.get("slug") or "").strip()
+                    for it in report.skip_items
+                    if (it.get("type") or "").strip().lower() == "plugin"
+                }
+                current_skip_themes = {
+                    (it.get("slug") or "").strip()
+                    for it in report.skip_items
+                    if (it.get("type") or "").strip().lower() == "theme"
+                }
+                still_pending_plugins = [
+                    s for s in cached["pending_plugin_slugs"]
+                    if s and s not in current_skip_plugins
+                ]
+                still_pending_themes = [
+                    s for s in cached["pending_theme_slugs"]
+                    if s and s not in current_skip_themes
+                ]
+                stale = bool(
+                    still_pending_plugins
+                    or still_pending_themes
+                    or cached["core_count"]
+                )
+                if not stale:
+                    report.overall = "skipped"
+                    report.needs_update = False
+                    report.failure_detail = (
+                        "no updates available in latest dry-run "
+                        f"(within {self.args.skip_up_to_date_ttl}m TTL)"
+                    )
+                    self._record_step(
+                        report, "up-to-date-skip", "skipped",
+                        "latest dry-run reported needs_update=false; "
+                        "use --recheck-updates or --no-skip-up-to-date to override",
+                    )
+                    self.log.info(
+                        "SKIP  %s — up to date per recent dry-run", report.domain,
+                    )
+                    self.reports.append(report)
+                    continue
+                # Notes/skip rules changed — log why we're NOT skipping.
+                self.log.info(
+                    "  up-to-date skip invalidated for %s — notes.json now "
+                    "leaves %d plugin / %d theme / %d core update(s) actionable",
+                    report.domain, len(still_pending_plugins),
+                    len(still_pending_themes), cached["core_count"],
+                )
             self.reports.append(report)
             self._process_site(report)
 
@@ -813,16 +1199,39 @@ class WPUpdater:
         sftp = app.get("sftp_credentials", {})
         flags = app.get("environment_flags", {})
 
+        # Provider marker is set on the doc by siteground_to_internal_doc()
+        # at load time, and propagated to the app entry. Cloudways files
+        # don't carry the marker; default to cloudways.
+        provider = (
+            (app.get("_provider") or doc.get("_provider") or "cloudways").lower()
+        )
+
+        # Disabled-in-inventory: Siteground inventory carries enabled=false
+        # for sites with DNS pointing elsewhere (edtec.com,
+        # foundationforseniorcare.org). Skip them with a clear reason.
+        if app.get("_enabled") is False:
+            reason = app.get("_skip_reason") or "disabled in inventory"
+            raise InventoryError(f"disabled: {reason}")
+
         if not domain or domain.startswith("["):
             raise InventoryError("missing website_domain")
-        if not VALID_PATH.match(wp_path):
-            raise InventoryError(f"invalid path_to_public_html: {wp_path!r}")
+
+        path_re = VALID_PATH_SG if provider == "siteground" else VALID_PATH
+        if not path_re.match(wp_path):
+            raise InventoryError(
+                f"invalid path_to_public_html for provider={provider}: {wp_path!r}"
+            )
         if not isinstance(sftp, dict):
             raise InventoryError("sftp_credentials is not an object")
         if not isinstance(flags, dict):
             raise InventoryError("environment_flags is not an object")
 
-        master_creds = doc.get("master_credentials", {})
+        master_creds = doc.get("master_credentials", {}) or {}
+        ssh_port = (
+            int(app.get("_ssh_port") or SITEGROUND_SSH_PORT)
+            if provider == "siteground"
+            else 22
+        )
 
         return SiteReport(
             client=doc["client_name"],
@@ -831,6 +1240,8 @@ class WPUpdater:
             wp_path=wp_path,
             is_staging=bool(flags.get("is_staging", False)),
             has_woocommerce=bool(flags.get("has_woocommerce", False)),
+            provider=provider,
+            ssh_port=ssh_port,
             ssh_user=resolve(sftp.get("username"), self.env) or self._ssh_user,
             ssh_password=resolve(sftp.get("password"), self.env) or self._app_pw,
             ssh_key_path=resolve(sftp.get("ssh_key"), self.env) or self._ssh_key,
@@ -872,6 +1283,29 @@ class WPUpdater:
 
             current_step = "baseline"
             self._step_collect_baseline(r)
+
+            # Default execute-mode behavior: once the inline baseline says
+            # nothing is pending for this site, bail out before the backup,
+            # update, and verify steps. The operator can disable this with
+            # --no-skip-up-to-date to force every site through the full
+            # mutation+verify path (e.g. for end-to-end smoke testing).
+            # (--recheck-updates still has effect upstream — it disables
+            # the summary-cache short-circuit so we always reach this
+            # point inline rather than skipping baseline collection.)
+            if (self.args.execute
+                    and r.needs_update is False
+                    and not getattr(self.args, "no_skip_up_to_date", False)):
+                self._record_step(
+                    r, "up-to-date-skip", "skipped",
+                    "inline baseline found no pending updates "
+                    "(use --no-skip-up-to-date to force a full run)",
+                )
+                r.overall = "skipped"
+                self.log.info(
+                    "SKIP  %s — inline baseline: no updates available",
+                    r.domain,
+                )
+                return
 
             current_step = "disk-check"
             self._step_disk_check(r)
@@ -932,14 +1366,25 @@ class WPUpdater:
                         self.log.info("Maintenance mode OFF  |  %s", r.domain)
                     except (SSHError, WPCliError) as exc:
                         # Don't re-raise: a redundant deactivate after wp-cli
-                        # already toggled it off is the common benign case.
-                        # But log so a real PHP fatal that prevents wp-cli
-                        # from booting isn't completely invisible —
-                        # final-verification will still catch it.
-                        self.log.warning(
-                            "Maintenance mode deactivate failed (continuing to verify): "
-                            "%s  |  %s", exc, r.domain,
-                        )
+                        # already toggled it off is the common benign case
+                        # (X/Pro theme self-disables maintenance mode after
+                        # its own update, so our later deactivate is a
+                        # no-op). Suppress that specific case to DEBUG;
+                        # surface anything else as a real warning so a PHP
+                        # fatal preventing wp-cli from booting isn't
+                        # invisible — final-verification will still catch
+                        # it either way.
+                        if _is_already_deactivated(exc):
+                            self.log.debug(
+                                "Maintenance mode was already off (wp-cli "
+                                "self-disabled during an update)  |  %s",
+                                r.domain,
+                            )
+                        else:
+                            self.log.warning(
+                                "Maintenance mode deactivate failed (continuing to verify): "
+                                "%s  |  %s", exc, r.domain,
+                            )
 
             # --- Final verification ---
             current_step = "final-verification"
@@ -948,6 +1393,13 @@ class WPUpdater:
                               "site healthy after all updates")
 
             r.overall = "success"
+            # Baseline set needs_update from the *pre-update* state. After a
+            # successful execute that state is stale — everything pending was
+            # applied — so flip it to reflect post-update reality. Failed and
+            # rolled-back paths intentionally keep the original True/False so
+            # downstream readers can see what was outstanding at the time of
+            # the failure.
+            r.needs_update = False
             self.log.info("✓ SUCCESS  |  %s", r.domain)
 
             if r.backup_dir:
@@ -1016,7 +1468,7 @@ class WPUpdater:
         """
         Establish SSH connectivity and verify WordPress is installed.
 
-        Three-tier auth cascade:
+        On Cloudways, runs a three-tier auth cascade:
           1. SSH key + each candidate app-scoped user (wpupdates,
              wpupdates-stage, wpupdates-2, ...) until one succeeds.
           2. SSH key + master username — same key, but the master user has
@@ -1024,13 +1476,30 @@ class WPUpdater:
           3. sshpass + master password — last resort when the key isn't
              authorized for the master user.
 
-        When master fallback is used (tier 2 or 3), r.auth_method is set to
-        "master" so downstream steps know to capture and restore file
-        ownership after mutations. r.auth_user is always populated with the
-        username that actually authenticated.
+        On Siteground, the cascade is skipped — SG has no master concept;
+        each domain is its own user owning its own files, key auth only.
+
+        When master fallback is used on Cloudways (tier 2 or 3), r.auth_method
+        is set to "master" so downstream steps know to capture and restore
+        file ownership after mutations. r.auth_user is always populated with
+        the username that actually authenticated.
         """
         t0 = ts()
         r.auth_method = "key"
+
+        # Siteground: single-tier key auth with the inventory's SSH user.
+        # No master fallback — falling through to tier 2/3 would just
+        # produce confusing "no master_user" errors.
+        if r.provider == "siteground":
+            self._ssh(r, "echo 'ssh-ok'")
+            self._wp(r, "core is-installed")
+            r.auth_user = r.ssh_user
+            self._record_step(
+                r, "ssh-preflight", "success",
+                f"SSH reachable at {r.server_ip}:{r.ssh_port} as {r.ssh_user} "
+                "(siteground, auth=key)", t0,
+            )
+            return
 
         # --- Tier 1: SSH key + app-scoped candidates ---
         #
@@ -1193,6 +1662,27 @@ class WPUpdater:
                     "version": p.get("version", "?"),
                 })
 
+        # Detect active plugin capabilities. Only active plugins drive
+        # behavior — an installed-but-deactivated cache plugin doesn't
+        # serve cached pages. First match wins per category; we don't
+        # try to compose multiple cache plugins (a misconfiguration we
+        # log but don't try to repair).
+        caps = SiteCapabilities()
+        for p in plugins:
+            if (p.get("status", "") or "").lower() != "active":
+                continue
+            slug = p.get("name", "")
+            if not caps.backup_plugin and slug in KNOWN_BACKUP_PLUGINS:
+                caps.backup_plugin = KNOWN_BACKUP_PLUGINS[slug]
+            if not caps.cache_plugin and slug in KNOWN_CACHE_PLUGINS:
+                label, flush_cmd = KNOWN_CACHE_PLUGINS[slug]
+                caps.cache_plugin = label
+                caps.cache_flush_cmd = flush_cmd
+        r.capabilities = caps
+        if caps.cache_plugin:
+            self.log.info("  Cache plugin detected: %s  |  %s",
+                          caps.cache_plugin, r.domain)
+
         r.baseline = {
             "wp_version": self._wp_text(r, "core version"),
             "php_version": self._wp_text(r, "eval 'echo PHP_VERSION;'"),
@@ -1205,11 +1695,20 @@ class WPUpdater:
             "backup_plugins": backup_plugins,
         }
 
+        pending = baseline_pending_updates(r.baseline, r.skip_items)
+        r.needs_update = bool(pending["core"] or pending["plugins"] or pending["themes"])
+        r.baseline["pending_after_skips"] = {
+            "core": len(pending["core"]),
+            "plugin_slugs": [p.get("name", "") for p in pending["plugins"]],
+            "theme_slugs": [t.get("name", "") for t in pending["themes"]],
+        }
+
         self._record_step(
             r, "baseline", "success",
             f"WP {r.baseline['wp_version']}  |  "
             f"{len(r.baseline['plugin_updates'])} plugin updates  |  "
-            f"{len(r.baseline['theme_updates'])} theme updates",
+            f"{len(r.baseline['theme_updates'])} theme updates"
+            + ("  |  needs_update=true" if r.needs_update else "  |  up to date"),
             t0,
         )
 
@@ -1283,13 +1782,20 @@ echo "${{du_bytes:-0}} ${{avail_bytes:-0}}"
     def _step_backup(self, r: SiteReport) -> None:
         t0 = ts()
 
-        # Extract the application hash from the path:
-        # /home/master/applications/<hash>/public_html → <hash>
-        app_hash = r.wp_path.split("/")[-2]
-        backup_dir = (
-            f"/home/master/applications/{app_hash}/private_html"
-            f"/wp-maintenance-backups/{self.run_id}"
-        )
+        # Backup destination is provider-specific:
+        # - Cloudways: under the app's private_html sibling (sibling of public_html).
+        # - Siteground: ~/wp-maintenance-backups/<run_id>/ on the user's home.
+        #   No /private_html exists; ~/tmp is server-shared (root-owned, sticky).
+        if r.provider == "siteground":
+            backup_dir = f"$HOME/wp-maintenance-backups/{self.run_id}"
+        else:
+            # Extract the application hash from the path:
+            # /home/master/applications/<hash>/public_html → <hash>
+            app_hash = r.wp_path.split("/")[-2]
+            backup_dir = (
+                f"/home/master/applications/{app_hash}/private_html"
+                f"/wp-maintenance-backups/{self.run_id}"
+            )
         r.backup_dir = backup_dir
 
         if not self.args.execute:
@@ -1517,6 +2023,14 @@ echo 'backup-ok'
             # Prefer the post-update version reported by wp-cli, fall back
             # to the baseline's target version.
             ver_to_reported = result.get("version") or ver_to or "?"
+
+            # Flush page/object cache before verify so the HTTP check sees
+            # post-update content, not a stale cached error page from
+            # before the fix. This is the highest-leverage win for sites
+            # behind aggressive page-cache plugins (LiteSpeed, WP Rocket,
+            # SG Optimizer) — those caches outlive the actual update and
+            # produce false-positive verify failures.
+            self._flush_cache(r, slug)
 
             # Always verify after the update attempt — this is the oracle
             # that decides whether the site still works.
@@ -1889,6 +2403,20 @@ echo 'rollback-ok'
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", f"ConnectTimeout={self.args.connect_timeout}",
         ]
+        # Reuse one TCP+auth handshake for every command to the same host.
+        # Without this, a slow Cloudways host (e.g. PAM/reverse-DNS stalls)
+        # makes every wp-cli call pay a fresh-connection penalty (60-120s
+        # observed on 45.76.170.254 during a sick-host incident).
+        if not self.args.no_ssh_mux:
+            common_opts.extend([
+                "-o", "ControlMaster=auto",
+                "-o", "ControlPath=~/.ssh/cm-%C",
+                "-o", f"ControlPersist={self.args.ssh_mux_persist}",
+            ])
+        # Siteground requires port 18765; Cloudways uses default 22.
+        # Pass -p only when non-default to keep ssh argv minimal on CW.
+        if r.ssh_port and r.ssh_port != 22:
+            common_opts.extend(["-p", str(r.ssh_port)])
 
         # load_env already expanded ~ in any path read from .env, so this
         # is just a typesafe Path() coercion.
@@ -1966,6 +2494,27 @@ echo 'rollback-ok'
             return json.loads(raw)
         except json.JSONDecodeError as exc:
             raise WPCliError(f"Bad JSON from `wp {wp_cmd}`: {exc}") from exc
+
+    def _flush_cache(self, r: SiteReport, after_slug: str) -> None:
+        """Flush page+object cache after a plugin update.
+
+        Uses the capability-mapped command when a known cache plugin is
+        active; otherwise runs `wp cache flush` (WP core object cache,
+        always available even without a cache plugin).
+
+        Failures are logged and swallowed — a flush failure must never
+        fail the plugin update step. Stale cache after one update is a
+        soft regression; a verify failure on the NEXT update is the hard
+        one we're protecting against.
+        """
+        caps = r.capabilities
+        flush_cmd = (caps.cache_flush_cmd
+                     if caps and caps.cache_flush_cmd else "cache flush")
+        try:
+            self._wp(r, flush_cmd, timeout=self.args.remote_timeout)
+        except (SSHError, WPCliError) as exc:
+            self.log.info("  ⤼ cache flush after %s skipped: %s  |  %s",
+                          after_slug, exc, r.domain)
 
     # ------------------------------------------------------------------
     # Step recording
@@ -2291,14 +2840,28 @@ echo 'rollback-ok'
             }.get(r.overall, "?")
 
             extra = ""
-            if r.overall == "skipped" and r.has_woocommerce:
+            # Branch order matters: the pre-flight up-to-date skip fires
+            # BEFORE the WooCommerce gate in _process_site, so for a
+            # WooCommerce + up-to-date site the real reason for the skip
+            # is "no updates available", not "WooCommerce — manual review".
+            # Check needs_update=False first so the glyph reflects reality.
+            if r.overall == "skipped" and r.needs_update is False:
+                extra = "  [up to date — skipped]"
+            elif r.overall == "skipped" and r.has_woocommerce:
                 extra = "  [WooCommerce — manual review]"
             elif r.overall in ("failed", "rolled-back"):
                 extra = f"  [failed at: {r.failure_step}]"
             elif r.overall == "dry-run":
                 conf = r.baseline.get("confidence", {})
+                bits = []
                 if conf:
-                    extra = f"  [{conf['grade']} {conf['score']}/100]"
+                    bits.append(f"{conf['grade']} {conf['score']}/100")
+                if r.needs_update is True:
+                    bits.append("needs update")
+                elif r.needs_update is False:
+                    bits.append("up to date")
+                if bits:
+                    extra = "  [" + " · ".join(bits) + "]"
 
             self.log.info(
                 "  %s  %-11s  %-25s  %s%s",
@@ -2332,7 +2895,20 @@ def build_cli() -> argparse.Namespace:
     )
     p.add_argument(
         "--clients-dir", type=Path, default=DEFAULT_CLIENTS,
-        help=f"Directory with *_cloudways.json files (default: {DEFAULT_CLIENTS})",
+        help=(
+            "Directory with *_cloudways.json or *_siteground.json files "
+            f"(default: {DEFAULT_CLIENTS})"
+        ),
+    )
+    p.add_argument(
+        "--provider", choices=("auto", "cloudways", "siteground"),
+        default="auto",
+        help=(
+            "Filter which provider's client files to process when scanning "
+            "--clients-dir. 'auto' (default) processes both. Per-file "
+            "schema detection still drives runtime behavior; this only "
+            "affects the file glob."
+        ),
     )
     p.add_argument(
         "--client-file", type=Path, action="append", default=None,
@@ -2374,6 +2950,17 @@ def build_cli() -> argparse.Namespace:
         help="SSH connection timeout in seconds (default: 20).",
     )
     p.add_argument(
+        "--no-ssh-mux", action="store_true",
+        help="Disable SSH connection multiplexing (ControlMaster). Each "
+             "command will open a fresh TCP+auth handshake — slower, "
+             "especially on hosts where sshd login is slow.",
+    )
+    p.add_argument(
+        "--ssh-mux-persist", default="5m",
+        help="ControlPersist duration for SSH multiplexing (default: 5m). "
+             "Master connection lingers this long after last use.",
+    )
+    p.add_argument(
         "--remote-timeout", type=int, default=600,
         help="Per-command remote execution timeout in seconds (default: 600).",
     )
@@ -2397,6 +2984,28 @@ def build_cli() -> argparse.Namespace:
         "--no-db", action="store_true",
         help="Disable DB integration entirely (no dedupe via DB, no ingest "
              "at end of run). --skip-recent falls back to log scanning.",
+    )
+    p.add_argument(
+        "--skip-up-to-date-ttl", type=int, default=60, metavar="MINUTES",
+        help="In execute mode, skip sites whose latest dry-run summary "
+             "(within the last N minutes) reported needs_update=false. "
+             "Default: 60. Set to 0 to disable summary-driven skipping. "
+             "Stale summaries are ignored — only sites with a fresh "
+             "dry-run inside the TTL are eligible for the skip.",
+    )
+    p.add_argument(
+        "--no-skip-up-to-date", action="store_true",
+        help="Disable summary-driven 'no updates available' skipping for "
+             "this run. Equivalent to --skip-up-to-date-ttl 0 but kept "
+             "as an explicit flag for clarity in run logs.",
+    )
+    p.add_argument(
+        "--recheck-updates", action="store_true",
+        help="In execute mode, ignore prior dry-run summaries and instead "
+             "SSH into each site, collect a fresh baseline, then skip if "
+             "no core/theme/plugin update is available. Costs one round "
+             "of WP-CLI calls per site but is always current. Useful "
+             "when you don't trust the most recent dry-run.",
     )
     p.add_argument(
         "--max-consecutive-failures", type=int, default=3,

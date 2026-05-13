@@ -139,11 +139,12 @@ def test_manual_payload_to_client_uses_env_placeholders() -> None:
     assert app["environment_flags"]["has_woocommerce"] is True
 
 
-def test_local_command_defaults_to_dry_run_and_stream() -> None:
+def test_local_command_defaults_to_dry_run_and_info_stream() -> None:
     command = webui.build_local_command({"clientFile": "example-client_cloudways.json"})
 
     assert command[:2] == [sys.executable, str(webui.SCRIPT_PATH)]
-    assert "--stream" in command
+    # Default: stdout is INFO-level only. --stream upgrades it to DEBUG.
+    assert "--stream" not in command
     assert "--execute" not in command
     # Path resolution walks both flat and per-client subdir layouts; pin the
     # assertion to whatever resolve_client_file returns (or the flat fallback
@@ -172,6 +173,51 @@ def test_local_command_adds_execute_and_woocommerce_flags() -> None:
 
     assert "--execute" in command
     assert "--include-woocommerce" in command
+
+
+def test_local_command_forwards_recheck_updates_flag() -> None:
+    command = webui.build_local_command({"execute": True, "recheckUpdates": True})
+    assert "--recheck-updates" in command
+
+
+def test_local_command_forwards_no_skip_up_to_date_flag() -> None:
+    command = webui.build_local_command({"execute": True, "noSkipUpToDate": True})
+    assert "--no-skip-up-to-date" in command
+
+
+def test_local_command_forwards_skip_up_to_date_ttl_value() -> None:
+    command = webui.build_local_command({"execute": True, "skipUpToDateTtl": 120})
+    # Flag + value must be adjacent and pass through as an int-string.
+    idx = command.index("--skip-up-to-date-ttl")
+    assert command[idx + 1] == "120"
+
+
+def test_local_command_forwards_ttl_zero_to_disable_cache() -> None:
+    """TTL=0 is the persistent kill-switch for the up-to-date cache; must
+    survive the int-conversion path (string '0' is truthy but value 0)."""
+    command = webui.build_local_command({"execute": True, "skipUpToDateTtl": "0"})
+    idx = command.index("--skip-up-to-date-ttl")
+    assert command[idx + 1] == "0"
+
+
+def test_local_command_skips_ttl_when_blank() -> None:
+    """Empty TTL field means 'use CLI default' — don't forward the flag."""
+    command = webui.build_local_command({"execute": True, "skipUpToDateTtl": ""})
+    assert "--skip-up-to-date-ttl" not in command
+
+
+def test_local_command_skips_ttl_when_unparseable() -> None:
+    """Garbage in the TTL field shouldn't crash the run-builder."""
+    command = webui.build_local_command({"execute": True, "skipUpToDateTtl": "abc"})
+    assert "--skip-up-to-date-ttl" not in command
+
+
+def test_local_command_omits_up_to_date_flags_by_default() -> None:
+    """No checkboxes ticked → none of the three flags forwarded."""
+    command = webui.build_local_command({"execute": True})
+    assert "--recheck-updates" not in command
+    assert "--no-skip-up-to-date" not in command
+    assert "--skip-up-to-date-ttl" not in command
 
 
 def test_local_command_supports_multiple_client_files() -> None:
@@ -215,7 +261,7 @@ def test_remote_command_wraps_streaming_script_with_ssh() -> None:
     assert command[:7] == ["ssh", "-p", "22", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new"]
     assert "-i" in command
     assert "deploy@203.0.113.30" in command
-    assert command[-1] == "cd /srv/maintenance && exec python3 wp_update.py --stream --execute"
+    assert command[-1] == "cd /srv/maintenance && exec python3 wp_update.py --execute"
 
 
 def test_remote_command_uses_repo_relative_client_file() -> None:
@@ -238,20 +284,62 @@ def test_remote_command_uses_repo_relative_client_file() -> None:
     resolved = webui.resolve_client_file("example-client_cloudways.json")
     if resolved is not None:
         rel = resolved.relative_to(webui.CLIENTS_DIR).as_posix()
-        expected = f"wp_update.py --stream --client-file clients/{rel}"
+        expected = f"wp_update.py --client-file clients/{rel}"
     else:
         expected = (
-            "wp_update.py --stream --client-file clients/example-client_cloudways.json"
+            "wp_update.py --client-file clients/example-client_cloudways.json"
         )
     assert command[-1].endswith(expected)
 
 
+def test_stream_debug_checkbox_adds_stream_flag() -> None:
+    command = webui.build_local_command(
+        {"clientFile": "example-client_cloudways.json", "streamDebug": True}
+    )
+    assert "--stream" in command
+
+
 def test_start_run_rejects_provider_without_runner() -> None:
-    with pytest.raises(ValueError, match="Siteground does not have a runner configured yet"):
+    with pytest.raises(ValueError, match="Cloudron does not have a runner configured yet"):
         webui.start_run(
-            {"provider": "Siteground"},
+            {"provider": "Cloudron"},
             webui.Settings(password="pw", secret="secret"),
         )
+
+
+def test_build_wp_args_propagates_siteground_provider() -> None:
+    args = webui.build_wp_args({"provider": "Siteground"})
+    assert "--provider" in args
+    assert args[args.index("--provider") + 1] == "siteground"
+
+
+def test_validate_client_doc_accepts_siteground_inventory_schema() -> None:
+    doc = {
+        "schema": "siteground_wp_cli_inventory_v1",
+        "provider": "siteground",
+        "domain": "bentonwebs.com",
+        "client_name": "bentonwebs.com",
+        "ssh": {
+            "host": "gtxm1093.siteground.biz",
+            "user": "u187-p647nunebt8c",
+            "port": 18765,
+            "key_env": "SSH_KEY_SG",
+        },
+        "wordpress": {"path": "/home/u187-p647nunebt8c/www/bentonwebs.com/public_html"},
+    }
+    assert webui.validate_client_doc(doc) == []
+
+
+def test_validate_client_doc_rejects_malformed_siteground_schema() -> None:
+    doc = {
+        "schema": "siteground_wp_cli_inventory_v1",
+        "domain": "x.com",
+        "ssh": {"host": "h"},  # missing user
+        "wordpress": {"path": "/var/www/html"},  # wrong shape
+    }
+    errors = webui.validate_client_doc(doc)
+    assert any("ssh.user" in e for e in errors)
+    assert any("Siteground public_html path" in e for e in errors)
 
 
 @pytest.fixture()

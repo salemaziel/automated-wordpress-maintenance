@@ -32,9 +32,14 @@ def make_args(
         ssh_config=Path("/dev/null"),
         ssh_key=None,
         connect_timeout=20,
+        no_ssh_mux=True,
+        ssh_mux_persist="5m",
         remote_timeout=600,
         http_timeout=20,
         max_consecutive_failures=3,
+        skip_up_to_date_ttl=60,
+        no_skip_up_to_date=False,
+        recheck_updates=False,
         stream=False,
     )
 
@@ -226,6 +231,43 @@ def test_ssh_command_bypasses_system_config_by_default(tmp_path: Path) -> None:
     assert command[:3] == ["ssh", "-F", "/dev/null"]
     assert "-o" in command
     assert "BatchMode=yes" in command
+
+
+def test_ssh_command_includes_controlmaster_when_mux_enabled(tmp_path: Path) -> None:
+    args = make_args(tmp_path)
+    args.no_ssh_mux = False  # explicit override: real default is mux ON
+    ssh_key = tmp_path / "id_rsa"
+    ssh_key.write_text("dummy-key")
+    updater = wp_update.WPUpdater(args)
+    report = make_report(
+        ssh_user="wpupdates-stage",
+        ssh_key_path=str(ssh_key),
+    )
+
+    command, _ = updater._ssh_cmd(report)
+    joined = " ".join(command)
+
+    assert "ControlMaster=auto" in joined
+    assert "ControlPath=~/.ssh/cm-%C" in joined
+    assert "ControlPersist=5m" in joined
+
+
+def test_ssh_command_omits_controlmaster_when_mux_disabled(tmp_path: Path) -> None:
+    args = make_args(tmp_path)  # fixture sets no_ssh_mux=True
+    ssh_key = tmp_path / "id_rsa"
+    ssh_key.write_text("dummy-key")
+    updater = wp_update.WPUpdater(args)
+    report = make_report(
+        ssh_user="wpupdates-stage",
+        ssh_key_path=str(ssh_key),
+    )
+
+    command, _ = updater._ssh_cmd(report)
+    joined = " ".join(command)
+
+    assert "ControlMaster" not in joined
+    assert "ControlPath" not in joined
+    assert "ControlPersist" not in joined
 
 
 def test_compute_confidence_returns_full_score_when_nothing_needs_updates(tmp_path: Path) -> None:
@@ -683,6 +725,31 @@ def test_step_rollback_success_constructs_correct_script(tmp_path: Path) -> None
     assert "tar -xzf" in script_text
 
 
+def test_step_rollback_script_preserves_distinct_exit_codes(tmp_path: Path) -> None:
+    # Each guard in the rollback script exits with a distinct code so logs
+    # can pinpoint which defense-in-depth check fired. Refactors that move
+    # the heredoc into a constant must keep these codes intact.
+    updater = wp_update.WPUpdater(make_args(tmp_path))
+    r = make_report(
+        backup_dir="/home/master/wp-maintenance-backups/example-client/example.com/run01",
+        auth_method="key",
+    )
+
+    captured_scripts = []
+
+    def fake_ssh(report, script, timeout=None):  # noqa: ANN001
+        captured_scripts.append(script)
+        return "rollback-ok"
+
+    with patch.object(updater, "_ssh", side_effect=fake_ssh), \
+         patch.object(updater, "_verify", return_value=None):
+        updater._step_rollback(r)
+
+    script_text = captured_scripts[0]
+    for code in ("exit 99", "exit 98", "exit 97", "exit 96"):
+        assert code in script_text, f"rollback script missing {code}"
+
+
 def test_step_rollback_failure_raises_and_sets_failed_state(tmp_path: Path) -> None:
     updater = wp_update.WPUpdater(make_args(tmp_path))
     r = make_report(
@@ -986,6 +1053,7 @@ def test_step_update_plugins_success_continues(tmp_path: Path) -> None:
     with (
         patch.object(updater, "_run_plugin_update_structured", side_effect=fake_structured),
         patch.object(updater, "_verify") as mock_verify,
+        patch.object(updater, "_flush_cache"),
         patch.object(updater, "_wp") as mock_wp,
     ):
         updater._step_update_plugins(r)
@@ -1022,6 +1090,7 @@ def test_step_update_plugins_non_fatal_error_skips(tmp_path: Path) -> None:
     with (
         patch.object(updater, "_run_plugin_update_structured", side_effect=fake_structured),
         patch.object(updater, "_verify"),  # always passes
+        patch.object(updater, "_flush_cache"),
         patch.object(updater, "_wp") as mock_wp,
     ):
         updater._step_update_plugins(r)  # must not raise
@@ -1145,6 +1214,162 @@ def test_step_update_plugins_verify_called_after_each(tmp_path: Path) -> None:
     assert mock_verify.call_count == len(slugs)
 
 
+# ---------------------------------------------------------------------------
+# Capability detection + cache flush (A7)
+# ---------------------------------------------------------------------------
+
+def _baseline_with_plugins(updater: wp_update.WPUpdater,
+                           r: wp_update.SiteReport,
+                           plugins: list[dict]) -> None:
+    """Run _step_collect_baseline against canned wp-cli responses."""
+    def fake_json(report: wp_update.SiteReport, cmd: str,
+                  allow_empty: bool = False) -> list[dict]:
+        if cmd.startswith("plugin list"):
+            return plugins
+        return []
+    with (
+        patch.object(updater, "_wp_json", side_effect=fake_json),
+        patch.object(updater, "_wp_text", return_value="x"),
+    ):
+        updater._step_collect_baseline(r)
+
+
+def test_capabilities_detect_active_cache_plugin(tmp_path: Path) -> None:
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    _baseline_with_plugins(updater, r, [
+        {"name": "litespeed-cache", "status": "active", "version": "5.0"},
+        {"name": "akismet",         "status": "active", "version": "5.0"},
+    ])
+    assert r.capabilities is not None
+    assert r.capabilities.cache_plugin == "LiteSpeed Cache"
+    assert r.capabilities.cache_flush_cmd == "litespeed-purge all"
+
+
+def test_capabilities_ignore_inactive_cache_plugin(tmp_path: Path) -> None:
+    # An installed-but-deactivated cache plugin doesn't serve cached pages,
+    # so capability detection must skip it.
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    _baseline_with_plugins(updater, r, [
+        {"name": "wp-rocket", "status": "inactive", "version": "3.0"},
+    ])
+    assert r.capabilities is not None
+    assert r.capabilities.cache_plugin == ""
+    assert r.capabilities.cache_flush_cmd == ""
+
+
+def test_capabilities_detect_active_backup_plugin(tmp_path: Path) -> None:
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    _baseline_with_plugins(updater, r, [
+        {"name": "updraftplus", "status": "active", "version": "1.0"},
+    ])
+    assert r.capabilities is not None
+    assert r.capabilities.backup_plugin == "UpdraftPlus"
+
+
+def test_capabilities_none_when_no_known_plugins(tmp_path: Path) -> None:
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    _baseline_with_plugins(updater, r, [
+        {"name": "akismet", "status": "active", "version": "5.0"},
+    ])
+    assert r.capabilities is not None
+    assert r.capabilities.cache_plugin == ""
+    assert r.capabilities.backup_plugin == ""
+
+
+def test_flush_cache_uses_capability_command(tmp_path: Path) -> None:
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    r.capabilities = wp_update.SiteCapabilities(
+        cache_plugin="LiteSpeed Cache",
+        cache_flush_cmd="litespeed-purge all",
+    )
+    with patch.object(updater, "_wp", return_value="ok") as mock_wp:
+        updater._flush_cache(r, "some-plugin")
+    mock_wp.assert_called_once()
+    assert mock_wp.call_args.args[1] == "litespeed-purge all"
+
+
+def test_flush_cache_falls_back_when_no_capability(tmp_path: Path) -> None:
+    # No cache plugin detected → use WP core's "wp cache flush" (always
+    # available, flushes the object cache even with no page-cache plugin).
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    r.capabilities = None
+    with patch.object(updater, "_wp", return_value="ok") as mock_wp:
+        updater._flush_cache(r, "some-plugin")
+    mock_wp.assert_called_once()
+    assert mock_wp.call_args.args[1] == "cache flush"
+
+
+def test_flush_cache_falls_back_when_capability_has_no_cmd(tmp_path: Path) -> None:
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    r.capabilities = wp_update.SiteCapabilities()  # all empty
+    with patch.object(updater, "_wp", return_value="ok") as mock_wp:
+        updater._flush_cache(r, "some-plugin")
+    assert mock_wp.call_args.args[1] == "cache flush"
+
+
+def test_flush_cache_swallows_ssh_failure(tmp_path: Path) -> None:
+    # A flush failure must never fail the plugin update step.
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    with patch.object(updater, "_wp",
+                      side_effect=wp_update.SSHError("connection lost")):
+        updater._flush_cache(r, "some-plugin")  # must not raise
+
+
+def test_step_update_plugins_calls_flush_before_verify(tmp_path: Path) -> None:
+    # Cache flush must run BEFORE verify so the HTTP check sees post-update
+    # content, not a stale cached error page.
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    r.baseline = {
+        "plugin_updates": [
+            {"name": "plugin-a", "version": "1.0", "update_version": "2.0"},
+        ]
+    }
+    call_order: list[str] = []
+
+    with (
+        patch.object(updater, "_run_plugin_update_structured",
+                     return_value={"name": "plugin-a", "status": "Updated"}),
+        patch.object(updater, "_flush_cache",
+                     side_effect=lambda rep, slug: call_order.append("flush")),
+        patch.object(updater, "_verify",
+                     side_effect=lambda rep: call_order.append("verify")),
+    ):
+        updater._step_update_plugins(r)
+
+    assert call_order == ["flush", "verify"]
+
+
+def test_site_report_to_dict_serializes_capabilities() -> None:
+    r = wp_update.SiteReport(
+        client="x", domain="x", server_ip="x", wp_path="x",
+        is_staging=False, has_woocommerce=False,
+    )
+    r.capabilities = wp_update.SiteCapabilities(
+        cache_plugin="WP Rocket",
+        cache_flush_cmd="rocket clean --confirm",
+    )
+    d = r.to_dict()
+    assert d["capabilities"]["cache_plugin"] == "WP Rocket"
+    assert d["capabilities"]["cache_flush_cmd"] == "rocket clean --confirm"
+
+
+def test_site_report_to_dict_capabilities_none_when_unset() -> None:
+    r = wp_update.SiteReport(
+        client="x", domain="x", server_ip="x", wp_path="x",
+        is_staging=False, has_woocommerce=False,
+    )
+    assert r.to_dict()["capabilities"] is None
+
+
 def test_extract_plugin_error_prefers_message(tmp_path: Path) -> None:
     assert wp_update._extract_plugin_error(
         {"name": "x", "status": "Error", "message": "license expired"}
@@ -1244,3 +1469,649 @@ def test_to_dict_includes_skip_items() -> None:
     assert report.to_dict()["skip_items"] == [
         {"type": "plugin", "slug": "ninja-forms", "reason": "PHP 8"}
     ]
+
+
+def test_is_already_deactivated_matches_wpcli_message() -> None:
+    """The exact wp-cli error string from a redundant deactivate is suppressed."""
+    err = wp_update.WPCliError(
+        "exit=1 on wpupdates@host: Error: Maintenance mode already deactivated."
+    )
+    assert wp_update._is_already_deactivated(err) is True
+
+
+def test_is_already_deactivated_is_case_insensitive() -> None:
+    err = wp_update.SSHError("ALREADY DEACTIVATED")
+    assert wp_update._is_already_deactivated(err) is True
+
+
+def test_is_already_deactivated_rejects_real_failures() -> None:
+    """A genuine wp-cli boot failure must still surface as a warning."""
+    err = wp_update.SSHError("PHP Fatal error: cannot bootstrap wp-cli")
+    assert wp_update._is_already_deactivated(err) is False
+    err2 = wp_update.WPCliError("Error: This does not seem to be a WordPress installation.")
+    assert wp_update._is_already_deactivated(err2) is False
+
+
+# ---------------------------------------------------------------------------
+# needs_update / summary-driven "up to date" skip + inline recheck
+# ---------------------------------------------------------------------------
+
+def test_baseline_pending_updates_filters_skipped_plugin_slugs() -> None:
+    baseline = {
+        "core_updates": [],
+        "plugin_updates": [
+            {"name": "ninja-forms", "update": "available"},
+            {"name": "akismet",     "update": "available"},
+        ],
+        "theme_updates": [],
+    }
+    skip_items = [{"type": "plugin", "slug": "ninja-forms"}]
+    pending = wp_update.baseline_pending_updates(baseline, skip_items)
+    assert [p["name"] for p in pending["plugins"]] == ["akismet"]
+    assert pending["themes"] == []
+    assert pending["core"] == []
+
+
+def test_baseline_pending_updates_empty_when_only_skipped_have_updates() -> None:
+    baseline = {
+        "core_updates": [],
+        "plugin_updates": [{"name": "ninja-forms", "update": "available"}],
+        "theme_updates": [],
+    }
+    pending = wp_update.baseline_pending_updates(
+        baseline, [{"type": "plugin", "slug": "ninja-forms"}]
+    )
+    assert pending["core"] == [] and pending["plugins"] == [] and pending["themes"] == []
+
+
+def test_step_collect_baseline_sets_needs_update_true(tmp_path: Path) -> None:
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    _baseline_with_plugins(updater, r, [
+        {"name": "akismet", "status": "active", "version": "5.0",
+         "update": "available"},
+    ])
+    assert r.needs_update is True
+
+
+def test_step_collect_baseline_sets_needs_update_false_when_clean(tmp_path: Path) -> None:
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    _baseline_with_plugins(updater, r, [
+        {"name": "akismet", "status": "active", "version": "5.0"},
+    ])
+    assert r.needs_update is False
+
+
+def test_site_report_to_dict_includes_needs_update() -> None:
+    r = make_report()
+    r.needs_update = False
+    assert r.to_dict()["needs_update"] is False
+
+
+def _make_args_with_skip_flags(
+    tmp_path: Path, *, execute: bool, ttl: int = 60,
+    no_skip: bool = False, recheck: bool = False,
+) -> argparse.Namespace:
+    args = make_args(tmp_path, execute=execute)
+    args.skip_up_to_date_ttl = ttl
+    args.no_skip_up_to_date = no_skip
+    args.recheck_updates = recheck
+    return args
+
+
+def _write_dry_run_summary(
+    log_dir: Path, run_id: str, domain: str, needs_update: bool | None,
+) -> None:
+    log_dir.mkdir(parents=True, exist_ok=True)
+    # Match what _step_collect_baseline actually writes: an empty-but-typed
+    # baseline. The loader requires this structure to trust a needs_update=
+    # false cache hit (G2 guard against missing-baseline silent degrade).
+    site_entry = {
+        "domain": domain,
+        "overall": "dry-run",
+        "baseline": {
+            "core_updates": [],
+            "plugin_updates": [],
+            "theme_updates": [],
+        },
+    }
+    if needs_update is not None:
+        site_entry["needs_update"] = needs_update
+    payload = {
+        "run_id": run_id,
+        "mode": "dry-run",
+        "generated_at": "2026-05-12T00:00:00+00:00",
+        "sites": [site_entry],
+    }
+    (log_dir / f"wp-update-summary-{run_id}.json").write_text(json.dumps(payload))
+
+
+def test_load_no_update_domains_picks_up_recent_dry_run_with_false(tmp_path: Path) -> None:
+    args = _make_args_with_skip_flags(tmp_path, execute=True)
+    args.env_file.write_text("SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=pw\n")
+    fresh = wp_update.datetime.now(wp_update.UTC).strftime("%Y%m%dT%H%M%SZ")
+    _write_dry_run_summary(args.log_dir, fresh, "fresh.example.com", False)
+    updater = wp_update.WPUpdater(args)
+    assert "fresh.example.com" in updater._no_update_domains
+
+
+def test_load_no_update_domains_ignores_stale_summary(tmp_path: Path) -> None:
+    args = _make_args_with_skip_flags(tmp_path, execute=True, ttl=30)
+    args.env_file.write_text("SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=pw\n")
+    # Two hours ago — well outside any sensible TTL we use in tests
+    old = (wp_update.datetime.now(wp_update.UTC)
+           - wp_update.timedelta(hours=2)).strftime("%Y%m%dT%H%M%SZ")
+    _write_dry_run_summary(args.log_dir, old, "old.example.com", False)
+    updater = wp_update.WPUpdater(args)
+    assert "old.example.com" not in updater._no_update_domains
+
+
+def test_load_no_update_domains_skips_sites_with_pending_updates(tmp_path: Path) -> None:
+    args = _make_args_with_skip_flags(tmp_path, execute=True)
+    args.env_file.write_text("SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=pw\n")
+    fresh = wp_update.datetime.now(wp_update.UTC).strftime("%Y%m%dT%H%M%SZ")
+    _write_dry_run_summary(args.log_dir, fresh, "needs.example.com", True)
+    updater = wp_update.WPUpdater(args)
+    assert "needs.example.com" not in updater._no_update_domains
+
+
+def test_load_no_update_domains_disabled_in_dry_run_mode(tmp_path: Path) -> None:
+    args = _make_args_with_skip_flags(tmp_path, execute=False)
+    fresh = wp_update.datetime.now(wp_update.UTC).strftime("%Y%m%dT%H%M%SZ")
+    _write_dry_run_summary(args.log_dir, fresh, "any.example.com", False)
+    updater = wp_update.WPUpdater(args)
+    assert updater._no_update_domains == {}
+
+
+def test_load_no_update_domains_disabled_by_no_skip_flag(tmp_path: Path) -> None:
+    args = _make_args_with_skip_flags(tmp_path, execute=True, no_skip=True)
+    args.env_file.write_text("SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=pw\n")
+    fresh = wp_update.datetime.now(wp_update.UTC).strftime("%Y%m%dT%H%M%SZ")
+    _write_dry_run_summary(args.log_dir, fresh, "any.example.com", False)
+    updater = wp_update.WPUpdater(args)
+    assert updater._no_update_domains == {}
+
+
+def test_load_no_update_domains_disabled_by_recheck_flag(tmp_path: Path) -> None:
+    args = _make_args_with_skip_flags(tmp_path, execute=True, recheck=True)
+    args.env_file.write_text("SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=pw\n")
+    fresh = wp_update.datetime.now(wp_update.UTC).strftime("%Y%m%dT%H%M%SZ")
+    _write_dry_run_summary(args.log_dir, fresh, "any.example.com", False)
+    updater = wp_update.WPUpdater(args)
+    assert updater._no_update_domains == {}
+
+
+def test_load_no_update_domains_most_recent_wins(tmp_path: Path) -> None:
+    """A more recent dry-run with needs_update=true overrides an older false."""
+    args = _make_args_with_skip_flags(tmp_path, execute=True, ttl=120)
+    args.env_file.write_text("SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=pw\n")
+    now = wp_update.datetime.now(wp_update.UTC)
+    older = (now - wp_update.timedelta(minutes=30)).strftime("%Y%m%dT%H%M%SZ")
+    newer = (now - wp_update.timedelta(minutes=5)).strftime("%Y%m%dT%H%M%SZ")
+    _write_dry_run_summary(args.log_dir, older, "flip.example.com", False)
+    _write_dry_run_summary(args.log_dir, newer, "flip.example.com", True)
+    updater = wp_update.WPUpdater(args)
+    assert "flip.example.com" not in updater._no_update_domains
+
+
+# ---------------------------------------------------------------------------
+# F1: needs_update flips False after successful execute (post-codex review)
+# ---------------------------------------------------------------------------
+
+def test_needs_update_flips_false_after_successful_execute(tmp_path: Path) -> None:
+    """A successful execute mutates the site; the pre-update baseline value
+    of needs_update is stale by definition and must be flipped to False so
+    downstream JSON/API consumers see the post-update truth."""
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    r.needs_update = True  # pretend baseline saw pending updates
+
+    with (
+        patch.object(updater, "_step_ssh_preflight"),
+        patch.object(updater, "_step_collect_baseline"),
+        patch.object(updater, "_step_disk_check"),
+        patch.object(updater, "_step_backup"),
+        patch.object(updater, "_step_capture_ownership"),
+        patch.object(updater, "_step_update_core"),
+        patch.object(updater, "_step_update_themes"),
+        patch.object(updater, "_step_update_plugins"),
+        patch.object(updater, "_verify"),
+        patch.object(updater, "_ssh"),
+    ):
+        updater._process_site(r)
+
+    assert r.overall == "success"
+    assert r.needs_update is False
+
+
+# ---------------------------------------------------------------------------
+# F2: skip-drift validation — _process_client_file rechecks current skip rules
+# ---------------------------------------------------------------------------
+
+def _write_dry_run_summary_with_baseline(
+    log_dir: Path, run_id: str, domain: str,
+    pending_plugin_slugs: list[str],
+    pending_theme_slugs: list[str] | None = None,
+    core_count: int = 0,
+) -> None:
+    """Emit a synthetic dry-run summary whose baseline has pending updates.
+
+    needs_update is set to True when any pending exist, False otherwise —
+    matching what the production baseline-collection step would do.
+    """
+    log_dir.mkdir(parents=True, exist_ok=True)
+    needs = bool(pending_plugin_slugs or pending_theme_slugs or core_count)
+    site_entry = {
+        "domain": domain,
+        "overall": "dry-run",
+        "needs_update": needs,
+        "baseline": {
+            "plugin_updates": [{"name": s} for s in pending_plugin_slugs],
+            "theme_updates": [{"name": s} for s in (pending_theme_slugs or [])],
+            "core_updates": [{} for _ in range(core_count)],
+        },
+    }
+    payload = {
+        "run_id": run_id, "mode": "dry-run",
+        "generated_at": "2026-05-12T00:00:00+00:00",
+        "sites": [site_entry],
+    }
+    (log_dir / f"wp-update-summary-{run_id}.json").write_text(json.dumps(payload))
+
+
+def test_no_update_skip_records_pre_filter_pending_slugs(tmp_path: Path) -> None:
+    args = _make_args_with_skip_flags(tmp_path, execute=True)
+    args.env_file.write_text("SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=pw\n")
+    fresh = wp_update.datetime.now(wp_update.UTC).strftime("%Y%m%dT%H%M%SZ")
+    # needs_update=false in summary, but baseline lists a plugin that *was*
+    # filtered out via notes.json at dry-run time — recorded so we can
+    # later re-validate against the current notes.json.
+    _write_dry_run_summary_with_baseline(
+        args.log_dir, fresh, "x.example.com",
+        pending_plugin_slugs=["ninja-forms"],
+    )
+    # Force needs_update to False (the helper would have set True because
+    # baseline pending is non-empty; for this test we want to simulate
+    # the dry-run path where skip_items filtered it out).
+    summary_path = next(args.log_dir.glob("wp-update-summary-*.json"))
+    data = json.loads(summary_path.read_text())
+    data["sites"][0]["needs_update"] = False
+    summary_path.write_text(json.dumps(data))
+
+    updater = wp_update.WPUpdater(args)
+    assert updater._no_update_domains["x.example.com"]["pending_plugin_slugs"] == [
+        "ninja-forms"
+    ]
+
+
+def _seed_no_update_state(
+    updater: wp_update.WPUpdater, domain: str, *,
+    plugins: list[str] | None = None, themes: list[str] | None = None,
+    core_count: int = 0,
+) -> None:
+    """Inject a synthetic _no_update_domains record without writing files."""
+    updater._no_update_domains[domain] = {
+        "pending_plugin_slugs": list(plugins or []),
+        "pending_theme_slugs": list(themes or []),
+        "core_count": core_count,
+    }
+
+
+def test_process_client_file_skips_when_current_skips_cover_cached(tmp_path: Path) -> None:
+    """Cached dry-run filtered out ninja-forms via notes.json. Current notes
+    still skip ninja-forms. The cached up-to-date verdict is still valid →
+    site is skipped without _process_site being called."""
+    args = make_args(tmp_path, execute=True)
+    args.env_file.write_text("SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=pw\n")
+    clients_dir = tmp_path / "clients"
+    clients_dir.mkdir()
+    args.clients_dir = clients_dir
+    client = _write_single_app_client_json(
+        clients_dir, "site_cloudways.json", "site.example.com", "abc1234"
+    )
+    (clients_dir / "notes.json").write_text(json.dumps({
+        "sites": {"site.example.com": {
+            "skip_items": [{"type": "plugin", "slug": "ninja-forms"}],
+        }}
+    }))
+
+    updater = wp_update.WPUpdater(args)
+    _seed_no_update_state(updater, "site.example.com", plugins=["ninja-forms"])
+
+    with patch.object(updater, "_process_site") as mock_process:
+        updater._process_client_file(client)
+
+    mock_process.assert_not_called()
+    assert updater.reports[0].overall == "skipped"
+    assert any(
+        s.name == "up-to-date-skip" for s in updater.reports[0].steps
+    )
+
+
+def test_process_client_file_runs_when_skip_was_removed(tmp_path: Path) -> None:
+    """Cached dry-run filtered out ninja-forms via notes.json. Operator
+    removed that skip. The slug now has a pending update → site must run."""
+    args = make_args(tmp_path, execute=True)
+    args.env_file.write_text("SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=pw\n")
+    clients_dir = tmp_path / "clients"
+    clients_dir.mkdir()
+    args.clients_dir = clients_dir
+    client = _write_single_app_client_json(
+        clients_dir, "site_cloudways.json", "site.example.com", "abc1234"
+    )
+    # No notes.json → no current skips
+
+    updater = wp_update.WPUpdater(args)
+    _seed_no_update_state(updater, "site.example.com", plugins=["ninja-forms"])
+
+    with patch.object(updater, "_process_site") as mock_process:
+        updater._process_client_file(client)
+
+    mock_process.assert_called_once()
+    assert not any(
+        s.name == "up-to-date-skip"
+        for r in updater.reports for s in r.steps
+    )
+
+
+# ---------------------------------------------------------------------------
+# Default execute auto-skip after inline baseline + --no-skip-up-to-date
+# ---------------------------------------------------------------------------
+
+def test_execute_skips_after_baseline_when_no_pending_by_default(tmp_path: Path) -> None:
+    """Default execute behavior: once the inline baseline reports
+    needs_update=False, the site is skipped before backup/update/verify.
+    No special flag required — this is the one-click workflow."""
+    args = make_args(tmp_path, execute=True)
+    args.env_file.write_text("SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=pw\n")
+    args.recheck_updates = False
+    args.no_skip_up_to_date = False
+    args.skip_up_to_date_ttl = 60
+    updater = wp_update.WPUpdater(args)
+    r = _make_exec_report()
+
+    def fake_baseline(report):  # noqa: ANN001
+        report.needs_update = False
+
+    with (
+        patch.object(updater, "_step_ssh_preflight"),
+        patch.object(updater, "_step_collect_baseline", side_effect=fake_baseline),
+        patch.object(updater, "_step_disk_check") as mock_disk,
+        patch.object(updater, "_step_backup") as mock_backup,
+    ):
+        updater._process_site(r)
+
+    mock_disk.assert_not_called()
+    mock_backup.assert_not_called()
+    assert r.overall == "skipped"
+    assert any(s.name == "up-to-date-skip" for s in r.steps)
+
+
+def test_execute_proceeds_when_baseline_has_pending(tmp_path: Path) -> None:
+    """Sites with pending updates flow through the full execute path."""
+    args = make_args(tmp_path, execute=True)
+    args.env_file.write_text("SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=pw\n")
+    args.recheck_updates = False
+    args.no_skip_up_to_date = False
+    args.skip_up_to_date_ttl = 60
+    updater = wp_update.WPUpdater(args)
+    r = _make_exec_report()
+
+    def fake_baseline(report):  # noqa: ANN001
+        report.needs_update = True
+
+    with (
+        patch.object(updater, "_step_ssh_preflight"),
+        patch.object(updater, "_step_collect_baseline", side_effect=fake_baseline),
+        patch.object(updater, "_step_disk_check") as mock_disk,
+        patch.object(updater, "_step_backup"),
+        patch.object(updater, "_step_capture_ownership"),
+        patch.object(updater, "_step_update_core"),
+        patch.object(updater, "_step_update_themes"),
+        patch.object(updater, "_step_update_plugins"),
+        patch.object(updater, "_verify"),
+        patch.object(updater, "_ssh"),
+    ):
+        updater._process_site(r)
+
+    mock_disk.assert_called_once()
+    assert r.overall == "success"
+
+
+def test_no_skip_up_to_date_forces_full_run_even_when_baseline_empty(
+    tmp_path: Path,
+) -> None:
+    """--no-skip-up-to-date overrides the new default auto-skip. Sites with
+    needs_update=False still go through backup → update → verify (e.g. for
+    smoke-testing the whole pipeline against a stable site)."""
+    args = make_args(tmp_path, execute=True)
+    args.env_file.write_text("SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=pw\n")
+    args.recheck_updates = False
+    args.no_skip_up_to_date = True  # override
+    args.skip_up_to_date_ttl = 60
+    updater = wp_update.WPUpdater(args)
+    r = _make_exec_report()
+
+    def fake_baseline(report):  # noqa: ANN001
+        report.needs_update = False
+
+    with (
+        patch.object(updater, "_step_ssh_preflight"),
+        patch.object(updater, "_step_collect_baseline", side_effect=fake_baseline),
+        patch.object(updater, "_step_disk_check") as mock_disk,
+        patch.object(updater, "_step_backup") as mock_backup,
+        patch.object(updater, "_step_capture_ownership"),
+        patch.object(updater, "_step_update_core"),
+        patch.object(updater, "_step_update_themes"),
+        patch.object(updater, "_step_update_plugins"),
+        patch.object(updater, "_verify"),
+        patch.object(updater, "_ssh"),
+    ):
+        updater._process_site(r)
+
+    mock_disk.assert_called_once()
+    mock_backup.assert_called_once()
+    assert r.overall == "success"
+    assert not any(s.name == "up-to-date-skip" for s in r.steps)
+
+
+# ---------------------------------------------------------------------------
+# Second codex review: H1/M1/M2/M3 robustness fixes for _load_no_update_domains
+# ---------------------------------------------------------------------------
+
+def _write_summary_raw(log_dir: Path, run_id: str, payload: dict) -> None:
+    """Write an arbitrary JSON payload as a summary file — for malformed-input tests."""
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / f"wp-update-summary-{run_id}.json").write_text(json.dumps(payload))
+
+
+def test_load_no_update_domains_handles_malformed_sites_field(tmp_path: Path) -> None:
+    """H1: sites is a dict, not a list — must not crash __init__."""
+    args = _make_args_with_skip_flags(tmp_path, execute=True)
+    args.env_file.write_text("SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=pw\n")
+    fresh = wp_update.datetime.now(wp_update.UTC).strftime("%Y%m%dT%H%M%SZ")
+    _write_summary_raw(args.log_dir, fresh, {
+        "run_id": fresh, "mode": "dry-run", "sites": {"not": "a list"},
+    })
+    updater = wp_update.WPUpdater(args)  # must not raise
+    assert updater._no_update_domains == {}
+
+
+def test_load_no_update_domains_handles_non_dict_site_entries(tmp_path: Path) -> None:
+    """H1: entries inside sites are strings, not dicts — must not crash."""
+    args = _make_args_with_skip_flags(tmp_path, execute=True)
+    args.env_file.write_text("SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=pw\n")
+    fresh = wp_update.datetime.now(wp_update.UTC).strftime("%Y%m%dT%H%M%SZ")
+    _write_summary_raw(args.log_dir, fresh, {
+        "run_id": fresh, "mode": "dry-run", "sites": ["string-not-dict", 42, None],
+    })
+    updater = wp_update.WPUpdater(args)
+    assert updater._no_update_domains == {}
+
+
+def test_load_no_update_domains_rejects_missing_baseline(tmp_path: Path) -> None:
+    """M1: needs_update=false but no baseline field → reject cache hit.
+
+    Older summary files (pre-needs_update PR) won't have a baseline at all;
+    we can't validate skip-drift against them, so we must NOT trust them.
+    """
+    args = _make_args_with_skip_flags(tmp_path, execute=True)
+    args.env_file.write_text("SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=pw\n")
+    fresh = wp_update.datetime.now(wp_update.UTC).strftime("%Y%m%dT%H%M%SZ")
+    _write_summary_raw(args.log_dir, fresh, {
+        "run_id": fresh, "mode": "dry-run",
+        "sites": [{
+            "domain": "no-baseline.example.com",
+            "overall": "dry-run",
+            "needs_update": False,
+            # baseline omitted
+        }],
+    })
+    updater = wp_update.WPUpdater(args)
+    assert "no-baseline.example.com" not in updater._no_update_domains
+
+
+def test_load_no_update_domains_rejects_non_dict_baseline(tmp_path: Path) -> None:
+    """M1: baseline is a list (malformed) → reject cache hit, no crash."""
+    args = _make_args_with_skip_flags(tmp_path, execute=True)
+    args.env_file.write_text("SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=pw\n")
+    fresh = wp_update.datetime.now(wp_update.UTC).strftime("%Y%m%dT%H%M%SZ")
+    _write_summary_raw(args.log_dir, fresh, {
+        "run_id": fresh, "mode": "dry-run",
+        "sites": [{
+            "domain": "weird.example.com", "overall": "dry-run",
+            "needs_update": False,
+            "baseline": ["unexpected", "list", "shape"],
+        }],
+    })
+    updater = wp_update.WPUpdater(args)
+    assert "weird.example.com" not in updater._no_update_domains
+
+
+def test_load_no_update_domains_rejects_baseline_with_wrong_typed_lists(tmp_path: Path) -> None:
+    """M1: baseline dict but plugin_updates is a string → reject, no crash."""
+    args = _make_args_with_skip_flags(tmp_path, execute=True)
+    args.env_file.write_text("SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=pw\n")
+    fresh = wp_update.datetime.now(wp_update.UTC).strftime("%Y%m%dT%H%M%SZ")
+    _write_summary_raw(args.log_dir, fresh, {
+        "run_id": fresh, "mode": "dry-run",
+        "sites": [{
+            "domain": "bad-types.example.com", "overall": "dry-run",
+            "needs_update": False,
+            "baseline": {
+                "core_updates": [],
+                "plugin_updates": "should-be-a-list",
+                "theme_updates": [],
+            },
+        }],
+    })
+    updater = wp_update.WPUpdater(args)
+    assert "bad-types.example.com" not in updater._no_update_domains
+
+
+def test_load_no_update_domains_accepts_empty_baseline_for_truly_up_to_date(
+    tmp_path: Path,
+) -> None:
+    """M1 regression guard: a site with NO available updates writes empty
+    baseline lists with needs_update=false. That's still a valid cache hit —
+    the empty-lists case must NOT be falsely rejected by the new guard."""
+    args = _make_args_with_skip_flags(tmp_path, execute=True)
+    args.env_file.write_text("SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=pw\n")
+    fresh = wp_update.datetime.now(wp_update.UTC).strftime("%Y%m%dT%H%M%SZ")
+    _write_summary_raw(args.log_dir, fresh, {
+        "run_id": fresh, "mode": "dry-run",
+        "sites": [{
+            "domain": "clean.example.com", "overall": "dry-run",
+            "needs_update": False,
+            "baseline": {
+                "core_updates": [], "plugin_updates": [], "theme_updates": [],
+            },
+        }],
+    })
+    updater = wp_update.WPUpdater(args)
+    assert "clean.example.com" in updater._no_update_domains
+    assert updater._no_update_domains["clean.example.com"] == {
+        "pending_plugin_slugs": [],
+        "pending_theme_slugs": [],
+        "core_count": 0,
+    }
+
+
+def test_load_no_update_domains_normalizes_domain_keys(tmp_path: Path) -> None:
+    """M2: cached entries written with scheme/www prefixes must collapse
+    to the same key as an inventory entry without them."""
+    args = _make_args_with_skip_flags(tmp_path, execute=True)
+    args.env_file.write_text("SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=pw\n")
+    fresh = wp_update.datetime.now(wp_update.UTC).strftime("%Y%m%dT%H%M%SZ")
+    _write_summary_raw(args.log_dir, fresh, {
+        "run_id": fresh, "mode": "dry-run",
+        "sites": [{
+            "domain": "https://WWW.MixedCase.example.com/",
+            "overall": "dry-run", "needs_update": False,
+            "baseline": {
+                "core_updates": [], "plugin_updates": [], "theme_updates": [],
+            },
+        }],
+    })
+    updater = wp_update.WPUpdater(args)
+    # Key collapses to the canonical normalized form.
+    assert "mixedcase.example.com" in updater._no_update_domains
+    # And callers looking up by any equivalent inventory string land on it.
+    for variant in (
+        "MixedCase.example.com",
+        "www.mixedcase.example.com",
+        "https://mixedcase.example.com",
+    ):
+        assert wp_update._normalize_domain(variant) in updater._no_update_domains
+
+
+def test_load_no_update_domains_newer_execute_invalidates_older_dryrun(
+    tmp_path: Path,
+) -> None:
+    """M3: older dry-run says needs_update=false, newer FAILED execute touched
+    the same domain. The cache must NOT skip — something happened in between
+    that we shouldn't silently ignore."""
+    args = _make_args_with_skip_flags(tmp_path, execute=True, ttl=120)
+    args.env_file.write_text("SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=pw\n")
+    now = wp_update.datetime.now(wp_update.UTC)
+    older = (now - wp_update.timedelta(minutes=30)).strftime("%Y%m%dT%H%M%SZ")
+    newer = (now - wp_update.timedelta(minutes=5)).strftime("%Y%m%dT%H%M%SZ")
+    # Older: dry-run, up-to-date — would have qualified for cache hit on its own.
+    _write_summary_raw(args.log_dir, older, {
+        "run_id": older, "mode": "dry-run",
+        "sites": [{
+            "domain": "touched.example.com", "overall": "dry-run",
+            "needs_update": False,
+            "baseline": {
+                "core_updates": [], "plugin_updates": [], "theme_updates": [],
+            },
+        }],
+    })
+    # Newer: execute that failed (so the failed flag is preserved).
+    _write_summary_raw(args.log_dir, newer, {
+        "run_id": newer, "mode": "execute",
+        "sites": [{
+            "domain": "touched.example.com", "overall": "failed",
+            "needs_update": True,
+        }],
+    })
+    updater = wp_update.WPUpdater(args)
+    assert "touched.example.com" not in updater._no_update_domains
+
+
+def test_process_site_skip_lookup_uses_normalized_domain(tmp_path: Path) -> None:
+    """M2 wiring: the skip path looks up by the normalized form of
+    report.domain, so an inventory entry like 'www.foo.com' still matches a
+    cache row keyed by 'foo.com'."""
+    args = _make_args_with_skip_flags(tmp_path, execute=True)
+    args.env_file.write_text("SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=pw\n")
+    updater = wp_update.WPUpdater(args)
+    # Inject a cache row under the normalized key.
+    updater._no_update_domains["normalized.example.com"] = {
+        "pending_plugin_slugs": [], "pending_theme_slugs": [], "core_count": 0,
+    }
+    # Simulate the lookup code path: same expression as in _process_site.
+    raw_inventory_domain = "https://WWW.Normalized.example.com/"
+    norm = wp_update._normalize_domain(raw_inventory_domain)
+    assert norm in updater._no_update_domains

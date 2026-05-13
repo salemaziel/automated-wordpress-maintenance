@@ -211,6 +211,30 @@ def slugify(value: str) -> str:
 def validate_client_doc(doc: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     provider = str(doc.get("hosting_provider") or "Cloudways").strip() or "Cloudways"
+    if str(doc.get("schema", "")).startswith("siteground_"):
+        # Siteground inventory schema (siteground_wp_cli_inventory_v1) — emitted
+        # by inventory tooling, not the Cloudways form. Validate the per-domain
+        # shape directly: ssh.{host,user} + wordpress.path.
+        if not doc.get("client_name") and not doc.get("domain"):
+            errors.append("client_name is required")
+        ssh = doc.get("ssh")
+        if not isinstance(ssh, dict):
+            errors.append("ssh is required")
+        else:
+            if not ssh.get("host"):
+                errors.append("ssh.host is required")
+            if not ssh.get("user"):
+                errors.append("ssh.user is required")
+        wp = doc.get("wordpress")
+        if not isinstance(wp, dict):
+            errors.append("wordpress is required")
+        else:
+            path = wp.get("path") or ""
+            if not path:
+                errors.append("wordpress.path is required")
+            elif not (path.startswith("/home/") and path.endswith("/public_html")):
+                errors.append("wordpress.path must be a Siteground public_html path")
+        return errors
     if not doc.get("client_name"):
         errors.append("client_name is required")
     if not doc.get("server_ip_address"):
@@ -422,20 +446,33 @@ def list_client_files(clients_dir: Path = CLIENTS_DIR, provider: str | None = No
         domains: list[str] = []
         try:
             doc = json.loads(path.read_text(encoding="utf-8"))
-            client_name = str(doc.get("client_name") or label)
-            label = client_name
-            client_provider = str(doc.get("hosting_provider") or client_provider).strip() or client_provider
-            apps = doc.get("applications") or []
-            if isinstance(apps, list):
-                for app in apps:
-                    if not isinstance(app, dict):
-                        continue
-                    flags = app.get("environment_flags") or {}
-                    if isinstance(flags, dict) and flags.get("has_woocommerce"):
-                        has_woo = True
-                    domain = str(app.get("website_domain") or "").strip()
-                    if domain:
-                        domains.append(domain)
+            schema = str(doc.get("schema", ""))
+            if schema.startswith("siteground_"):
+                # SG inventory schema: top-level `domain` is the only site
+                # for this file, and `client_name` may be absent. Use the
+                # domain as both the display label and the DB lookup key
+                # (matches site_outcomes.client_name written by SG runs).
+                client_name = str(doc.get("client_name") or doc.get("domain") or label)
+                label = client_name
+                client_provider = "Siteground"
+                domain = str(doc.get("domain") or "").strip()
+                if domain:
+                    domains.append(domain)
+            else:
+                client_name = str(doc.get("client_name") or label)
+                label = client_name
+                client_provider = str(doc.get("hosting_provider") or client_provider).strip() or client_provider
+                apps = doc.get("applications") or []
+                if isinstance(apps, list):
+                    for app in apps:
+                        if not isinstance(app, dict):
+                            continue
+                        flags = app.get("environment_flags") or {}
+                        if isinstance(flags, dict) and flags.get("has_woocommerce"):
+                            has_woo = True
+                        domain = str(app.get("website_domain") or "").strip()
+                        if domain:
+                            domains.append(domain)
         except (OSError, json.JSONDecodeError):
             pass
         if selected_provider and client_provider.casefold() != selected_provider:
@@ -488,11 +525,31 @@ def _summarize_client_selection(payload: dict[str, Any]) -> str:
 
 
 def build_wp_args(payload: dict[str, Any], *, remote: bool = False) -> list[str]:
-    args = ["wp_update.py", "--stream"]
+    # --stream toggles the wp_update CLI's stdout handler from INFO (default)
+    # to DEBUG (raw SSH commands + WP-CLI output). The webui defaults to INFO
+    # and surfaces a "Show debug logs" checkbox to opt into the firehose.
+    args = ["wp_update.py"]
+    if payload.get("streamDebug"):
+        args.append("--stream")
+    provider = str(payload.get("provider") or "").strip().casefold()
+    if provider in ("cloudways", "siteground"):
+        args.extend(["--provider", provider])
     if payload.get("execute"):
         args.append("--execute")
     if payload.get("includeWooCommerce"):
         args.append("--include-woocommerce")
+    # Up-to-date skip controls — only meaningful in execute mode, but the
+    # CLI accepts and ignores them otherwise, so forward unconditionally.
+    if payload.get("recheckUpdates"):
+        args.append("--recheck-updates")
+    if payload.get("noSkipUpToDate"):
+        args.append("--no-skip-up-to-date")
+    ttl_raw = payload.get("skipUpToDateTtl")
+    if ttl_raw is not None and str(ttl_raw).strip() != "":
+        # Malformed input from the form silently falls back to the CLI's
+        # 60-minute default rather than aborting the run.
+        with contextlib.suppress(TypeError, ValueError):
+            args.extend(["--skip-up-to-date-ttl", str(int(ttl_raw))])
     raw_files = payload.get("clientFiles")
     if isinstance(raw_files, list):
         names = [str(x).strip() for x in raw_files if str(x).strip()]
@@ -566,7 +623,7 @@ def start_run(
     payload: dict[str, Any], settings: Settings, *, started_by: str = ""
 ) -> RunRecord:
     provider = str(payload.get("provider") or "Cloudways").strip() or "Cloudways"
-    if provider.casefold() != "cloudways":
+    if provider.casefold() not in ("cloudways", "siteground"):
         raise ValueError(f"{provider} does not have a runner configured yet")
 
     target = str(payload.get("target") or "local")
@@ -863,10 +920,11 @@ def client_history_payload(client_name: str) -> dict[str, Any]:
 
 
 def _resolve_display_name(filename: str) -> str | None:
-    """Read the client JSON to recover its `client_name` for DB lookups.
+    """Read the client JSON to recover its display key for DB lookups.
 
-    The picker passes filenames like `lisette_cloudways.json`; the DB
-    stores the display name from the JSON (e.g. "Lisette").
+    Cloudways files: `client_name` field. Siteground inventory schema has
+    no `client_name` — fall back to `domain`, which is what wp_update.py
+    writes into `site_outcomes.client_name` for SG runs.
     """
     path = resolve_client_file(filename)
     if path is None:
@@ -876,7 +934,13 @@ def _resolve_display_name(filename: str) -> str | None:
     except (OSError, json.JSONDecodeError):
         return None
     name = str(data.get("client_name") or "").strip()
-    return name or None
+    if name:
+        return name
+    if str(data.get("schema", "")).startswith("siteground_"):
+        domain = str(data.get("domain") or "").strip()
+        if domain:
+            return domain
+    return None
 
 
 def _load_client_notes_for_filename(filename: str) -> dict[str, Any]:
@@ -1334,8 +1398,11 @@ def app_html(settings: Settings) -> str:
     h2{{font-size:15px;margin:0 0 14px}} h3{{font-size:13px;margin:18px 0 8px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}}
     label{{display:block;font-size:12px;font-weight:800;margin:10px 0 5px;color:#334139}}
     input,select,textarea,button{{font:inherit;border-radius:6px}} input,select,textarea{{width:100%;border:1px solid #c8cec5;padding:9px 10px;background:#fff;color:var(--text)}} textarea{{min-height:154px;font-family:var(--mono);font-size:12px}}
-    .row{{display:grid;grid-template-columns:1fr 1fr;gap:10px}} .toggles{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:12px 0}}
-    .check{{display:flex;gap:8px;align-items:center;border:1px solid var(--line);border-radius:6px;padding:10px;background:#fafbf9}} .check input{{width:auto}}
+    .row{{display:grid;grid-template-columns:1fr 1fr;gap:10px}} .toggles{{display:flex;flex-wrap:wrap;gap:10px;margin:12px 0}}
+    .check{{display:inline-flex;gap:8px;align-items:center;border:1px solid var(--line);border-radius:6px;padding:6px 10px;background:#fafbf9}} .check input{{width:auto}}
+    .terminal-toolbar{{display:flex;justify-content:flex-end;align-items:center;margin:6px 0 4px}}
+    .terminal-toolbar .check{{font-size:11px;padding:4px 8px;background:transparent;border:1px solid var(--line)}}
+    .provider-bar .add-toggle{{height:34px;padding:0 12px;font-size:12px}}
     button{{height:40px;border:0;padding:0 14px;background:var(--accent);color:white;font-weight:800;cursor:pointer}} button.secondary{{background:#e6ebe3;color:#213129}} button.danger{{background:var(--warn)}} button:disabled{{opacity:.55;cursor:not-allowed}}
     .actions{{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}} .status{{font-size:12px;color:var(--muted);min-height:18px;margin-top:8px}}
     #terminal{{height:620px;overflow:auto;background:#101511;color:#d9f7df;border-radius:8px;padding:14px;font-family:var(--mono);font-size:12px;line-height:1.5;white-space:pre-wrap;border:1px solid #26362a}}
@@ -1389,21 +1456,29 @@ def app_html(settings: Settings) -> str:
   <header><h1>Wordpress Maintenance Console</h1><a href="/logout">Logout</a></header>
   <nav class="provider-bar" aria-label="Hosting providers">
     <div class="provider-tabs" id="providerTabs"></div>
-    <div class="provider-add">
-      <input id="newProvider" placeholder="Add provider">
+    <button class="secondary add-toggle" id="toggleAddProvider" type="button">+ Add provider</button>
+    <div class="provider-add hidden" id="providerAddPanel">
+      <input id="newProvider" placeholder="Provider name">
       <button class="secondary" id="addProvider">Add</button>
     </div>
   </nav>
   <main>
     <div>
       <section>
-        <h2>Run maintenance</h2>
         <p class="status" id="providerStatus"></p>
-        <label>Target</label>
-        <select id="target"><option value="local">Local repo</option><option value="remote">Remote server via SSH</option></select>
+        <input type="hidden" id="target" value="local">
         <div class="toggles">
           <label class="check"><input id="execute" type="checkbox"> Execute mode</label>
           <label class="check"><input id="includeWoo" type="checkbox"> Include WooCommerce</label>
+          <label class="check" title="Ignore any recent dry-run summary cache; always collect a fresh inline baseline per site."><input id="recheckUpdates" type="checkbox"> Re-check updates</label>
+          <label class="check" title="Force every site through the full backup+update+verify path even when its inline baseline shows no pending updates."><input id="noSkipUpToDate" type="checkbox"> Disable up-to-date skip</label>
+        </div>
+        <div class="row" style="align-items:flex-end">
+          <div style="max-width:180px">
+            <label>Up-to-date TTL (min)</label>
+            <input id="skipUpToDateTtl" type="number" min="0" placeholder="60">
+          </div>
+          <p class="status" style="margin:0 0 6px 8px;font-size:11px;opacity:0.7">Execute mode skips sites whose dry-run summary is newer than this window. 0 disables.</p>
         </div>
         <label>Client scope</label>
         <div class="client-picker">
@@ -1485,6 +1560,9 @@ def app_html(settings: Settings) -> str:
     </div>
     <section>
       <div class="meta"><span class="pill" id="providerPill">Cloudways</span><span class="pill" id="modePill">dry-run</span><span class="pill" id="targetPill">local</span><span class="pill" id="statusPill">idle</span></div>
+      <div class="terminal-toolbar">
+        <label class="check"><input id="streamDebug" type="checkbox"> Show debug logs</label>
+      </div>
       <div id="terminal">No run started.</div>
       
       <div id="runSummary" class="hidden" style="margin-top:18px">
@@ -1697,6 +1775,10 @@ def app_html(settings: Settings) -> str:
         target: $('target').value,
         execute: $('execute').checked,
         includeWooCommerce: $('includeWoo').checked,
+        recheckUpdates: $('recheckUpdates').checked,
+        noSkipUpToDate: $('noSkipUpToDate').checked,
+        skipUpToDateTtl: $('skipUpToDateTtl').value,
+        streamDebug: $('streamDebug').checked,
         clientFiles: selectedClientNames(),
         sshKey: $('sshKey').value,
         remoteHost: $('remoteHost').value,
@@ -1715,12 +1797,13 @@ def app_html(settings: Settings) -> str:
       localStorage.setItem('maintenanceProviders', JSON.stringify(providers.filter((name) => !defaultProviders.includes(name))));
       localStorage.setItem('selectedProvider', selectedProvider);
     }}
+    const runnableProviders = new Set(['cloudways', 'siteground']);
     function renderProviders() {{
       if (!providers.includes(selectedProvider)) selectedProvider = providers[0] || 'Cloudways';
       const tabs = $('providerTabs');
       tabs.innerHTML = '';
       providers.forEach((provider) => {{
-        const isImplemented = provider.toLowerCase() === 'cloudways';
+        const isImplemented = runnableProviders.has(provider.toLowerCase());
         const button = document.createElement('button');
         button.innerHTML = provider + (!isImplemented ? ' <span style="font-size:9px;opacity:0.7">(soon)</span>' : '');
         button.classList.toggle('active', provider === selectedProvider);
@@ -1734,10 +1817,14 @@ def app_html(settings: Settings) -> str:
         tabs.appendChild(button);
       }});
       $('providerPill').textContent = selectedProvider;
-      const runnable = selectedProvider.toLowerCase() === 'cloudways';
+      const providerKey = selectedProvider.toLowerCase();
+      const runnable = runnableProviders.has(providerKey);
       $('startRun').style.opacity = runnable ? '1' : '0.6';
-      $('providerStatus').textContent = runnable ? 'Cloudways runner: wp_update.py' : `${{selectedProvider}} tab is ready for inventory; no runner is configured yet.`;
-      $('publicHtmlPath').placeholder = runnable ? '/home/master/applications/appid/public_html' : 'Provider-specific WordPress path';
+      $('providerStatus').textContent = runnable ? '' : `${{selectedProvider}} tab is ready for inventory; no runner is configured yet.`;
+      const placeholder = providerKey === 'siteground'
+        ? '/home/<user>/www/<domain>/public_html'
+        : (runnable ? '/home/master/applications/appid/public_html' : 'Provider-specific WordPress path');
+      $('publicHtmlPath').placeholder = placeholder;
     }}
     function appendLine(line) {{
       const terminal = $('terminal');
@@ -1912,7 +1999,7 @@ def app_html(settings: Settings) -> str:
       $('executeWarn').textContent = $('execute').checked ? 'Execute mode will perform remote writes and backups.' : '';
     }});
     $('startRun').addEventListener('click', async () => {{
-      if (selectedProvider.toLowerCase() !== 'cloudways') {{
+      if (!runnableProviders.has(selectedProvider.toLowerCase())) {{
         $('runStatus').textContent = `Runner not yet implemented for ${{selectedProvider}}`;
         return;
       }}
@@ -1945,12 +2032,18 @@ def app_html(settings: Settings) -> str:
         $('sshKey').value = data.name;
       }} catch (error) {{ $('runStatus').textContent = error.message; }}
     }});
+    $('toggleAddProvider').addEventListener('click', () => {{
+      const panel = $('providerAddPanel');
+      const wasHidden = panel.classList.toggle('hidden');
+      if (!wasHidden) $('newProvider').focus();
+    }});
     $('addProvider').addEventListener('click', () => {{
       const name = $('newProvider').value.trim();
       if (!name) return;
       providers = [...new Set([...providers, name])];
       selectedProvider = name;
       $('newProvider').value = '';
+      $('providerAddPanel').classList.add('hidden');
       saveProviders();
       renderProviders();
       loadClients().catch((error) => $('runStatus').textContent = error.message);
