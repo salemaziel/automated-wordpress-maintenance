@@ -251,6 +251,13 @@ class SiteReport:
     #   False — site is fully up to date (or only skipped slugs have updates)
     needs_update: bool | None = None
     backup_dir: str = ""
+    # True only after the pre-flight backup script has fully succeeded
+    # (tar written, integrity-verified). Rollback is gated on THIS, not on
+    # backup_dir — which is only a path and is set before the backup runs.
+    # A failed backup must never arm a destructive rollback: at backup time
+    # no mutations have happened yet, so restoring from a known-bad archive
+    # could only destroy a healthy site.
+    backup_ok: bool = False
     failure_step: str = ""
     failure_detail: str = ""
     rollback_result: str = ""
@@ -294,6 +301,10 @@ class SiteReport:
     ssh_key_path: str = ""
     master_user: str = ""
     master_password: str = ""
+    # Remote $HOME, resolved once at preflight. Siteground writes backups under
+    # this path; using a resolved absolute string lets shlex.quote() be safe
+    # without suppressing the variable expansion the code used to rely on.
+    home_dir: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Serialise to dict, stripping credentials."""
@@ -312,6 +323,7 @@ class SiteReport:
             "auth_user": self.auth_user,
             "original_owner": self.original_owner,
             "backup_dir": self.backup_dir,
+            "backup_ok": self.backup_ok,
             "failure_step": self.failure_step,
             "failure_detail": self.failure_detail,
             "rollback_result": self.rollback_result,
@@ -1437,7 +1449,7 @@ class WPUpdater:
                 r.domain, r.failure_step, exc
             )
 
-            if self.args.execute and r.backup_dir:
+            if self.args.execute and r.backup_ok:
                 self._step_rollback(r)
             else:
                 r.overall = "failed"
@@ -1454,7 +1466,7 @@ class WPUpdater:
                 "✗ UNEXPECTED  |  %s  |  step=%s  |  %s",
                 r.domain, r.failure_step, exc,
             )
-            if self.args.execute and r.backup_dir:
+            if self.args.execute and r.backup_ok:
                 self._step_rollback(r)
             else:
                 r.overall = "failed"
@@ -1509,11 +1521,21 @@ class WPUpdater:
         if r.provider == "siteground":
             self._ssh(r, "echo 'ssh-ok'")
             self._wp(r, "core is-installed")
+            # Resolve $HOME once so backup paths can be absolute. Without this,
+            # shlex.quote() on a literal '$HOME/...' suppresses expansion and
+            # the remote shell creates a directory literally named "$HOME"
+            # inside the WP path — which is the webroot.
+            r.home_dir = self._ssh(r, 'printf %s "$HOME"').strip()
+            if not r.home_dir.startswith("/"):
+                raise SSHError(
+                    f"failed to resolve $HOME on {r.ssh_user}@{r.server_ip}: "
+                    f"got {r.home_dir!r}"
+                )
             r.auth_user = r.ssh_user
             self._record_step(
                 r, "ssh-preflight", "success",
                 f"SSH reachable at {r.server_ip}:{r.ssh_port} as {r.ssh_user} "
-                "(siteground, auth=key)", t0,
+                f"(siteground, auth=key, home={r.home_dir})", t0,
             )
             return
 
@@ -1816,10 +1838,17 @@ echo "${{du_bytes:-0}} ${{avail_bytes:-0}}"
 
         # Backup destination is provider-specific:
         # - Cloudways: under the app's private_html sibling (sibling of public_html).
-        # - Siteground: ~/wp-maintenance-backups/<run_id>/ on the user's home.
-        #   No /private_html exists; ~/tmp is server-shared (root-owned, sticky).
+        # - Siteground: <home>/wp-maintenance-backups/<run_id>/, where <home> is
+        #   resolved at preflight (r.home_dir). Using a literal "$HOME" here is
+        #   not safe — every callsite quotes paths with shlex.quote(), which
+        #   suppresses variable expansion and would create a directory named
+        #   "$HOME" inside the WP path (the webroot).
         if r.provider == "siteground":
-            backup_dir = f"$HOME/wp-maintenance-backups/{self.run_id}"
+            if not r.home_dir:
+                raise SSHError(
+                    f"backup: r.home_dir not set for siteground site {r.domain}"
+                )
+            backup_dir = f"{r.home_dir}/wp-maintenance-backups/{self.run_id}"
         else:
             # Extract the application hash from the path:
             # /home/master/applications/<hash>/public_html → <hash>
@@ -1862,9 +1891,23 @@ test -s {shlex.quote(backup_dir + '/public_html.tar.gz')}
 # Run in a subshell with pipefail disabled: grep -q exits on first match sending SIGPIPE
 # to tar, which would otherwise cause pipefail to report a false failure.
 (set +o pipefail; tar -tzf {shlex.quote(backup_dir + '/public_html.tar.gz')} 2>/dev/null | grep -qE '(^|/)wp-content/') || {{ echo 'backup-integrity-fail: wp-content/ missing from archive'; exit 1; }}
+# Verify the archive also contains wp-config.php. Without it a rollback would
+# restore a tree WordPress cannot boot — wp-content/ alone is not a usable site.
+(set +o pipefail; tar -tzf {shlex.quote(backup_dir + '/public_html.tar.gz')} 2>/dev/null | grep -qE '(^|/)wp-config\\.php$') || {{ echo 'backup-integrity-fail: wp-config.php missing from archive'; exit 1; }}
+# Fingerprint the live wp-config.php so the rollback path can later prove the
+# restored copy is byte-for-byte complete (catches a truncated/partial extract
+# that leaves a present-but-broken config). CWD is the WP root (cd above).
+test -s wp-config.php || {{ echo 'backup-integrity-fail: wp-config.php missing or empty in live tree'; exit 1; }}
+sha256sum wp-config.php | awk '{{print $1}}' > {shlex.quote(backup_dir + '/wp-config.sha256')}
+wc -c < wp-config.php | tr -d ' ' > {shlex.quote(backup_dir + '/wp-config.bytes')}
 echo 'backup-ok'
 """
+        # If the backup script fails, _ssh raises and backup_ok stays False,
+        # so the failure handler in _process_site will NOT roll back. That is
+        # the correct outcome: no updates have run yet, the live site is
+        # untouched, and the only archive we have is known-bad.
         self._ssh(r, script, timeout=self.args.remote_timeout)
+        r.backup_ok = True
         self._record_step(r, "backup", "success",
                           f"backup at {backup_dir}", t0)
 
@@ -1892,6 +1935,48 @@ echo 'backup-ok'
 
     # ------------------------------------------------------------------
     # Step: Update themes (sequential, one-by-one)
+    # ------------------------------------------------------------------
+
+    def _run_theme_update_structured(self, r: SiteReport, slug: str) -> dict:
+        """Run `wp theme update <slug> --format=json` and return the result dict.
+
+        Mirrors `_run_plugin_update_structured`: a theme that cannot be
+        updated (premium theme not on wordpress.org, expired license, failed
+        zip fetch) often makes wp-cli emit an "Error" status — sometimes with
+        a zero exit code — so we cannot trust the exit code alone. See that
+        method for the meaning of the `_exit_nonzero`/`_parse_error`/`_no_entry`
+        signals.
+        """
+        try:
+            raw = self._wp(
+                r, f"theme update {shlex.quote(slug)} --format=json",
+                timeout=self.args.remote_timeout,
+            )
+        except (SSHError, WPCliError) as exc:
+            return {"name": slug, "status": "Error", "_exit_nonzero": True, "_error": str(exc)}
+
+        bracket = raw.find("[")
+        if bracket == -1:
+            return {"name": slug, "status": "Error", "_parse_error": True, "_raw": raw}
+        try:
+            entries = json.loads(raw[bracket:])
+        except json.JSONDecodeError:
+            return {"name": slug, "status": "Error", "_parse_error": True, "_raw": raw}
+
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("name") == slug:
+                return entry
+        return {"name": slug, "status": "Error", "_no_entry": True}
+
+    # ------------------------------------------------------------------
+    # Step: Update themes (sequential, one-by-one)
+    #
+    # Classification mirrors the plugin path: a theme that *cannot* be
+    # updated (license/zip/auth error) but leaves the site healthy is
+    # recorded as `skipped` and we move on — a stuck theme is never a
+    # reason to roll back working updates or block the rest of the run.
+    # Only a verify FAILURE after the attempt (the site is actually
+    # broken) escalates to a full-site rollback.
     # ------------------------------------------------------------------
 
     def _step_update_themes(self, r: SiteReport) -> None:
@@ -1924,16 +2009,71 @@ echo 'backup-ok'
                 continue
             step = f"theme-update:{slug}"
             t0 = ts()
+            self.log.info(
+                "  Updating theme  %s  (%s → %s)  |  %s",
+                slug, ver_from, ver_to, r.domain,
+            )
+
+            result = self._run_theme_update_structured(r, slug)
+            # Retry once on transient signals (empty output / no entry / ssh
+            # blip), matching the plugin path.
+            if result.get("_parse_error") and not (result.get("_raw") or "").strip():
+                self.log.info("  ↻ Retrying theme update (empty output)  |  %s", slug)
+                result = self._run_theme_update_structured(r, slug)
+            elif result.get("_no_entry"):
+                self.log.info("  ↻ Retrying theme update (no entry)  |  %s", slug)
+                result = self._run_theme_update_structured(r, slug)
+            elif result.get("_exit_nonzero"):
+                self.log.info(
+                    "  ↻ Retrying theme update (ssh/wpcli failure: %s)  |  %s",
+                    result.get("_error", "?"), slug,
+                )
+                result = self._run_theme_update_structured(r, slug)
+
+            status = (result.get("status", "") or "").strip().lower()
+            ver_to_reported = result.get("version") or ver_to or "?"
+
+            self._flush_cache(r, slug)
+
             try:
-                self._wp(r, f"theme update {shlex.quote(slug)}",
-                         timeout=self.args.remote_timeout)
                 self._verify(r)
-            except (SSHError, HealthCheckError) as exc:
-                self._record_step(r, step, "failed",
-                                  f"{slug} {ver_from}→{ver_to} FAILED: {exc}", t0)
-                raise
-            self._record_step(r, step, "success",
-                              f"{slug} {ver_from}→{ver_to}", t0)
+                verify_ok = True
+                verify_exc: HealthCheckError | None = None
+            except HealthCheckError as exc:
+                verify_ok = False
+                verify_exc = exc
+
+            if verify_ok and status in _PLUGIN_STATUS_SUCCESS:
+                self._record_step(r, step, "success",
+                                  f"{slug} {ver_from}→{ver_to_reported}", t0)
+                continue
+
+            if verify_ok and status in _PLUGIN_STATUS_UPTODATE:
+                self._record_step(r, step, "success",
+                                  f"{slug} up to date", t0)
+                continue
+
+            if verify_ok:
+                # Theme update reported an error but the site is still
+                # healthy — premium theme not in the repo, expired license,
+                # failed zip fetch. The theme simply wasn't updated. Record
+                # and continue; do NOT roll back, do NOT block remaining
+                # themes/plugins.
+                err_msg = _extract_plugin_error(result)
+                detail = f"{slug} {ver_from}→{ver_to} non-fatal error: {err_msg}"
+                self._record_step(r, step, "skipped", detail, t0)
+                self.log.warning(
+                    "  ⚠ Skipping theme  %s  (%s → %s): non-fatal error: %s  |  %s",
+                    slug, ver_from, ver_to, err_msg, r.domain,
+                )
+                continue
+
+            # verify FAILED — the update genuinely broke the site. Themes
+            # have no per-item "deactivate" isolation like plugins, so this
+            # escalates straight to the full-site rollback via _process_site.
+            detail = f"{slug} {ver_from}→{ver_to} FAILED: {verify_exc}"
+            self._record_step(r, step, "failed", detail, t0)
+            raise verify_exc
 
     # ------------------------------------------------------------------
     # Plugin update helpers
@@ -2153,12 +2293,13 @@ echo 'backup-ok'
     #
     # Restore sequence:
     #   0. Backstop: refuse if live wp-content/ missing or backup tarball
-    #      doesn't contain wp-content/ (corrupt/wrong archive)
+    #      doesn't contain wp-content/ AND wp-config.php (corrupt/wrong archive)
     #   1. Archive the failed state (for post-mortem analysis)
     #   2. Best-effort chown so wipe can recurse into restrictive-mode dirs
     #   3. Wipe public_html contents (tolerate partial; verify-empty after)
     #   4. Extract the pre-flight tar (only if wipe completed)
-    #   5. Backstop: verify wp-content/ landed
+    #   5. Backstop: verify wp-content/ landed and wp-config.php restored
+    #      byte-for-byte (matches the fingerprint captured at backup time)
     #   6. Import the pre-flight database dump
     #   7. Verify the site is back to healthy
     #
@@ -2194,6 +2335,13 @@ if ! (set +o pipefail; tar -tzf {shlex.quote(fs_backup)} 2>/dev/null | grep -qE 
     echo "rollback-abort: {fs_backup} missing wp-content/ — refusing to extract" >&2
     exit 98
 fi
+# 0c. Refuse to extract a backup whose archive lacks wp-config.php. Restoring a
+#     config-less tree leaves WordPress unbootable; better to abort and force a
+#     manual recovery than to repopulate public_html with a non-bootable site.
+if ! (set +o pipefail; tar -tzf {shlex.quote(fs_backup)} 2>/dev/null | grep -qE '(^|/)wp-config\\.php$'); then
+    echo "rollback-abort: {fs_backup} missing wp-config.php — refusing to extract" >&2
+    exit 95
+fi
 # 1. Archive the broken state for forensic analysis
 tar -czf {shlex.quote(failed_snapshot)} -C {shlex.quote(r.wp_path)} . 2>/dev/null || true
 # 2. Best-effort ownership recovery before the wipe. rm -rf normally
@@ -2219,6 +2367,24 @@ tar -xzf {shlex.quote(fs_backup)} -C {shlex.quote(r.wp_path)}
 if [ ! -d {shlex.quote(r.wp_path + "/wp-content")} ]; then
     echo "rollback-abort: extract completed but {r.wp_path}/wp-content/ missing — manual recovery required" >&2
     exit 96
+fi
+# 5b. Verify wp-config.php came back intact. A present-but-truncated config is
+#     worse than an obvious failure — the site half-boots and silently breaks.
+#     Compare against the fingerprint captured at backup time; if it's absent
+#     (older backup predating this check) fall back to a non-empty assertion so
+#     we never silently trust a corrupt restore.
+_cfg={shlex.quote(r.wp_path + "/wp-config.php")}
+if [ ! -s "$_cfg" ]; then
+    echo "rollback-abort: wp-config.php missing or empty after restore — manual recovery required" >&2
+    exit 94
+fi
+if [ -f {shlex.quote(r.backup_dir + "/wp-config.sha256")} ]; then
+    _want=$(cat {shlex.quote(r.backup_dir + "/wp-config.sha256")})
+    _got=$(sha256sum "$_cfg" | awk '{{print $1}}')
+    if [ "$_want" != "$_got" ]; then
+        echo "rollback-abort: wp-config.php checksum mismatch after restore (want $_want, got $_got) — restore incomplete/corrupt, manual recovery required" >&2
+        exit 93
+    fi
 fi
 # 6. Restore database from pre-flight dump.
 #    cd into wp_path so wp-config.php's relative require (e.g. require 'wp-salt.php')

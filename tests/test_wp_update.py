@@ -913,8 +913,38 @@ def test_step_rollback_script_preserves_distinct_exit_codes(tmp_path: Path) -> N
         updater._step_rollback(r)
 
     script_text = captured_scripts[0]
-    for code in ("exit 99", "exit 98", "exit 97", "exit 96"):
+    for code in ("exit 99", "exit 98", "exit 97", "exit 96", "exit 95", "exit 94", "exit 93"):
         assert code in script_text, f"rollback script missing {code}"
+
+
+def test_step_rollback_verifies_wp_config_integrity(tmp_path: Path) -> None:
+    # The rollback must refuse to extract an archive lacking wp-config.php and
+    # must prove the restored config matches the backup-time fingerprint. A
+    # rollback that only restores wp-content/ leaves WordPress unbootable.
+    updater = wp_update.WPUpdater(make_args(tmp_path))
+    r = make_report(
+        backup_dir="/home/master/wp-maintenance-backups/example-client/example.com/run01",
+        auth_method="key",
+    )
+
+    captured_scripts = []
+
+    def fake_ssh(report, script, timeout=None):  # noqa: ANN001
+        captured_scripts.append(script)
+        return "rollback-ok"
+
+    with patch.object(updater, "_ssh", side_effect=fake_ssh), \
+         patch.object(updater, "_verify", return_value=None):
+        updater._step_rollback(r)
+
+    script_text = captured_scripts[0]
+    # Pre-extract: archive must contain wp-config.php
+    assert "missing wp-config.php — refusing to extract" in script_text
+    # Post-extract: restored config must be non-empty and checksum-matched
+    assert "wp-config.php missing or empty after restore" in script_text
+    assert "wp-config.sha256" in script_text
+    assert "sha256sum" in script_text
+    assert "checksum mismatch after restore" in script_text
 
 
 def test_step_rollback_failure_raises_and_sets_failed_state(tmp_path: Path) -> None:
@@ -1271,6 +1301,75 @@ def test_step_update_plugins_non_fatal_error_skips(tmp_path: Path) -> None:
     assert steps["plugin-update:plugin-c"].status == "success"
 
 
+def test_run_theme_update_structured_parses_clean_json(tmp_path: Path) -> None:
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    payload = '[{"name":"my-theme","status":"Updated","version":"1.1"}]'
+    with patch.object(updater, "_wp", return_value=payload):
+        result = updater._run_theme_update_structured(r, "my-theme")
+    assert result["status"] == "Updated"
+    assert result["name"] == "my-theme"
+
+
+def test_step_update_themes_license_error_skips_not_rollback(tmp_path: Path) -> None:
+    """A theme that cannot be updated (e.g. premium theme, expired license)
+    but leaves the site healthy is recorded as skipped — it must NOT raise
+    (which would trigger a full-site rollback) and must NOT block the
+    remaining themes."""
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    r.baseline = {
+        "theme_updates": [
+            {"name": "theme-a", "version": "1.0", "update_version": "2.0"},
+            {"name": "theme-b", "version": "1.0", "update_version": "2.0"},
+            {"name": "theme-c", "version": "1.0", "update_version": "2.0"},
+        ]
+    }
+
+    def fake_structured(report: wp_update.SiteReport, slug: str) -> dict:
+        if slug == "theme-b":
+            return {"name": slug, "status": "Error", "_exit_nonzero": True,
+                    "_error": "license key invalid"}
+        return {"name": slug, "status": "Updated", "version": "2.0"}
+
+    with (
+        patch.object(updater, "_run_theme_update_structured", side_effect=fake_structured),
+        patch.object(updater, "_verify"),  # always passes — site stays healthy
+        patch.object(updater, "_flush_cache"),
+    ):
+        updater._step_update_themes(r)  # must not raise
+
+    steps = {s.name: s for s in r.steps}
+    assert steps["theme-update:theme-a"].status == "success"
+    assert steps["theme-update:theme-b"].status == "skipped"
+    assert "non-fatal error" in steps["theme-update:theme-b"].detail
+    assert steps["theme-update:theme-c"].status == "success"
+
+
+def test_step_update_themes_break_raises_for_rollback(tmp_path: Path) -> None:
+    """A theme update that genuinely breaks the site (verify fails) escalates
+    by raising HealthCheckError so _process_site performs a rollback."""
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    r.baseline = {
+        "theme_updates": [
+            {"name": "theme-a", "version": "1.0", "update_version": "2.0"},
+        ]
+    }
+
+    with (
+        patch.object(updater, "_run_theme_update_structured",
+                     return_value={"name": "theme-a", "status": "Updated", "version": "2.0"}),
+        patch.object(updater, "_verify", side_effect=wp_update.HealthCheckError("500")),
+        patch.object(updater, "_flush_cache"),
+        pytest.raises(wp_update.HealthCheckError),
+    ):
+        updater._step_update_themes(r)
+
+    steps = {s.name: s for s in r.steps}
+    assert steps["theme-update:theme-a"].status == "failed"
+
+
 def test_step_update_plugins_fatal_deactivation_recovers(tmp_path: Path) -> None:
     """plugin 2 update 'succeeds' but verify fails; wp plugin deactivate
     succeeds and subsequent verify passes → degraded, continues, no rollback."""
@@ -1572,6 +1671,28 @@ def test_step_backup_still_creates_backup_dir_without_plugins_subdir(tmp_path: P
     assert "public_html.tar.gz" in script
     # The per-plugin snapshot subdir is no longer created
     assert "/plugins'" not in script  # specifically the mkdir '…/plugins' line
+
+
+def test_step_backup_fingerprints_wp_config(tmp_path: Path) -> None:
+    # The backup must assert wp-config.php is in the archive and record its
+    # sha256 so the rollback path can prove a complete restore later.
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    r.backup_dir = ""
+
+    captured: list[str] = []
+
+    def fake_ssh(report: wp_update.SiteReport, script: str, **kw: object) -> str:
+        captured.append(script)
+        return "backup-ok"
+
+    with patch.object(updater, "_ssh", side_effect=fake_ssh):
+        updater._step_backup(r)
+
+    script = captured[0]
+    assert "wp-config.php missing from archive" in script
+    assert "wp-config.sha256" in script
+    assert "sha256sum wp-config.php" in script
 
 
 def test_load_client_notes_missing_returns_empty(tmp_path: Path) -> None:
@@ -2044,6 +2165,82 @@ def test_execute_proceeds_when_baseline_has_pending(tmp_path: Path) -> None:
 
     mock_disk.assert_called_once()
     assert r.overall == "success"
+
+
+def test_backup_failure_does_not_trigger_rollback(tmp_path: Path) -> None:
+    """A failed pre-flight backup must NOT escalate into a destructive
+    rollback. At backup time no updates have run, the live site is
+    untouched, and the only archive on disk is known-bad — restoring from
+    it could only destroy a healthy site. backup_ok stays False, so the
+    failure handler marks the site failed and leaves it alone.
+
+    Regression guard for the data-loss path where a permission-denied tar
+    failure wiped public_html and restored from the broken backup.
+    """
+    args = make_args(tmp_path, execute=True)
+    args.env_file.write_text("SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=pw\n")
+    args.recheck_updates = False
+    args.no_skip_up_to_date = True
+    args.skip_up_to_date_ttl = 60
+    updater = wp_update.WPUpdater(args)
+    r = _make_exec_report()
+
+    def fake_baseline(report):  # noqa: ANN001
+        report.needs_update = True
+
+    def failing_backup(report):  # noqa: ANN001
+        # Mirror the real method: backup_ok is only set True on success.
+        raise wp_update.SSHError("tar: uploads/secret.pdf: Permission denied")
+
+    with (
+        patch.object(updater, "_step_ssh_preflight"),
+        patch.object(updater, "_step_collect_baseline", side_effect=fake_baseline),
+        patch.object(updater, "_step_disk_check"),
+        patch.object(updater, "_step_backup", side_effect=failing_backup),
+        patch.object(updater, "_step_rollback") as mock_rollback,
+    ):
+        updater._process_site(r)
+
+    mock_rollback.assert_not_called()
+    assert r.backup_ok is False
+    assert r.overall == "failed"
+    assert r.failure_step == "backup"
+
+
+def test_update_failure_after_good_backup_triggers_rollback(tmp_path: Path) -> None:
+    """The flip side of the gate: when the backup succeeded (backup_ok=True)
+    and a later update step breaks the site, rollback MUST fire. Proves the
+    backup_ok gate didn't disable legitimate rollbacks."""
+    args = make_args(tmp_path, execute=True)
+    args.env_file.write_text("SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=pw\n")
+    args.recheck_updates = False
+    args.no_skip_up_to_date = True
+    args.skip_up_to_date_ttl = 60
+    updater = wp_update.WPUpdater(args)
+    r = _make_exec_report()
+
+    def fake_baseline(report):  # noqa: ANN001
+        report.needs_update = True
+
+    def good_backup(report):  # noqa: ANN001
+        report.backup_ok = True
+
+    with (
+        patch.object(updater, "_step_ssh_preflight"),
+        patch.object(updater, "_step_collect_baseline", side_effect=fake_baseline),
+        patch.object(updater, "_step_disk_check"),
+        patch.object(updater, "_step_backup", side_effect=good_backup),
+        patch.object(updater, "_step_capture_ownership"),
+        patch.object(updater, "_step_update_core"),
+        patch.object(updater, "_step_update_themes",
+                     side_effect=wp_update.SSHError("theme update broke site")),
+        patch.object(updater, "_step_rollback") as mock_rollback,
+        patch.object(updater, "_ssh"),
+    ):
+        updater._process_site(r)
+
+    mock_rollback.assert_called_once()
+    assert r.backup_ok is True
 
 
 def test_no_skip_up_to_date_forces_full_run_even_when_baseline_empty(
