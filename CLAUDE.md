@@ -7,7 +7,7 @@ This file captures non-obvious gotchas for AI sessions only.
 ## Web UI (`webui.py`)
 
 Required env vars: `WEBUI_USERNAME`, `WEBUI_PASSWORD`, `WEBUI_SECRET`.
-Optional remote vars: `WEBUI_REMOTE_HOST`, `WEBUI_REMOTE_USER`, `WEBUI_REMOTE_REPO_PATH`, `WEBUI_REMOTE_PORT`, `WEBUI_REMOTE_IDENTITY`.
+Optional remote vars: `WEBUI_REMOTE_HOST`, `WEBUI_REMOTE_USER`, `WEBUI_REMOTE_REPO_PATH`, `WEBUI_REMOTE_PORT`, `WEBUI_REMOTE_IDENTITY_FILE`.
 Startup: `env WEBUI_USERNAME=admin WEBUI_PASSWORD=testpass WEBUI_SECRET=testsecret python3 webui.py --host 127.0.0.1 --port 8787`
 Provider tabs (Cloudways/Siteground/Cloudron) exist in the UI but only Cloudways has a runner; others return 400.
 Uploaded SSH keys are stored in `.webui-keys/` (gitignored, dir 0700, files 0600).

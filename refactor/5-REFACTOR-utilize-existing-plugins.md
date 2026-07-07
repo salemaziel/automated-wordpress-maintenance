@@ -1,6 +1,6 @@
 # Utilizing already-installed plugins
 
-**NOTE: Ideas mentioned in this file WILL modify WILL cause changes in the refactor plan. Explicit mention of the changes at the bottom of this document.**
+**NOTE: Ideas mentioned in this file will modify and cause changes in the refactor plan. Explicit mention of the changes at the bottom of this document.**
 
 ***
 

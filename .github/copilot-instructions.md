@@ -55,7 +55,7 @@ The script defaults to `.env`, `clients/`, `logs/`, and `db/wpmaint.db` under th
 | File | Purpose |
 |---|---|
 | `wp_update.py` | Main automation CLI — all update, backup, rollback logic |
-| `webui.py` | Flask-based web UI for triggering and monitoring runs |
+| `webui.py` | Web UI (stdlib `http.server`) for triggering and monitoring runs |
 | `db.py` | SQLite persistence layer (`db/wpmaint.db`) — run history, deduplication |
 | `sheet_update.py` | Google Sheets post-run hook — writes next/last update dates |
 | `scripts/convert_cloudways.py` | Converts text manifest → per-client Cloudways JSON files |

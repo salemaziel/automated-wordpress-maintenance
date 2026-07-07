@@ -33,6 +33,7 @@ def main() -> int:
     summaries = sorted(args.logs_dir.glob("wp-update-summary-*.json"))
     if not summaries:
         print(f"No summaries found in {args.logs_dir}")
+        conn.close()
         return 0
 
     ok = skipped = failed = 0
@@ -52,6 +53,7 @@ def main() -> int:
             ok += 1
     print(f"\nIngested: {ok}   Skipped: {skipped}   Failed: {failed}")
     print(f"DB: {args.db_path}")
+    conn.close()
     return 0 if failed == 0 else 1
 
 

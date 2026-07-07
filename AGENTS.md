@@ -41,11 +41,11 @@ python3 wp_update.py --client-file ./clients/test_juha_staging_cloudways.json --
 
 # Runs the automation update script in **dry run mode** using default settings for .env file  
 # running on all files in clients/ directory **including client sites marked** `woocommerce: true`
-python3 wp_update.py --client-dir ./clients --include-woocommerce --stream
+python3 wp_update.py --clients-dir ./clients --include-woocommerce --stream
 
 # Runs the automation update script in execute mode using default settings for .env file  
 # running on all non-Woocommerce sites in clients/ directory, with streaming logs` 
-python3 wp_update.py --client-dir ./clients --execute --stream
+python3 wp_update.py --clients-dir ./clients --execute --stream
 
 # Shows all flags available for runtime configurations (e.g. ENV_FILE location, CLIENT_DIR 
 # or CLIENT_FILE location, LOG_DIR location, skipping staging sites, skipping SSL verification,

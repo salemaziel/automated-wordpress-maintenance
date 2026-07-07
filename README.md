@@ -38,7 +38,7 @@ For each application listed in the client inventory, the script:
 | `requirements-dev.txt` | Development dependencies for linting and tests |
 | `tests/test_wp_update.py` | Unit tests for helper logic and core non-network behavior |
 | `.env.example` | Example local environment file for SSH credentials |
-| `clients/example-client_cloudways.json` | Example client inventory file |
+| `clients/cloudways/example-client/example-client_cloudways.json` | Example client inventory file |
 | `.github/copilot-instructions.md` | Repository-specific guidance for future Copilot sessions |
 
 ## Requirements
@@ -222,7 +222,7 @@ It does **not** create backups or update anything remotely.
 ### Dry-run one client file
 
 ```bash
-python3 wp_update.py --client-file clients/example-client_cloudways.json
+python3 wp_update.py --client-file clients/cloudways/example-client/example-client_cloudways.json
 ```
 
 ### Execute against all client files
@@ -234,7 +234,7 @@ python3 wp_update.py --execute
 ### Execute against one client file
 
 ```bash
-python3 wp_update.py --execute --client-file clients/example-client_cloudways.json
+python3 wp_update.py --execute --client-file clients/cloudways/example-client/example-client_cloudways.json
 ```
 
 ### Include WooCommerce sites
