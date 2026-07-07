@@ -361,6 +361,22 @@ def test_check_login_rate_limit_blocks_after_threshold(conn) -> None:
     assert rl == 1
 
 
+def test_check_login_rate_limit_dedupes_marker_within_window(conn) -> None:
+    for _ in range(5):
+        db.record_auth_event(conn, ip="1.2.3.4", event="login_fail",
+                             username="admin")
+    # Many blocked attempts must not flood auth_events with markers.
+    for _ in range(10):
+        allowed, _ = db.check_login_rate_limit(conn, ip="1.2.3.4",
+                                               max_failures=5,
+                                               within_seconds=60)
+        assert allowed is False
+    rl = conn.execute(
+        "SELECT COUNT(*) AS n FROM auth_events WHERE event='rate_limited'"
+    ).fetchone()["n"]
+    assert rl == 1
+
+
 def test_check_login_rate_limit_allows_when_under_threshold(conn) -> None:
     for _ in range(2):
         db.record_auth_event(conn, ip="1.2.3.4", event="login_fail",

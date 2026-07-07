@@ -523,13 +523,27 @@ def check_login_rate_limit(
         ).fetchone()
         n = int(row["n"]) if row else 0
         if n >= max_failures:
-            conn.execute(
+            # Record at most one rate_limited marker per IP per window.
+            # Without this de-dup a sustained brute-force/DoS from one IP
+            # inserts a row on every blocked request, letting an attacker
+            # flood the table and consume disk. One marker per window is
+            # also the more meaningful signal for later inspection.
+            already = conn.execute(
                 """
-                INSERT INTO auth_events(ts, ip, username, event, detail)
-                VALUES (?, ?, NULL, 'rate_limited', ?)
+                SELECT 1 FROM auth_events
+                 WHERE ip = ? AND event = 'rate_limited' AND ts >= ?
+                 LIMIT 1
                 """,
-                (_now_iso(), ip, f"{n} fails in {within_seconds}s"),
-            )
+                (ip, cutoff),
+            ).fetchone()
+            if not already:
+                conn.execute(
+                    """
+                    INSERT INTO auth_events(ts, ip, username, event, detail)
+                    VALUES (?, ?, NULL, 'rate_limited', ?)
+                    """,
+                    (_now_iso(), ip, f"{n} fails in {within_seconds}s"),
+                )
             return False, within_seconds
     return True, 0
 
