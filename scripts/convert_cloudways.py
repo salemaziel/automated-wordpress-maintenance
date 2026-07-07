@@ -220,15 +220,23 @@ def main() -> None:
     records = parse_records(SOURCE.read_text())
     documents = build_documents(records)
 
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    for path in OUTPUT_DIR.glob("*_cloudways.json"):
+    # Provider-scoped layout: clients/cloudways/<slug>/<slug>_cloudways.json.
+    # wp_update.py and the web UI discover Cloudways inventory here; writing
+    # to the legacy flat clients/*.json would leave duplicate files that get
+    # double-processed. This regenerates from the text manifest (source of
+    # truth), so wiping the nested tree first is intentional.
+    cloudways_dir = OUTPUT_DIR / "cloudways"
+    cloudways_dir.mkdir(parents=True, exist_ok=True)
+    for path in cloudways_dir.glob("**/*_cloudways.json"):
         path.unlink()
 
     for slug, document in documents.items():
-        output_path = OUTPUT_DIR / f"{slug}_cloudways.json"
+        client_dir = cloudways_dir / slug
+        client_dir.mkdir(parents=True, exist_ok=True)
+        output_path = client_dir / f"{slug}_cloudways.json"
         output_path.write_text(json.dumps(document, indent=2) + "\n")
 
-    print(f"Generated {len(documents)} files in {OUTPUT_DIR}")
+    print(f"Generated {len(documents)} files in {cloudways_dir}")
 
 
 if __name__ == "__main__":
