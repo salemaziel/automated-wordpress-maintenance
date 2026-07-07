@@ -71,11 +71,16 @@ def next_monday(today: date) -> date:
     return today + timedelta(days=days)
 
 
+_MONTH_ABBR = ("", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
 def format_sheet_date(d: date) -> str:
     """Render a date in the sheet's existing format, e.g. '8 May 2026'."""
-    # %-d works on Linux/macOS; explicit lstrip avoids the Windows
-    # '%-d not recognized' edge case in case anyone runs this on Windows.
-    return f"{d.day} {d.strftime('%b')} {d.year}"
+    # Locale-independent English abbreviation. strftime('%b') would emit a
+    # localized month name (e.g. 'Mai') on a non-English host and corrupt
+    # the sheet; a static lookup keeps output stable regardless of locale.
+    return f"{d.day} {_MONTH_ABBR[d.month]} {d.year}"
 
 
 def build_value_ranges(

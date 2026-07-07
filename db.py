@@ -441,7 +441,8 @@ def _extract_plugin_rows(
     rows: list[tuple[Any, ...]] = []
     seen: set[str] = set()
 
-    for step in site.get("steps") or []:
+    steps = site.get("steps")
+    for step in steps if isinstance(steps, list) else []:
         if not isinstance(step, dict):
             continue
         name = str(step.get("name") or "")

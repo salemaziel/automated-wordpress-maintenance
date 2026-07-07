@@ -217,7 +217,7 @@ def build_documents(records: list[dict]) -> dict[str, dict]:
 
 
 def main() -> None:
-    records = parse_records(SOURCE.read_text())
+    records = parse_records(SOURCE.read_text(encoding="utf-8"))
     documents = build_documents(records)
 
     # Provider-scoped layout: clients/cloudways/<slug>/<slug>_cloudways.json.
@@ -234,7 +234,7 @@ def main() -> None:
         client_dir = cloudways_dir / slug
         client_dir.mkdir(parents=True, exist_ok=True)
         output_path = client_dir / f"{slug}_cloudways.json"
-        output_path.write_text(json.dumps(document, indent=2) + "\n")
+        output_path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
 
     print(f"Generated {len(documents)} files in {cloudways_dir}")
 
