@@ -2761,6 +2761,13 @@ echo 'rollback-ok'
             if allow_empty:
                 return []
             raise WPCliError(f"Empty output from: wp {wp_cmd}")
+        # Baseline reads (plugin/theme list, core check-update) all return a
+        # JSON array. Use the same noise-tolerant scanner as the update paths
+        # so a stray PHP notice or plugin-emitted line around the array does
+        # not turn a healthy site into a false pre-flight failure.
+        entries = _extract_wpcli_json_array(raw)
+        if entries is not None:
+            return entries
         try:
             return json.loads(raw)
         except json.JSONDecodeError as exc:

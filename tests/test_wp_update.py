@@ -1243,6 +1243,29 @@ def test_extract_wpcli_json_array_helper() -> None:
     assert wp_update._extract_wpcli_json_array('[notjson [1,2,3]') == [1, 2, 3]
 
 
+def test_wp_json_tolerates_noise_around_array(tmp_path: Path) -> None:
+    """Baseline reads (plugin/theme list) must survive stray output around the
+    JSON array, the same way the update paths do — otherwise a noisy but
+    healthy site is falsely failed during pre-flight before backup/update."""
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    raw = (
+        "PHP Notice: undefined index in /path/mu-plugin.php on line 3\n"
+        '[{"name":"akismet","status":"active","update":"available"}]'
+    )
+    with patch.object(updater, "_wp", return_value=raw):
+        entries = updater._wp_json(r, "plugin list --format=json")
+    assert entries == [{"name": "akismet", "status": "active", "update": "available"}]
+
+
+def test_wp_json_raises_on_unparseable_output(tmp_path: Path) -> None:
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    with patch.object(updater, "_wp", return_value="fatal error, no json here"), \
+            pytest.raises(wp_update.WPCliError):
+        updater._wp_json(r, "plugin list --format=json")
+
+
 def test_run_plugin_update_structured_returns_error_on_malformed_json(tmp_path: Path) -> None:
     updater = _make_updater(tmp_path)
     r = _make_exec_report()
