@@ -441,6 +441,36 @@ def test_cancel_run_returns_unknown_for_missing() -> None:
     assert webui.cancel_run("does-not-exist")["status"] == "unknown"
 
 
+def test_stream_run_swallows_client_disconnect() -> None:
+    record = webui.RunRecord(run_id="stream-bp", command=[], mode="dry-run", target="local")
+    record.lines.extend(["first line", "second line"])
+    record.mark_finished(0)
+    with webui.RUNS_LOCK:
+        webui.RUNS["stream-bp"] = record
+
+    class DisconnectedWfile:
+        def write(self, _data: bytes) -> int:
+            raise BrokenPipeError(32, "Broken pipe")
+
+        def flush(self) -> None:
+            return None
+
+    handler = webui.WebUIHandler.__new__(webui.WebUIHandler)
+    handler.wfile = DisconnectedWfile()  # type: ignore[attr-defined]
+    handler.send_response = lambda *_a, **_k: None  # type: ignore[attr-defined]
+    handler.send_header = lambda *_a, **_k: None  # type: ignore[attr-defined]
+    handler.end_headers = lambda: None  # type: ignore[attr-defined]
+    handler.send_error = lambda *_a, **_k: None  # type: ignore[attr-defined]
+
+    try:
+        handler._stream_run("stream-bp")
+    finally:
+        with webui.RUNS_LOCK:
+            webui.RUNS.pop("stream-bp", None)
+
+    assert record.listeners == []
+
+
 def test_cancel_run_is_idempotent_for_already_finished() -> None:
     record = webui.RunRecord(run_id="done1", command=[], mode="dry-run", target="local")
     record.mark_finished(0)

@@ -1415,6 +1415,8 @@ class WebUIHandler(BaseHTTPRequestHandler):
                     send_event("done", json.dumps({"status": record.status, "exitCode": record.exit_code}))
                     return
                 send_event("line", item)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
         finally:
             with record.lock:
                 if listener in record.listeners:
