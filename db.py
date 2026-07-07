@@ -116,7 +116,19 @@ def open_db(path: Path | str) -> sqlite3.Connection:
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=10000")
         _apply_schema(conn)
+        _ensure_columns(conn)
     return conn
+
+
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    """Idempotently add additive columns introduced after the initial
+    schema. SQLite has no ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS``, so
+    guard each add with a PRAGMA check — this is safe to run on every boot
+    and avoids the crash-reapply hazard a bare ALTER would create inside
+    the migration framework."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(site_outcomes)")}
+    if "skip_kind" not in cols:
+        conn.execute("ALTER TABLE site_outcomes ADD COLUMN skip_kind TEXT")
 
 
 _MIGRATIONS: list[tuple[int, str]] = [
@@ -278,6 +290,33 @@ def mark_ingest_failed(
         )
 
 
+# Site-level skip steps recorded by wp_update.py when SiteReport.overall
+# becomes "skipped". An up-to-date or dedupe skip means the site was
+# confirmed current (nothing to do / it succeeded moments ago), so it
+# counts toward the client-list freshness badge. WooCommerce and staging
+# gates mean the site was never verified and must NOT count as fresh.
+_SITE_SKIP_STEPS = ("up-to-date-skip", "dedupe", "woocommerce-gate", "staging-gate")
+_VERIFIED_CURRENT_SKIPS = ("up-to-date-skip", "dedupe")
+
+
+def _classify_skip(site: dict[str, Any]) -> str | None:
+    """Return the site-level skip kind for a skipped site, else None.
+
+    Reads the structured step name rather than the free-text reason so the
+    classification stays stable if log wording changes. Per-plugin/theme
+    skip steps are ignored — only whole-site skip gates are matched."""
+    if str(site.get("overall") or "").strip().lower() != "skipped":
+        return None
+    steps = site.get("steps")
+    if isinstance(steps, list):
+        for step in steps:
+            if (isinstance(step, dict)
+                    and step.get("name") in _SITE_SKIP_STEPS
+                    and str(step.get("status") or "").strip().lower() == "skipped"):
+                return str(step["name"])
+    return None
+
+
 def ingest_run_summary(
     conn: sqlite3.Connection,
     *,
@@ -315,9 +354,11 @@ def ingest_run_summary(
             str(site.get("failure_detail") or site.get("failure_step") or "").strip()
             or None
         )
+        skip_kind = _classify_skip(site)
         finished_at = _last_step_end(site.get("steps")) or fallback_finished
         site_rows.append(
-            (webui_run_id, client_name, domain, is_staging, outcome, reason, finished_at)
+            (webui_run_id, client_name, domain, is_staging,
+             outcome, reason, skip_kind, finished_at)
         )
         plugin_rows.extend(
             _extract_plugin_rows(
@@ -337,8 +378,8 @@ def ingest_run_summary(
                 """
                 INSERT INTO site_outcomes(
                     webui_run_id, client_name, domain, is_staging,
-                    outcome, reason, finished_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    outcome, reason, skip_kind, finished_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 site_rows,
             )
@@ -765,15 +806,22 @@ def last_success_per_client(
 def last_success_per_domain(
     conn: sqlite3.Connection,
 ) -> dict[str, str]:
-    """Return {domain: max(finished_at)} across execute-mode successes."""
+    """Return {domain: max(finished_at)} for the client-list freshness badge.
+
+    Counts an execute-mode run when the domain was either updated
+    ("success") or confirmed already current — an up-to-date or dedupe
+    skip. WooCommerce and staging-gate skips are excluded because those
+    sites were gated/aborted and never actually verified as current."""
     with _read(conn):
         rows = conn.execute(
             """
             SELECT s.domain, MAX(s.finished_at) AS last_at
               FROM site_outcomes s
               JOIN runs r ON r.webui_run_id = s.webui_run_id
-             WHERE s.outcome = 'success'
-               AND r.mode = 'execute'
+             WHERE r.mode = 'execute'
+               AND (s.outcome = 'success'
+                    OR (s.outcome = 'skipped'
+                        AND s.skip_kind IN ('up-to-date-skip', 'dedupe')))
              GROUP BY s.domain
             """
         ).fetchall()

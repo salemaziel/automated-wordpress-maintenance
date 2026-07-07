@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -150,6 +151,72 @@ def test_ingest_run_summary_inserts_sites_and_plugins(conn) -> None:
     assert all(p["client_name"] == "William" for p in plugins)
 
 
+def _seed_execute_run(conn, webui_run_id):
+    db.insert_run_started(
+        conn, webui_run_id=webui_run_id, provider="cloudways", mode="execute",
+        target="local", client_file="c.json", include_woo=False, started_by="admin",
+    )
+    db.update_run_finished(
+        conn, webui_run_id=webui_run_id, status="success", exit_code=0,
+        summary_path=f"logs/wp-update-summary-{webui_run_id}.json",
+    )
+
+
+def test_skip_kind_classified_and_counts_toward_freshness(conn) -> None:
+    """Up-to-date and dedupe skips are 'verified current' — they set
+    skip_kind and bump the client-list freshness date. WooCommerce and
+    staging-gate skips do not."""
+    cases = {
+        "uptodate.com": ("up-to-date-skip", True),
+        "dedupe.com": ("dedupe", True),
+        "woo.com": ("woocommerce-gate", False),
+        "staging.com": ("staging-gate", False),
+    }
+    for i, (domain, (step_name, _fresh)) in enumerate(cases.items()):
+        rid = f"run{i}"
+        _seed_execute_run(conn, rid)
+        db.ingest_run_summary(conn, webui_run_id=rid, summary={
+            "sites": [{
+                "client": "C", "domain": domain, "overall": "skipped",
+                "steps": [{"name": step_name, "status": "skipped",
+                           "ended": "2026-06-09T23:48:00+00:00", "detail": "x"}],
+            }],
+        })
+
+    stored = {
+        r["domain"]: r["skip_kind"]
+        for r in conn.execute("SELECT domain, skip_kind FROM site_outcomes")
+    }
+    assert stored == {
+        "uptodate.com": "up-to-date-skip",
+        "dedupe.com": "dedupe",
+        "woo.com": "woocommerce-gate",
+        "staging.com": "staging-gate",
+    }
+
+    fresh = db.last_success_per_domain(conn)
+    assert set(fresh) == {"uptodate.com", "dedupe.com"}
+    assert "woo.com" not in fresh
+    assert "staging.com" not in fresh
+
+
+def test_success_outcome_has_null_skip_kind(conn) -> None:
+    _seed_execute_run(conn, "ok")
+    db.ingest_run_summary(conn, webui_run_id="ok", summary={
+        "sites": [{
+            "client": "C", "domain": "live.com", "overall": "success",
+            "steps": [{"name": "final-verification", "status": "success",
+                       "ended": "2026-06-09T23:48:00+00:00", "detail": "ok"}],
+            "baseline": {"plugin_updates": []},
+        }],
+    })
+    row = conn.execute(
+        "SELECT skip_kind FROM site_outcomes WHERE domain='live.com'"
+    ).fetchone()
+    assert row["skip_kind"] is None
+    assert "live.com" in db.last_success_per_domain(conn)
+
+
 def test_ingest_dry_run_uses_baseline_for_planned_plugin_rows(conn) -> None:
     _seed_run(conn)
     summary = {
@@ -248,14 +315,19 @@ def test_client_history_returns_last_touched_and_failures(conn) -> None:
 def test_plugin_failure_stats_aggregates_by_plugin(conn) -> None:
     _seed_run(conn, "r1")
     _seed_run(conn, "r2")
+    # Timestamps must be relative to "now": plugin_failure_stats only counts
+    # rows inside a rolling 30-day window, so hardcoded dates rot and the
+    # test would start failing weeks after it was written.
+    early = db._now_iso(time.time() - 7200)   # 2h ago
+    late = db._now_iso(time.time() - 3600)    # 1h ago
     db.ingest_run_summary(conn, webui_run_id="r1", summary={
         "sites": [{"client": "C", "domain": "d", "overall": "success",
                    "is_staging": False,
                    "steps": [
                        {"name": "plugin-update:perfmatters", "status": "failed",
-                        "ended": "2026-04-25T10:00:00+00:00", "detail": "broke"},
+                        "ended": early, "detail": "broke"},
                        {"name": "plugin-update:wpseo", "status": "skipped",
-                        "ended": "2026-04-25T10:00:01+00:00", "detail": ""},
+                        "ended": early, "detail": ""},
                    ],
                    "baseline": {}}]
     })
@@ -264,14 +336,14 @@ def test_plugin_failure_stats_aggregates_by_plugin(conn) -> None:
                    "is_staging": False,
                    "steps": [
                        {"name": "plugin-update:perfmatters", "status": "failed",
-                        "ended": "2026-04-25T11:00:00+00:00", "detail": "broke"},
+                        "ended": late, "detail": "broke"},
                    ],
                    "baseline": {}}]
     })
     stats = {row["plugin"]: row for row in db.plugin_failure_stats(conn)}
     assert stats["perfmatters"]["fail_count"] == 2
     assert stats["wpseo"]["skip_count"] == 1
-    assert stats["perfmatters"]["last_failure_at"] == "2026-04-25T11:00:00+00:00"
+    assert stats["perfmatters"]["last_failure_at"] == late
 
 
 def test_check_login_rate_limit_blocks_after_threshold(conn) -> None:
