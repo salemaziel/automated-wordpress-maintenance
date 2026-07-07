@@ -197,6 +197,34 @@ def _extract_plugin_error(result: dict) -> str:
     return f"status={result.get('status', '?')}"
 
 
+def _extract_wpcli_json_array(raw: str) -> list | None:
+    """Locate and parse the JSON array emitted by `wp ... --format=json`.
+
+    WP-CLI prints the JSON array on stdout, but plugins/themes can emit their
+    own noise (PHP notices, or an Elementor "data updater process has been
+    queued. [array (...)]" dump) before OR after it. A naive `raw.find("[")`
+    + `json.loads` grabs the first bracket — often one inside that noise
+    (`[info]`, `[array (`) — fails to parse, and masks a *successful* update
+    as a parse error (which then gets logged as a non-fatal skip).
+
+    Scan every '[' offset and use `raw_decode`, which stops at the end of the
+    first valid JSON value, so trailing noise after the array is tolerated
+    too. Return the first bracket that decodes to a list; None if none do.
+    """
+    decoder = json.JSONDecoder()
+    start = raw.find("[")
+    while start != -1:
+        try:
+            value, _ = decoder.raw_decode(raw[start:])
+        except json.JSONDecodeError:
+            start = raw.find("[", start + 1)
+            continue
+        if isinstance(value, list):
+            return value
+        start = raw.find("[", start + 1)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
@@ -1955,12 +1983,10 @@ echo 'backup-ok'
         except (SSHError, WPCliError) as exc:
             return {"name": slug, "status": "Error", "_exit_nonzero": True, "_error": str(exc)}
 
-        bracket = raw.find("[")
-        if bracket == -1:
-            return {"name": slug, "status": "Error", "_parse_error": True, "_raw": raw}
-        try:
-            entries = json.loads(raw[bracket:])
-        except json.JSONDecodeError:
+        # Robustly locate the JSON array even when a theme emits its own
+        # noise (PHP notices, etc.) before or after it.
+        entries = _extract_wpcli_json_array(raw)
+        if entries is None:
             return {"name": slug, "status": "Error", "_parse_error": True, "_raw": raw}
 
         for entry in entries:
@@ -2098,13 +2124,10 @@ echo 'backup-ok'
         except (SSHError, WPCliError) as exc:
             return {"name": slug, "status": "Error", "_exit_nonzero": True, "_error": str(exc)}
 
-        # Strip PHP warnings / notices that may appear before the JSON array
-        bracket = raw.find("[")
-        if bracket == -1:
-            return {"name": slug, "status": "Error", "_parse_error": True, "_raw": raw}
-        try:
-            entries = json.loads(raw[bracket:])
-        except json.JSONDecodeError:
+        # Robustly locate the JSON array even when a plugin emits its own
+        # noise (PHP notices, Elementor's "[array (...)]" dump) around it.
+        entries = _extract_wpcli_json_array(raw)
+        if entries is None:
             return {"name": slug, "status": "Error", "_parse_error": True, "_raw": raw}
 
         for entry in entries:

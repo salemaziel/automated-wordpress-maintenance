@@ -1181,6 +1181,68 @@ def test_run_plugin_update_structured_strips_php_warnings(tmp_path: Path) -> Non
     assert result["status"] == "Updated"
 
 
+def test_run_plugin_update_structured_tolerates_bracket_noise_before_json(tmp_path: Path) -> None:
+    """Regression: a plugin (e.g. Elementor's data-updater) can print output
+    containing '[' before the real JSON array. The naive raw.find('[') grabbed
+    that bracket and failed to parse, masking a successful update as a skip.
+    Reproduces the rcfedisasterhelp.com / ninja-forms false-negative."""
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    raw = (
+        "2026-06-25 19:26:28 [info] Elementor data updater process has been "
+        "queued. [array (\n  0 => 'foo',\n)]\n"
+        '[{"name":"ninja-forms","status":"Updated","version":"3.14.7"}]'
+    )
+    with patch.object(updater, "_wp", return_value=raw):
+        result = updater._run_plugin_update_structured(r, "ninja-forms")
+    assert result["status"] == "Updated"
+    assert result["name"] == "ninja-forms"
+    assert not result.get("_parse_error")
+
+
+def test_run_plugin_update_structured_tolerates_noise_after_json(tmp_path: Path) -> None:
+    """Trailing noise after the JSON array must not break parsing."""
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    raw = (
+        '[{"name":"my-plugin","status":"Updated","version":"2.0"}]\n'
+        "Success: Plugin updated. [some trailing array (...)] noise"
+    )
+    with patch.object(updater, "_wp", return_value=raw):
+        result = updater._run_plugin_update_structured(r, "my-plugin")
+    assert result["status"] == "Updated"
+
+
+def test_run_theme_update_structured_tolerates_bracket_noise(tmp_path: Path) -> None:
+    """Theme path shares the same robust extraction."""
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    raw = (
+        "PHP Notice: undefined [thing] in file.php\n"
+        '[{"name":"my-theme","status":"Updated","version":"6.8.10"}]'
+    )
+    with patch.object(updater, "_wp", return_value=raw):
+        result = updater._run_theme_update_structured(r, "my-theme")
+    assert result["status"] == "Updated"
+    assert not result.get("_parse_error")
+
+
+def test_extract_wpcli_json_array_helper() -> None:
+    """Unit-level coverage of the bracket-scanning extractor."""
+    # noise with brackets before the real array
+    assert wp_update._extract_wpcli_json_array(
+        'log [info] x\n[{"name":"p"}]'
+    ) == [{"name": "p"}]
+    # empty array is valid
+    assert wp_update._extract_wpcli_json_array("noise\n[]") == []
+    # no array at all
+    assert wp_update._extract_wpcli_json_array("just text, no json") is None
+    # empty string
+    assert wp_update._extract_wpcli_json_array("") is None
+    # a bracketed non-list before the list must be skipped
+    assert wp_update._extract_wpcli_json_array('[notjson [1,2,3]') == [1, 2, 3]
+
+
 def test_run_plugin_update_structured_returns_error_on_malformed_json(tmp_path: Path) -> None:
     updater = _make_updater(tmp_path)
     r = _make_exec_report()
