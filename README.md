@@ -33,11 +33,12 @@ For each application listed in the client inventory, the script:
 | Path | Purpose |
 |------|---------|
 | `wp_update.py` | The entire maintenance CLI and orchestration logic |
+| `webui.py` | Authenticated browser console for running the CLI and managing client JSON |
 | `pyproject.toml` | Configuration for `pytest` and `ruff` |
 | `requirements-dev.txt` | Development dependencies for linting and tests |
 | `tests/test_wp_update.py` | Unit tests for helper logic and core non-network behavior |
 | `.env.example` | Example local environment file for SSH credentials |
-| `clients/example-client_cloudways.json` | Example client inventory file |
+| `clients/cloudways/example-client/example-client_cloudways.json` | Example client inventory file |
 | `.github/copilot-instructions.md` | Repository-specific guidance for future Copilot sessions |
 
 ## Requirements
@@ -221,7 +222,7 @@ It does **not** create backups or update anything remotely.
 ### Dry-run one client file
 
 ```bash
-python3 wp_update.py --client-file clients/example-client_cloudways.json
+python3 wp_update.py --client-file clients/cloudways/example-client/example-client_cloudways.json
 ```
 
 ### Execute against all client files
@@ -233,7 +234,7 @@ python3 wp_update.py --execute
 ### Execute against one client file
 
 ```bash
-python3 wp_update.py --execute --client-file clients/example-client_cloudways.json
+python3 wp_update.py --execute --client-file clients/cloudways/example-client/example-client_cloudways.json
 ```
 
 ### Include WooCommerce sites
@@ -256,6 +257,68 @@ By default, stdout is informational while the file log captures DEBUG detail. Us
 
 ```bash
 python3 wp_update.py --execute --stream
+```
+
+## Web UI
+
+`webui.py` serves a small authenticated operations console around the same
+`wp_update.py` workflow. It does not change the updater's safety model: dry-run
+is still the default, execute mode is explicit, and WooCommerce sites remain
+excluded unless selected.
+
+Configure a login before starting it:
+
+```bash
+export WEBUI_USERNAME=admin
+export WEBUI_PASSWORD='choose-a-strong-password'
+export WEBUI_SECRET='choose-a-long-random-session-secret'
+python3 webui.py
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8787
+```
+
+The UI supports:
+
+- provider tabs for Cloudways, Siteground, Cloudron, plus browser-saved custom providers
+- local dry-run or execute runs with live `--stream` output
+- remote dry-run or execute runs over SSH with live `--stream` output
+- optional WooCommerce inclusion
+- selecting all clients or a single `clients/*_cloudways.json` file
+- uploading private SSH keys for local runs or remote-server SSH identity
+- importing a full client JSON file
+- manually creating a single-application client JSON file
+
+Cloudways is the only provider with a configured runner today because the
+current maintenance script is Cloudways-specific. Siteground, Cloudron, and
+custom provider tabs can be used to stage/provider-label inventory, but starting
+a run from those tabs is blocked until a provider-specific runner is added.
+
+Uploaded SSH keys are stored under `.webui-keys/` with `0600` file permissions.
+For local runs, the selected key is passed to `wp_update.py` with `--ssh-key`.
+For remote runs, the selected key is used as the SSH identity for connecting to
+the remote server when no explicit remote identity file is entered.
+
+For remote execution, the remote server must already have this repository
+checked out and configured with its own `.env`. The UI connects with SSH batch
+mode and runs:
+
+```text
+cd <WEBUI_REMOTE_REPO_PATH> && python3 wp_update.py --stream ...
+```
+
+Optional remote defaults can be configured in `.env`:
+
+```bash
+export WEBUI_REMOTE_HOST=203.0.113.10
+export WEBUI_REMOTE_USER=deploy
+export WEBUI_REMOTE_PORT=22
+export WEBUI_REMOTE_REPO_PATH=/srv/claude-wordpress-maintenance
+export WEBUI_REMOTE_IDENTITY_FILE=~/.ssh/id_ed25519
+export WEBUI_REMOTE_PYTHON=python3
 ```
 
 ### Use custom paths

@@ -7,8 +7,23 @@ __pycache__
 .gemini/
 .omx/
 .omg/
+.omc/
 .serena/
+.webui-keys/
+db/
+memory/
+logs/
 IP_WHITELIST.txt
 notes/
 clients/*_cloudways.json
+clients/
 !clients/example-client_cloudways.json
+
+# local runtime / editor / scratch (not for the repo)
+webui.db
+tilix-history.json
+.run_watch.sh
+.mcp.json
+.vscode/
+siteground.pub
+*-search-*.csv

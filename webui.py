@@ -1,0 +1,2315 @@
+#!/usr/bin/env python3
+"""Authenticated web UI for running wp_update.py locally or over SSH."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import contextlib
+import hashlib
+import hmac
+import json
+import os
+import queue
+import re
+import secrets
+import shlex
+import signal
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from http import HTTPStatus
+from http.cookies import SimpleCookie
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+
+import db
+
+ROOT = Path(__file__).resolve().parent
+CLIENTS_DIR = ROOT / "clients"
+SCRIPT_PATH = ROOT / "wp_update.py"
+KEYS_DIR = ROOT / ".webui-keys"
+LOGS_DIR = ROOT / "logs"
+# Directory under CLIENTS_DIR used to soft-delete client JSON files. Files
+# inside it are hidden from the picker and excluded by wp_update.py's
+# inventory scan; restoring moves them back to their original active path.
+ARCHIVE_SEGMENT = "_archived"
+ARCHIVE_DIR = CLIENTS_DIR / ARCHIVE_SEGMENT
+DB_PATH = ROOT / "db" / "wpmaint.db"
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8787
+SESSION_COOKIE = "wpmaint_session"
+CSRF_COOKIE = "csrf_token"
+SESSION_TTL_SECONDS = 12 * 60 * 60
+MAX_BODY_BYTES = 1024 * 1024
+LOGIN_MAX_FAILURES = 5
+LOGIN_FAILURE_WINDOW_SECONDS = 60
+
+_RUN_ID_PATTERN = re.compile(r"WordPress Maintenance Run\s*\|\s*ID:\s*(\S+)")
+_SUMMARY_PATTERN = re.compile(r"Summary written to (.+\.json)\s*$")
+
+DB_CONN: sqlite3.Connection | None = None
+
+
+@dataclass(frozen=True)
+class Settings:
+    host: str = DEFAULT_HOST
+    port: int = DEFAULT_PORT
+    username: str = "admin"
+    password: str = ""
+    secret: str = ""
+    remote_host: str = ""
+    remote_user: str = ""
+    remote_port: int = 22
+    remote_repo_path: str = ""
+    remote_identity_file: str = ""
+    remote_python: str = "python3"
+
+    @classmethod
+    def from_env(cls) -> Settings:
+        secret = os.environ.get("WEBUI_SECRET") or secrets.token_urlsafe(32)
+        return cls(
+            host=os.environ.get("WEBUI_HOST", DEFAULT_HOST),
+            port=int(os.environ.get("WEBUI_PORT", str(DEFAULT_PORT))),
+            username=os.environ.get("WEBUI_USERNAME", "admin"),
+            password=os.environ.get("WEBUI_PASSWORD", ""),
+            secret=secret,
+            remote_host=os.environ.get("WEBUI_REMOTE_HOST", ""),
+            remote_user=os.environ.get("WEBUI_REMOTE_USER", ""),
+            remote_port=int(os.environ.get("WEBUI_REMOTE_PORT", "22")),
+            remote_repo_path=os.environ.get("WEBUI_REMOTE_REPO_PATH", ""),
+            remote_identity_file=os.environ.get("WEBUI_REMOTE_IDENTITY_FILE", ""),
+            remote_python=os.environ.get("WEBUI_REMOTE_PYTHON", "python3"),
+        )
+
+
+@dataclass
+class RunRecord:
+    run_id: str
+    command: list[str]
+    mode: str
+    target: str
+    client_file: str = ""
+    include_woo: bool = False
+    started_by: str = ""
+    started_at: float = field(default_factory=time.time)
+    status: str = "running"
+    exit_code: int | None = None
+    wp_run_id: str | None = None
+    summary_path: str | None = None
+    log_path: str | None = None
+    lines: list[str] = field(default_factory=list)
+    listeners: list[queue.Queue[str | None]] = field(default_factory=list)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    proc: subprocess.Popen[str] | None = None
+    cancel_requested: bool = False
+    cancelled_at: float | None = None
+
+    def publish(self, line: str) -> None:
+        with self.lock:
+            self.lines.append(line)
+            listeners = list(self.listeners)
+        for listener in listeners:
+            listener.put(line)
+
+    def mark_finished(self, exit_code: int) -> None:
+        # Set terminal status WITHOUT notifying listeners. Caller must
+        # invoke notify_done() after DB finalization so the SSE 'done'
+        # event never beats the persisted summary.
+        with self.lock:
+            self.exit_code = exit_code
+            if self.cancel_requested:
+                self.status = "cancelled"
+            else:
+                self.status = "success" if exit_code == 0 else "failed"
+
+    def notify_done(self) -> None:
+        with self.lock:
+            listeners = list(self.listeners)
+        for listener in listeners:
+            listener.put(None)
+
+    def finish(self, exit_code: int) -> None:
+        # Compatibility shim for early-failure paths that have no DB to
+        # finalize. New code should prefer mark_finished + notify_done.
+        self.mark_finished(exit_code)
+        self.notify_done()
+
+
+RUNS: dict[str, RunRecord] = {}
+RUNS_LOCK = threading.Lock()
+
+
+def init_db(path: Path | None = None) -> sqlite3.Connection:
+    """Open the persistent DB, sweep orphaned 'running' rows, and retry
+    any pending summary ingests left behind by a prior crash."""
+    global DB_CONN
+    target = path or DB_PATH
+    target.parent.mkdir(parents=True, exist_ok=True)
+    DB_CONN = db.open_db(target)
+    with RUNS_LOCK:
+        alive = set(RUNS.keys())
+    db.sweep_orphan_running(DB_CONN, alive_ids=alive)
+    db.reconcile_pending_ingests(DB_CONN, log_dir=LOGS_DIR)
+    return DB_CONN
+
+
+def sign_session(
+    username: str, secret: str, now: int | None = None, csrf: str = ""
+) -> str:
+    issued = int(now if now is not None else time.time())
+    body: dict[str, Any] = {"u": username, "iat": issued}
+    if csrf:
+        body["c"] = csrf
+    payload = json.dumps(body, separators=(",", ":")).encode()
+    encoded = base64.urlsafe_b64encode(payload).decode().rstrip("=")
+    signature = hmac.new(secret.encode(), encoded.encode(), hashlib.sha256).hexdigest()
+    return f"{encoded}.{signature}"
+
+
+def _decode_session(token: str, secret: str, now: int | None = None) -> dict[str, Any] | None:
+    if "." not in token:
+        return None
+    encoded, signature = token.rsplit(".", 1)
+    expected = hmac.new(secret.encode(), encoded.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        return None
+    try:
+        padded = encoded + "=" * (-len(encoded) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode()))
+    except (ValueError, json.JSONDecodeError):
+        return None
+    issued = int(payload.get("iat", 0))
+    current = int(now if now is not None else time.time())
+    if current - issued > SESSION_TTL_SECONDS:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def verify_session(token: str, secret: str, now: int | None = None) -> str | None:
+    payload = _decode_session(token, secret, now)
+    if payload is None:
+        return None
+    username = payload.get("u")
+    return username if isinstance(username, str) and username else None
+
+
+def session_csrf(token: str, secret: str, now: int | None = None) -> str | None:
+    payload = _decode_session(token, secret, now)
+    if payload is None:
+        return None
+    csrf = payload.get("c")
+    return csrf if isinstance(csrf, str) and csrf else None
+
+
+def slugify(value: str) -> str:
+    slug = "".join(ch if ch.isalnum() else "-" for ch in value.lower())
+    slug = "-".join(part for part in slug.split("-") if part)
+    return slug or "client"
+
+
+def validate_client_doc(doc: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    provider = str(doc.get("hosting_provider") or "Cloudways").strip() or "Cloudways"
+    if str(doc.get("schema", "")).startswith("siteground_"):
+        # Siteground inventory schema (siteground_wp_cli_inventory_v1) — emitted
+        # by inventory tooling, not the Cloudways form. Validate the per-domain
+        # shape directly: ssh.{host,user} + wordpress.path.
+        if not doc.get("client_name") and not doc.get("domain"):
+            errors.append("client_name is required")
+        ssh = doc.get("ssh")
+        if not isinstance(ssh, dict):
+            errors.append("ssh is required")
+        else:
+            if not ssh.get("host"):
+                errors.append("ssh.host is required")
+            if not ssh.get("user"):
+                errors.append("ssh.user is required")
+        wp = doc.get("wordpress")
+        if not isinstance(wp, dict):
+            errors.append("wordpress is required")
+        else:
+            path = wp.get("path") or ""
+            if not path:
+                errors.append("wordpress.path is required")
+            elif not (path.startswith("/home/") and path.endswith("/public_html")):
+                errors.append("wordpress.path must be a Siteground public_html path")
+        return errors
+    if not doc.get("client_name"):
+        errors.append("client_name is required")
+    if not doc.get("server_ip_address"):
+        errors.append("server_ip_address is required")
+    master = doc.get("master_credentials")
+    if not isinstance(master, dict):
+        errors.append("master_credentials is required")
+    else:
+        if not master.get("username"):
+            errors.append("master_credentials.username is required")
+        if not master.get("password"):
+            errors.append("master_credentials.password is required")
+    apps = doc.get("applications")
+    if not isinstance(apps, list) or not apps:
+        errors.append("at least one application is required")
+    else:
+        for idx, app in enumerate(apps, 1):
+            if not isinstance(app, dict):
+                errors.append(f"applications[{idx}] must be an object")
+                continue
+            if not app.get("website_domain"):
+                errors.append(f"applications[{idx}].website_domain is required")
+            path = app.get("path_to_public_html", "")
+            if not path:
+                errors.append(f"applications[{idx}].path_to_public_html is required")
+            elif provider.casefold() == "cloudways" and (
+                not path.startswith("/home/master/applications/") or not path.endswith("/public_html")
+            ):
+                errors.append(f"applications[{idx}].path_to_public_html must be a Cloudways public_html path")
+    return errors
+
+
+def client_path_for_doc(doc: dict[str, Any], clients_dir: Path = CLIENTS_DIR) -> Path:
+    base = slugify(str(doc.get("client_name") or "client"))
+    provider = slugify(str(doc.get("hosting_provider") or "Cloudways"))
+    target_dir = clients_dir / provider / base
+    candidate = target_dir / f"{base}_{provider}.json"
+    suffix = 2
+    # Look for collisions across both legacy flat layout and the new
+    # per-client subdir layout so the next free -N suffix is correct.
+    while (
+        candidate.exists()
+        or (clients_dir / candidate.name).exists()
+    ):
+        candidate = target_dir / f"{base}-{suffix}_{provider}.json"
+        suffix += 1
+    return candidate
+
+
+def provider_from_client_path(path: Path) -> str:
+    suffix = path.stem.rsplit("_", 1)[-1]
+    return suffix.replace("-", " ").title() if suffix else "Cloudways"
+
+
+def write_client_doc(doc: dict[str, Any], clients_dir: Path = CLIENTS_DIR) -> Path:
+    errors = validate_client_doc(doc)
+    if errors:
+        raise ValueError("; ".join(errors))
+    clients_dir.mkdir(parents=True, exist_ok=True)
+    path = client_path_for_doc(doc, clients_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(doc, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+    return path
+
+
+def key_path_for_name(name: str, keys_dir: Path | None = None) -> Path:
+    keys_dir = keys_dir or KEYS_DIR
+    safe_name = slugify(Path(name).name).replace("-", "_")
+    if not safe_name:
+        safe_name = "ssh_key"
+    return keys_dir / safe_name
+
+
+def write_ssh_key(name: str, content: str, keys_dir: Path | None = None) -> Path:
+    keys_dir = keys_dir or KEYS_DIR
+    text = content.strip() + "\n"
+    if "PRIVATE KEY" not in text.splitlines()[0]:
+        raise ValueError("uploaded file does not look like a private SSH key")
+    keys_dir.mkdir(parents=True, exist_ok=True)
+    keys_dir.chmod(0o700)
+    path = key_path_for_name(name, keys_dir)
+    suffix = 2
+    while path.exists():
+        path = keys_dir / f"{path.stem}_{suffix}"
+        suffix += 1
+    path.write_text(text, encoding="utf-8")
+    path.chmod(0o600)
+    return path
+
+
+def list_ssh_keys(keys_dir: Path | None = None) -> list[dict[str, str]]:
+    keys_dir = keys_dir or KEYS_DIR
+    if not keys_dir.exists():
+        return []
+    return [
+        {"name": path.name, "path": str(path)}
+        for path in sorted(keys_dir.iterdir())
+        if path.is_file()
+    ]
+
+
+def resolve_uploaded_key(name: str, keys_dir: Path | None = None) -> Path | None:
+    keys_dir = keys_dir or KEYS_DIR
+    if not name:
+        return None
+    candidate = keys_dir / Path(name).name
+    if not candidate.is_file():
+        raise ValueError("selected SSH key was not found")
+    return candidate
+
+
+def _normalize_domain_key(value: str) -> str:
+    """Lowercase, strip scheme + leading www. + trailing slashes/path.
+    Old runs stored domains as written in the JSON ("http://foo.com/"),
+    current JSONs are bare hostnames — normalize for cross-version lookup."""
+    if not value:
+        return ""
+    s = str(value).strip().lower()
+    for prefix in ("https://", "http://"):
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+            break
+    if s.startswith("www."):
+        s = s[4:]
+    s = s.split("/", 1)[0]
+    return s.rstrip(".")
+
+
+def list_client_files(clients_dir: Path = CLIENTS_DIR, provider: str | None = None) -> list[dict[str, Any]]:
+    selected_provider = (provider or "").casefold()
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    # Discover both legacy flat (clients/<slug>_<provider>.json) and
+    # per-client subdir (clients/<provider>/<base>/<slug>_<provider>.json)
+    # layouts. Filename is unique across either, so we key by `path.name`.
+    candidates: list[Path] = []
+    for pattern in ("*.json", "*/*.json", "*/*/*.json"):
+        for p in clients_dir.glob(pattern):
+            # Archived clients live under clients/_archived/ and are hidden
+            # from the picker. Use list_archived_client_files() to surface
+            # them in the "Archived" panel for restoration.
+            if ARCHIVE_SEGMENT in p.parts:
+                continue
+            candidates.append(p)
+    # Dedupe: when a per-domain file `<slug>_<domain>_cloudways.json` exists
+    # in a directory, suppress sibling files whose every domain is already
+    # covered by such a per-domain file. Lets us keep legacy multi-app and
+    # bare-slug files on disk without showing dup picker entries.
+    preferred: set[tuple[str, str]] = set()  # (parent_dir, domain)
+    file_domains: dict[Path, list[str]] = {}
+    for path in candidates:
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            file_domains[path] = []
+            continue
+        apps = doc.get("applications") or []
+        ds: list[str] = []
+        if isinstance(apps, list):
+            for app in apps:
+                if isinstance(app, dict):
+                    d = str(app.get("website_domain") or "").strip()
+                    if d:
+                        ds.append(d)
+        file_domains[path] = ds
+        if len(ds) == 1:
+            stem = path.stem
+            domain = ds[0]
+            if stem.endswith(f"_{domain}_cloudways") or stem.endswith(f"_{domain}"):
+                preferred.add((str(path.parent), domain))
+    superseded: set[Path] = set()
+    for path, ds in file_domains.items():
+        if not ds:
+            continue
+        stem = path.stem
+        is_preferred = (
+            len(ds) == 1
+            and (stem.endswith(f"_{ds[0]}_cloudways") or stem.endswith(f"_{ds[0]}"))
+        )
+        if is_preferred:
+            continue
+        if all((str(path.parent), d) in preferred for d in ds):
+            superseded.add(path)
+    # Pull DB-backed last-success timestamps once per request so we can
+    # badge each client without N+1 queries.
+    # Per-domain rollup ONLY. Client-name rollup conflates multi-server
+    # splits (e.g. alfredo / alfredo-2 / alfredo-3 all share client_name
+    # "Alfredo" but live on different servers — the WC site is its own
+    # file and may not have been touched yet).
+    last_by_domain_raw: dict[str, str] = {}
+    if DB_CONN is not None:
+        with contextlib.suppress(sqlite3.Error):
+            last_by_domain_raw = db.last_success_per_domain(DB_CONN)
+    # Older runs stored domains as written in the JSON ("http://foo.com/",
+    # "foo.com/"); current JSONs are bare hostnames. Normalize both sides so
+    # the lookup hits regardless of historical formatting.
+    last_by_domain: dict[str, str] = {}
+    for raw_domain, ts in last_by_domain_raw.items():
+        key = _normalize_domain_key(raw_domain)
+        if not key:
+            continue
+        prev = last_by_domain.get(key)
+        if prev is None or (ts or "") > prev:
+            last_by_domain[key] = ts
+    for path in sorted(candidates):
+        if path.name in seen:
+            continue
+        if path in superseded:
+            continue
+        seen.add(path.name)
+        label = path.stem
+        client_provider = provider_from_client_path(path)
+        client_name = label
+        has_woo = False
+        domains: list[str] = []
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            schema = str(doc.get("schema", ""))
+            if schema.startswith("siteground_"):
+                # SG inventory schema: top-level `domain` is the only site
+                # for this file, and `client_name` may be absent. Use the
+                # domain as both the display label and the DB lookup key
+                # (matches site_outcomes.client_name written by SG runs).
+                client_name = str(doc.get("client_name") or doc.get("domain") or label)
+                label = client_name
+                client_provider = "Siteground"
+                domain = str(doc.get("domain") or "").strip()
+                if domain:
+                    domains.append(domain)
+            else:
+                client_name = str(doc.get("client_name") or label)
+                label = client_name
+                client_provider = str(doc.get("hosting_provider") or client_provider).strip() or client_provider
+                apps = doc.get("applications") or []
+                if isinstance(apps, list):
+                    for app in apps:
+                        if not isinstance(app, dict):
+                            continue
+                        flags = app.get("environment_flags") or {}
+                        if isinstance(flags, dict) and flags.get("has_woocommerce"):
+                            has_woo = True
+                        domain = str(app.get("website_domain") or "").strip()
+                        if domain:
+                            domains.append(domain)
+        except (OSError, json.JSONDecodeError):
+            pass
+        if selected_provider and client_provider.casefold() != selected_provider:
+            continue
+        # Per-domain rollup: only mark this file as "recently run" if at
+        # least one of ITS domains has a successful execute-mode outcome.
+        # Track which specific domains have/haven't run so the UI can
+        # show "1/2 ok" for partially-completed multi-app files.
+        per_domain_last: dict[str, str | None] = {
+            d: last_by_domain.get(_normalize_domain_key(d)) for d in domains
+        }
+        run_domains = [d for d, v in per_domain_last.items() if v]
+        last_at: str | None = (
+            max(v for v in per_domain_last.values() if v) if run_domains else None
+        )
+        rows.append({
+            "name": path.name,
+            "label": label,
+            "provider": client_provider,
+            "has_woocommerce": has_woo,
+            "domains": domains,
+            "domains_run": run_domains,
+            "domains_total": len(domains),
+            "last_success_at": last_at,
+        })
+    return rows
+
+
+def resolve_client_file(name: str, clients_dir: Path = CLIENTS_DIR) -> Path | None:
+    """Locate an active client JSON by basename. Archived files are
+    ignored — call resolve_archived_client_file() for those."""
+    safe_name = Path(name).name
+    if not safe_name:
+        return None
+    for pattern in (safe_name, f"*/{safe_name}", f"*/*/{safe_name}"):
+        for match in clients_dir.glob(pattern):
+            if ARCHIVE_SEGMENT in match.parts:
+                continue
+            return match
+    return None
+
+
+def resolve_archived_client_file(name: str, clients_dir: Path = CLIENTS_DIR) -> Path | None:
+    """Locate an archived client JSON by basename under clients/_archived/.
+
+    Mirrors resolve_client_file()'s shape so restore endpoints can find a
+    soft-deleted file regardless of how deeply it was nested at archive
+    time (legacy flat layout vs per-provider/per-client subdirs)."""
+    safe_name = Path(name).name
+    if not safe_name:
+        return None
+    archive_root = clients_dir / ARCHIVE_SEGMENT
+    if not archive_root.exists():
+        return None
+    for pattern in (safe_name, f"*/{safe_name}", f"*/*/{safe_name}", f"*/*/*/{safe_name}"):
+        for match in archive_root.glob(pattern):
+            return match
+    return None
+
+
+def archive_client_file(name: str, clients_dir: Path = CLIENTS_DIR) -> Path:
+    """Move an active client JSON into clients/_archived/, preserving its
+    relative path. Returns the new archive path. Idempotent only in the
+    sense that re-archiving raises FileExistsError so the caller knows."""
+    source = resolve_client_file(name, clients_dir)
+    if source is None or not source.exists():
+        raise FileNotFoundError(f"client file not found: {name}")
+    rel = source.resolve().relative_to(clients_dir.resolve())
+    target = clients_dir / ARCHIVE_SEGMENT / rel
+    if target.exists():
+        raise FileExistsError(f"archive target already exists: {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    source.rename(target)
+    return target
+
+
+def restore_client_file(name: str, clients_dir: Path = CLIENTS_DIR) -> Path:
+    """Move an archived client JSON back to its active path. Returns the
+    restored path. Raises if no archived file matches or if a file already
+    exists at the active target (we don't silently overwrite)."""
+    source = resolve_archived_client_file(name, clients_dir)
+    if source is None or not source.exists():
+        raise FileNotFoundError(f"archived client file not found: {name}")
+    archive_root = clients_dir / ARCHIVE_SEGMENT
+    rel = source.resolve().relative_to(archive_root.resolve())
+    target = clients_dir / rel
+    if target.exists():
+        raise FileExistsError(f"active file already exists: {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    source.rename(target)
+    return target
+
+
+def list_archived_client_files(clients_dir: Path = CLIENTS_DIR) -> list[dict[str, Any]]:
+    """Enumerate archived client files for the 'Archived' panel UI."""
+    archive_root = clients_dir / ARCHIVE_SEGMENT
+    if not archive_root.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for pattern in ("*.json", "*/*.json", "*/*/*.json", "*/*/*/*.json"):
+        for path in archive_root.glob(pattern):
+            if path.name in seen:
+                continue
+            seen.add(path.name)
+            try:
+                doc = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                doc = {}
+            rows.append({
+                "name": path.name,
+                "client_name": str(doc.get("client_name") or "").strip(),
+                "archived_path": path.relative_to(clients_dir).as_posix(),
+            })
+    rows.sort(key=lambda r: (r["client_name"].casefold(), r["name"]))
+    return rows
+
+
+def _summarize_client_selection(payload: dict[str, Any]) -> str:
+    raw = payload.get("clientFiles")
+    if isinstance(raw, list):
+        names = [Path(str(x)).name for x in raw if str(x).strip()]
+        if not names:
+            return ""
+        if len(names) == 1:
+            return names[0]
+        return f"{len(names)} files: " + ", ".join(names[:3]) + ("..." if len(names) > 3 else "")
+    return str(payload.get("clientFile") or "").strip()
+
+
+def build_wp_args(payload: dict[str, Any], *, remote: bool = False) -> list[str]:
+    # --stream toggles the wp_update CLI's stdout handler from INFO (default)
+    # to DEBUG (raw SSH commands + WP-CLI output). The webui defaults to INFO
+    # and surfaces a "Show debug logs" checkbox to opt into the firehose.
+    args = ["wp_update.py"]
+    if payload.get("streamDebug"):
+        args.append("--stream")
+    provider = str(payload.get("provider") or "").strip().casefold()
+    if provider in ("cloudways", "siteground"):
+        args.extend(["--provider", provider])
+    if payload.get("execute"):
+        args.append("--execute")
+    if payload.get("includeWooCommerce"):
+        args.append("--include-woocommerce")
+    # Up-to-date skip controls — only meaningful in execute mode, but the
+    # CLI accepts and ignores them otherwise, so forward unconditionally.
+    if payload.get("recheckUpdates"):
+        args.append("--recheck-updates")
+    if payload.get("noSkipUpToDate"):
+        args.append("--no-skip-up-to-date")
+    ttl_raw = payload.get("skipUpToDateTtl")
+    if ttl_raw is not None and str(ttl_raw).strip() != "":
+        # Malformed input from the form silently falls back to the CLI's
+        # 60-minute default rather than aborting the run.
+        with contextlib.suppress(TypeError, ValueError):
+            args.extend(["--skip-up-to-date-ttl", str(int(ttl_raw))])
+    raw_files = payload.get("clientFiles")
+    if isinstance(raw_files, list):
+        names = [str(x).strip() for x in raw_files if str(x).strip()]
+    else:
+        single = str(payload.get("clientFile") or "").strip()
+        names = [single] if single else []
+    seen: set[str] = set()
+    for name in names:
+        safe_name = Path(name).name
+        if not safe_name or safe_name in seen:
+            continue
+        seen.add(safe_name)
+        resolved = resolve_client_file(safe_name)
+        if remote:
+            if resolved is not None:
+                rel = resolved.relative_to(CLIENTS_DIR).as_posix()
+                client_path = f"clients/{rel}"
+            else:
+                client_path = f"clients/{safe_name}"
+        else:
+            client_path = str(resolved) if resolved else str(CLIENTS_DIR / safe_name)
+        args.extend(["--client-file", client_path])
+    selected_key = str(payload.get("sshKey") or "").strip()
+    if selected_key and not remote:
+        key_path = resolve_uploaded_key(selected_key)
+        args.extend(["--ssh-key", str(key_path)])
+    return args
+
+
+def build_local_command(payload: dict[str, Any]) -> list[str]:
+    args = build_wp_args(payload)
+    return [sys.executable, str(SCRIPT_PATH), *args[1:]]
+
+
+def build_remote_command(payload: dict[str, Any], settings: Settings) -> list[str]:
+    host = str(payload.get("remoteHost") or settings.remote_host).strip()
+    user = str(payload.get("remoteUser") or settings.remote_user).strip()
+    repo_path = str(payload.get("remoteRepoPath") or settings.remote_repo_path).strip()
+    port = int(payload.get("remotePort") or settings.remote_port)
+    identity_file = str(payload.get("remoteIdentityFile") or settings.remote_identity_file).strip()
+    selected_key = str(payload.get("sshKey") or "").strip()
+    if selected_key and not identity_file:
+        key_path = resolve_uploaded_key(selected_key)
+        identity_file = str(key_path)
+    remote_python = str(payload.get("remotePython") or settings.remote_python).strip() or "python3"
+    if not host or not user or not repo_path:
+        raise ValueError("remote host, user, and repo path are required")
+
+    wp_args = build_wp_args(payload, remote=True)
+    remote_script = "cd {repo} && exec {python} {args}".format(
+        repo=shlex.quote(repo_path),
+        python=shlex.quote(remote_python),
+        args=" ".join(shlex.quote(part) for part in wp_args),
+    )
+    command = [
+        "ssh",
+        "-p",
+        str(port),
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+    ]
+    if identity_file:
+        command.extend(["-i", identity_file])
+    command.extend([f"{user}@{host}", remote_script])
+    return command
+
+
+def start_run(
+    payload: dict[str, Any], settings: Settings, *, started_by: str = ""
+) -> RunRecord:
+    provider = str(payload.get("provider") or "Cloudways").strip() or "Cloudways"
+    if provider.casefold() not in ("cloudways", "siteground"):
+        raise ValueError(f"{provider} does not have a runner configured yet")
+
+    target = str(payload.get("target") or "local")
+    if target == "remote":
+        command = build_remote_command(payload, settings)
+    else:
+        target = "local"
+        command = build_local_command(payload)
+
+    run_id = secrets.token_hex(8)
+    mode = "execute" if payload.get("execute") else "dry-run"
+    record = RunRecord(
+        run_id=run_id,
+        command=command,
+        mode=mode,
+        target=target,
+        client_file=_summarize_client_selection(payload),
+        include_woo=bool(payload.get("includeWooCommerce")),
+        started_by=started_by,
+    )
+    if DB_CONN is not None:
+        try:
+            db.insert_run_started(
+                DB_CONN,
+                webui_run_id=run_id,
+                provider=provider,
+                mode=mode,
+                target=target,
+                client_file=record.client_file or None,
+                include_woo=record.include_woo,
+                started_by=started_by or None,
+                started_at=record.started_at,
+            )
+        except sqlite3.Error as exc:
+            # Fail closed: a run we cannot persist would silently disappear
+            # from /api/runs after exit because runs_payload only overlays
+            # live records that are still in the 'running' state.
+            print(f"db insert_run_started failed: {exc}", file=sys.stderr)
+            raise RuntimeError(f"could not persist run: {exc}") from exc
+    with RUNS_LOCK:
+        RUNS[run_id] = record
+    thread = threading.Thread(target=_run_process, args=(record,), daemon=True)
+    thread.start()
+    return record
+
+
+def cancel_run(run_id: str, *, grace: float = 8.0) -> dict[str, Any]:
+    """Request cancellation of a live run.
+
+    Sends SIGTERM to the subprocess group, schedules a SIGKILL after the
+    grace window if it is still alive. Idempotent: cancelling a run that
+    has already exited (or is not in RUNS) returns the current status.
+    """
+    with RUNS_LOCK:
+        record = RUNS.get(run_id)
+    if record is None:
+        return {"id": run_id, "status": "unknown"}
+    with record.lock:
+        record.cancel_requested = True
+        record.cancelled_at = time.time()
+        proc = record.proc
+    if proc is None or proc.poll() is not None:
+        return {"id": run_id, "status": record.status}
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return {"id": run_id, "status": record.status}
+    threading.Thread(
+        target=_kill_after_grace, args=(record, proc, grace), daemon=True
+    ).start()
+    return {"id": run_id, "status": "cancelling"}
+
+
+def _kill_after_grace(record: RunRecord, proc: subprocess.Popen[str], grace: float) -> None:
+    deadline = time.time() + grace
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            return
+        time.sleep(0.2)
+    if proc.poll() is None:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+
+
+def _scan_run_metadata(record: RunRecord, line: str) -> None:
+    """Pick out wp_update.py's run_id and summary path from streaming output.
+
+    wp_update.py prints two anchor lines:
+      - `WordPress Maintenance Run  |  ID: <ts>` (early, before any work)
+      - `Summary written to <path>` (right before exit)
+    Once we have the run_id we attach it to the DB row so that operators
+    can correlate the webui token with the on-disk log/summary names.
+    """
+    if record.wp_run_id is None:
+        match = _RUN_ID_PATTERN.search(line)
+        if match:
+            record.wp_run_id = match.group(1)
+            record.log_path = str(LOGS_DIR / f"wp-update-{record.wp_run_id}.log")
+            if DB_CONN is not None:
+                try:
+                    db.attach_run_id(DB_CONN, record.run_id, record.wp_run_id)
+                except sqlite3.Error as exc:
+                    print(f"db attach_run_id failed: {exc}", file=sys.stderr)
+            return
+    if record.summary_path is None:
+        match = _SUMMARY_PATTERN.search(line)
+        if match:
+            record.summary_path = match.group(1).strip()
+
+
+def _finalize_run_in_db(record: RunRecord) -> None:
+    """Mark the run finished, then ingest the summary if it landed.
+
+    Ingest happens in the same worker thread that ran the process: the
+    summary file already exists when wp_update.py exits, so there is no
+    need to defer this work. If ingest raises, the failure is recorded
+    so the startup reconcile can retry on the next boot.
+    """
+    if DB_CONN is None:
+        return
+    try:
+        db.update_run_finished(
+            DB_CONN,
+            webui_run_id=record.run_id,
+            status=record.status,
+            exit_code=record.exit_code,
+            log_path=record.log_path,
+            summary_path=record.summary_path,
+        )
+    except sqlite3.Error as exc:
+        print(f"db update_run_finished failed: {exc}", file=sys.stderr)
+        return
+    if not record.summary_path:
+        return
+    if record.target == "remote":
+        # The summary path printed by wp_update.py lives on the remote host,
+        # not on the webui filesystem. Skip ingest until a transport step is
+        # added; the row stays at ingest_status='none' so it doesn't get
+        # retried forever by the startup reconciler.
+        db.mark_ingest_failed(
+            DB_CONN,
+            webui_run_id=record.run_id,
+            error="remote summary ingest not yet supported",
+        )
+        return
+    summary_path = Path(record.summary_path)
+    if not summary_path.is_absolute():
+        summary_path = LOGS_DIR / summary_path.name
+    summary = db.load_summary_file(summary_path)
+    if summary is None:
+        db.mark_ingest_failed(
+            DB_CONN, webui_run_id=record.run_id, error="summary file missing or unparseable"
+        )
+        return
+    try:
+        db.ingest_run_summary(DB_CONN, webui_run_id=record.run_id, summary=summary)
+    except Exception as exc:  # defensive — any ingest failure is recoverable
+        db.mark_ingest_failed(DB_CONN, webui_run_id=record.run_id, error=str(exc))
+
+
+def _run_process(record: RunRecord) -> None:
+    record.publish(f"$ {' '.join(shlex.quote(part) for part in record.command)}")
+    try:
+        proc = subprocess.Popen(
+            record.command,
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        record.publish(f"failed to start: {exc}")
+        record.mark_finished(127)
+        _finalize_run_in_db(record)
+        record.notify_done()
+        return
+    with record.lock:
+        record.proc = proc
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        clean = line.rstrip("\n")
+        _scan_run_metadata(record, clean)
+        record.publish(clean)
+    exit_code = proc.wait()
+    # Order matters: persist terminal state and ingest the summary BEFORE
+    # SSE listeners get the 'done' event. Otherwise the UI fires its
+    # follow-up summary fetch against a row still marked 'running'.
+    record.mark_finished(exit_code)
+    _finalize_run_in_db(record)
+    record.notify_done()
+
+
+def _live_run_row(record: RunRecord) -> dict[str, Any]:
+    """Render an in-memory RunRecord as the same shape recent_runs uses.
+
+    Lets the API merge running rows with finished DB rows without the
+    UI caring about the source.
+    """
+    return {
+        "id": record.run_id,
+        "run_id": record.wp_run_id,
+        "status": record.status,
+        "mode": record.mode,
+        "target": record.target,
+        "client_file": record.client_file or None,
+        "startedAt": record.started_at,
+        "finished_at": None,
+        "exit_code": record.exit_code,
+        "ingest_status": "live",
+    }
+
+
+def _db_run_row(row: dict[str, Any]) -> dict[str, Any]:
+    started_at = _iso_to_epoch(row.get("started_at"))
+    return {
+        "id": row["webui_run_id"],
+        "run_id": row.get("run_id"),
+        "status": row.get("status"),
+        "mode": row.get("mode"),
+        "target": row.get("target"),
+        "client_file": row.get("client_file"),
+        "startedAt": started_at,
+        "finished_at": row.get("finished_at"),
+        "exit_code": row.get("exit_code"),
+        "ingest_status": row.get("ingest_status"),
+    }
+
+
+def _iso_to_epoch(value: Any) -> float | None:
+    if not value:
+        return None
+    try:
+        return time.mktime(time.strptime(str(value), "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
+    except (TypeError, ValueError):
+        return None
+
+
+def runs_payload(limit: int, client: str | None, status: str | None) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if DB_CONN is not None:
+        rows.extend(_db_run_row(r) for r in db.recent_runs(
+            DB_CONN, limit=limit, client=client, status=status,
+        ))
+    seen = {row["id"] for row in rows}
+    if not status or status == "running":
+        with RUNS_LOCK:
+            live = [
+                _live_run_row(rec)
+                for rec in RUNS.values()
+                if rec.status == "running" and rec.run_id not in seen
+            ]
+        if client:
+            needle = client.casefold()
+            live = [row for row in live if needle in (row.get("client_file") or "").casefold()]
+        rows.extend(live)
+    rows.sort(key=lambda r: r["startedAt"] or 0, reverse=True)
+    return rows[:limit]
+
+
+def run_summary_payload(run_id: str) -> dict[str, Any] | None:
+    if DB_CONN is None:
+        return None
+    meta = db.get_run(DB_CONN, webui_run_id=run_id)
+    if meta is None:
+        return None
+    rows = db.run_summary_rows(DB_CONN, webui_run_id=run_id)
+    return {
+        "run_id": meta.get("run_id"),
+        "webui_run_id": run_id,
+        "status": meta.get("status"),
+        "mode": meta.get("mode"),
+        "started_at": meta.get("started_at"),
+        "finished_at": meta.get("finished_at"),
+        "log_path": meta.get("log_path"),
+        "summary_path": meta.get("summary_path"),
+        "ingest_status": meta.get("ingest_status"),
+        "sites": rows["sites"],
+        "plugins": rows["plugins"],
+    }
+
+
+def client_history_payload(client_name: str) -> dict[str, Any]:
+    notes_data = _load_client_notes_for_filename(client_name)
+    display_name = _resolve_display_name(client_name) or client_name
+    if DB_CONN is None:
+        return {"client": display_name, "last_touched": None, "last_success": None,
+                "recent_failures": [], "recent_runs": [], **notes_data}
+    history = db.client_history(DB_CONN, client_name=display_name)
+    history["recent_runs"] = [_db_run_row(r) for r in history.get("recent_runs", [])]
+    history.update(notes_data)
+    return history
+
+
+def _resolve_display_name(filename: str) -> str | None:
+    """Read the client JSON to recover its display key for DB lookups.
+
+    Cloudways files: `client_name` field. Siteground inventory schema has
+    no `client_name` — fall back to `domain`, which is what wp_update.py
+    writes into `site_outcomes.client_name` for SG runs.
+    """
+    path = resolve_client_file(filename)
+    if path is None:
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) or {}
+    except (OSError, json.JSONDecodeError):
+        return None
+    name = str(data.get("client_name") or "").strip()
+    if name:
+        return name
+    if str(data.get("schema", "")).startswith("siteground_"):
+        domain = str(data.get("domain") or "").strip()
+        if domain:
+            return domain
+    return None
+
+
+def _load_client_notes_for_filename(filename: str) -> dict[str, Any]:
+    """Resolve a client filename → its sibling notes.json contents.
+
+    Returns {"notes_general": str, "notes_sites": {domain: {...}}} when
+    notes are present; empty dict otherwise. UI uses this to surface
+    configured skip_items for the selected client.
+    """
+    path = resolve_client_file(filename)
+    if path is None:
+        return {}
+    notes_path = path.parent / "notes.json"
+    if not notes_path.exists():
+        return {}
+    try:
+        data = json.loads(notes_path.read_text(encoding="utf-8")) or {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {
+        "notes_general": str(data.get("general") or "").strip(),
+        "notes_sites": data.get("sites") if isinstance(data.get("sites"), dict) else {},
+    }
+
+
+def plugin_stats_payload() -> dict[str, Any]:
+    if DB_CONN is None:
+        return {"top_failed": [], "since": "30d"}
+    return {"top_failed": db.plugin_failure_stats(DB_CONN), "since": "30d"}
+
+
+def logs_listing_payload() -> list[dict[str, Any]]:
+    """Cross-reference on-disk log files with DB run rows.
+
+    The file system is the source of truth for log presence; the DB
+    contributes the status/run_id correlation the UI needs to know
+    whether a log corresponds to a known run.
+    """
+    if not LOGS_DIR.exists():
+        return []
+    db_by_run_id: dict[str, dict[str, Any]] = {}
+    if DB_CONN is not None:
+        for row in db.recent_runs(DB_CONN, limit=200):
+            wp_id = row.get("run_id")
+            if wp_id:
+                db_by_run_id[wp_id] = row
+    logs = []
+    for path in sorted(LOGS_DIR.glob("wp-update-*.log"), key=os.path.getmtime, reverse=True):
+        wp_id = path.stem.replace("wp-update-", "")
+        meta = db_by_run_id.get(wp_id, {})
+        logs.append({
+            "filename": path.name,
+            "run_id": wp_id,
+            "webui_run_id": meta.get("webui_run_id"),
+            "status": meta.get("status") or "unknown",
+            "size_bytes": path.stat().st_size,
+            "modified_at": path.stat().st_mtime,
+        })
+    return logs
+
+
+def json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
+    body = json.dumps(payload).encode()
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+class WebUIHandler(BaseHTTPRequestHandler):
+    server_version = "WPUpdateWebUI/1.0"
+    settings: Settings
+
+    def log_message(self, fmt: str, *args: object) -> None:
+        print(f"{self.address_string()} - {fmt % args}", file=sys.stderr)
+
+    def do_GET(self) -> None:
+        path = urlparse(self.path).path
+        if path == "/login":
+            self._send_html(LOGIN_HTML)
+            return
+        if path == "/logout":
+            self.send_response(HTTPStatus.FOUND)
+            self.send_header("Set-Cookie", f"{SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+            self.send_header("Location", "/login")
+            self.end_headers()
+            return
+        if path.startswith("/api/") and not self._authenticated():
+            json_response(self, HTTPStatus.UNAUTHORIZED, {"error": "authentication required"})
+            return
+        if path == "/":
+            if not self._authenticated():
+                self._redirect("/login")
+                return
+            self._send_html(app_html(self.settings))
+            return
+        if path == "/api/clients":
+            query = parse_qs(urlparse(self.path).query)
+            provider = query.get("provider", [""])[0]
+            json_response(self, HTTPStatus.OK, {"clients": list_client_files(provider=provider)})
+            return
+        if path == "/api/clients/archived":
+            json_response(self, HTTPStatus.OK, {"clients": list_archived_client_files()})
+            return
+        if path == "/api/ssh-keys":
+            json_response(self, HTTPStatus.OK, {"keys": list_ssh_keys()})
+            return
+        if path == "/api/runs":
+            query = parse_qs(urlparse(self.path).query)
+            limit = max(1, min(200, int(query.get("limit", ["50"])[0] or 50)))
+            client_filter = (query.get("client", [""])[0] or "").strip() or None
+            status_filter = (query.get("status", [""])[0] or "").strip() or None
+            json_response(self, HTTPStatus.OK, {"runs": runs_payload(limit, client_filter, status_filter)})
+            return
+        if path.startswith("/api/runs/") and path.endswith("/summary"):
+            run_id = path.split("/")[3]
+            payload = run_summary_payload(run_id)
+            if payload is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            json_response(self, HTTPStatus.OK, payload)
+            return
+        if path.startswith("/api/clients/") and path.endswith("/history"):
+            client_name = path.split("/")[3]
+            json_response(self, HTTPStatus.OK, client_history_payload(client_name))
+            return
+        if path == "/api/stats/plugins":
+            json_response(self, HTTPStatus.OK, plugin_stats_payload())
+            return
+        if path == "/api/logs":
+            json_response(self, HTTPStatus.OK, {"logs": logs_listing_payload()})
+            return
+        if path.startswith("/api/logs/"):
+            filename = Path(path.split("/")[3]).name
+            log_path = LOGS_DIR / filename
+            if not log_path.exists() or not filename.startswith("wp-update-") or not filename.endswith(".log"):
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(log_path.stat().st_size))
+            self.end_headers()
+            with open(log_path, "rb") as f:
+                self.wfile.write(f.read())
+            return
+        if path.startswith("/api/runs/") and path.endswith("/stream"):
+            self._stream_run(path.split("/")[3])
+            return
+        self.send_error(HTTPStatus.NOT_FOUND)
+
+    def do_POST(self) -> None:
+        path = urlparse(self.path).path
+        if path == "/api/login":
+            self._login()
+            return
+        if not self._authenticated():
+            json_response(self, HTTPStatus.UNAUTHORIZED, {"error": "authentication required"})
+            return
+        if not self._csrf_ok():
+            json_response(self, HTTPStatus.FORBIDDEN, {"error": "csrf token missing or invalid"})
+            return
+        if path.startswith("/api/runs/") and path.endswith("/cancel"):
+            run_id = path[len("/api/runs/") : -len("/cancel")]
+            if not run_id:
+                json_response(self, HTTPStatus.NOT_FOUND, {"error": "unknown run"})
+                return
+            result = cancel_run(run_id)
+            if result.get("status") == "unknown":
+                json_response(self, HTTPStatus.NOT_FOUND, {"error": "unknown run"})
+                return
+            json_response(self, HTTPStatus.OK, result)
+            return
+        if path.startswith("/api/clients/") and path.endswith("/archive"):
+            name = Path(path[len("/api/clients/") : -len("/archive")]).name
+            try:
+                target = archive_client_file(name)
+                json_response(self, HTTPStatus.OK, {
+                    "name": name,
+                    "archived_path": target.relative_to(CLIENTS_DIR).as_posix(),
+                })
+            except FileNotFoundError as exc:
+                json_response(self, HTTPStatus.NOT_FOUND, {"error": str(exc)})
+            except FileExistsError as exc:
+                json_response(self, HTTPStatus.CONFLICT, {"error": str(exc)})
+            return
+        if path.startswith("/api/clients/") and path.endswith("/restore"):
+            name = Path(path[len("/api/clients/") : -len("/restore")]).name
+            try:
+                target = restore_client_file(name)
+                json_response(self, HTTPStatus.OK, {
+                    "name": name,
+                    "active_path": target.relative_to(CLIENTS_DIR).as_posix(),
+                })
+            except FileNotFoundError as exc:
+                json_response(self, HTTPStatus.NOT_FOUND, {"error": str(exc)})
+            except FileExistsError as exc:
+                json_response(self, HTTPStatus.CONFLICT, {"error": str(exc)})
+            return
+        try:
+            payload = self._read_json()
+        except ValueError as exc:
+            json_response(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        try:
+            if path == "/api/clients/import":
+                doc = payload.get("client")
+                if not isinstance(doc, dict):
+                    raise ValueError("client must be an object")
+                written = write_client_doc(doc)
+                json_response(self, HTTPStatus.CREATED, {"path": written.name})
+                return
+            if path == "/api/clients/manual":
+                written = write_client_doc(manual_payload_to_client(payload))
+                json_response(self, HTTPStatus.CREATED, {"path": written.name})
+                return
+            if path == "/api/ssh-keys":
+                name = str(payload.get("name") or "").strip()
+                content = str(payload.get("content") or "")
+                if not name or not content:
+                    raise ValueError("name and content are required")
+                written = write_ssh_key(name, content)
+                json_response(self, HTTPStatus.CREATED, {"name": written.name, "path": str(written)})
+                return
+            if path == "/api/runs":
+                record = start_run(payload, self.settings, started_by=self._current_user() or "")
+                json_response(self, HTTPStatus.CREATED, {"id": record.run_id, "status": record.status})
+                return
+        except ValueError as exc:
+            json_response(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        except RuntimeError as exc:
+            json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+            return
+        self.send_error(HTTPStatus.NOT_FOUND)
+
+    def _login(self) -> None:
+        try:
+            payload = self._read_json()
+        except ValueError as exc:
+            json_response(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        username = str(payload.get("username") or "")
+        password = str(payload.get("password") or "")
+        ip = self.client_address[0] if self.client_address else "unknown"
+        if not self.settings.password:
+            json_response(self, HTTPStatus.FORBIDDEN, {"error": "WEBUI_PASSWORD is not configured"})
+            return
+        if DB_CONN is not None:
+            allowed, retry_after = db.check_login_rate_limit(
+                DB_CONN,
+                ip=ip,
+                max_failures=LOGIN_MAX_FAILURES,
+                within_seconds=LOGIN_FAILURE_WINDOW_SECONDS,
+            )
+            if not allowed:
+                self.send_response(HTTPStatus.TOO_MANY_REQUESTS)
+                self.send_header("Retry-After", str(retry_after))
+                body = json.dumps({"error": "too many login attempts; try again shortly"}).encode()
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+        if username != self.settings.username or not hmac.compare_digest(password, self.settings.password):
+            if DB_CONN is not None:
+                db.record_auth_event(DB_CONN, ip=ip, event="login_fail", username=username or None)
+            json_response(self, HTTPStatus.UNAUTHORIZED, {"error": "invalid credentials"})
+            return
+        if DB_CONN is not None:
+            db.record_auth_event(DB_CONN, ip=ip, event="login_ok", username=username)
+        csrf = secrets.token_urlsafe(32)
+        token = sign_session(username, self.settings.secret, csrf=csrf)
+        body = json.dumps({"ok": True}).encode()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header(
+            "Set-Cookie", f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax"
+        )
+        # Readable CSRF cookie: JS attaches its value as X-CSRF-Token; server
+        # cross-checks against the value baked into the signed session token.
+        self.send_header(
+            "Set-Cookie", f"{CSRF_COOKIE}={csrf}; Path=/; SameSite=Lax"
+        )
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _expected_csrf(self) -> str | None:
+        cookie = SimpleCookie(self.headers.get("Cookie"))
+        morsel = cookie.get(SESSION_COOKIE)
+        if not morsel:
+            return None
+        return session_csrf(morsel.value, self.settings.secret)
+
+    def _csrf_ok(self) -> bool:
+        expected = self._expected_csrf()
+        if not expected:
+            return False
+        supplied = self.headers.get("X-CSRF-Token", "")
+        cookie = SimpleCookie(self.headers.get("Cookie")).get(CSRF_COOKIE)
+        if not supplied or cookie is None:
+            return False
+        return (
+            hmac.compare_digest(supplied, expected)
+            and hmac.compare_digest(cookie.value, expected)
+        )
+
+    def _current_user(self) -> str | None:
+        cookie = SimpleCookie(self.headers.get("Cookie"))
+        morsel = cookie.get(SESSION_COOKIE)
+        if not morsel:
+            return None
+        return verify_session(morsel.value, self.settings.secret)
+
+    def _authenticated(self) -> bool:
+        return self._current_user() == self.settings.username
+
+    def _read_json(self) -> dict[str, Any]:
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0:
+            return {}
+        if length > MAX_BODY_BYTES:
+            raise ValueError("request body too large")
+        try:
+            payload = json.loads(self.rfile.read(length).decode())
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid JSON: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("JSON body must be an object")
+        return payload
+
+    def _send_html(self, body: str) -> None:
+        encoded = body.encode()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def _redirect(self, location: str) -> None:
+        self.send_response(HTTPStatus.FOUND)
+        self.send_header("Location", location)
+        self.end_headers()
+
+    def _stream_run(self, run_id: str) -> None:
+        with RUNS_LOCK:
+            record = RUNS.get(run_id)
+        if not record:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+
+        listener: queue.Queue[str | None] = queue.Queue()
+        with record.lock:
+            replay = list(record.lines)
+            done = record.status != "running"
+            if not done:
+                record.listeners.append(listener)
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+
+        def send_event(event: str, data: str) -> None:
+            self.wfile.write(f"event: {event}\n".encode())
+            for line in data.splitlines() or [""]:
+                self.wfile.write(f"data: {line}\n".encode())
+            self.wfile.write(b"\n")
+            self.wfile.flush()
+
+        try:
+            for line in replay:
+                send_event("line", line)
+            if done:
+                send_event("done", json.dumps({"status": record.status, "exitCode": record.exit_code}))
+                return
+            while True:
+                item = listener.get()
+                if item is None:
+                    send_event("done", json.dumps({"status": record.status, "exitCode": record.exit_code}))
+                    return
+                send_event("line", item)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
+        finally:
+            with record.lock:
+                if listener in record.listeners:
+                    record.listeners.remove(listener)
+
+
+def manual_payload_to_client(payload: dict[str, Any]) -> dict[str, Any]:
+    flags = {
+        "wp_cli_installed": bool(payload.get("wpCliInstalled", True)),
+        "is_staging": bool(payload.get("isStaging", False)),
+        "has_woocommerce": bool(payload.get("hasWooCommerce", False)),
+    }
+    return {
+        "hosting_provider": str(payload.get("provider") or "Cloudways").strip() or "Cloudways",
+        "client_name": str(payload.get("clientName") or "").strip(),
+        "email": str(payload.get("email") or "").strip(),
+        "server_ip_address": str(payload.get("serverIp") or "").strip(),
+        "master_credentials": {
+            "username": str(payload.get("masterUsername") or "").strip(),
+            "password": str(payload.get("masterPassword") or "").strip(),
+        },
+        "applications": [
+            {
+                "website_domain": str(payload.get("websiteDomain") or "").strip(),
+                "path_to_public_html": str(payload.get("publicHtmlPath") or "").strip(),
+                "sftp_credentials": {
+                    "username": "$SSH_USER",
+                    "password": "$APP_PW",
+                    "ssh_key": "$SSH_KEY",
+                },
+                "environment_flags": flags,
+            }
+        ],
+    }
+
+
+LOGIN_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wordpress Maintenance Login</title>
+  <style>
+    body{margin:0;font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif;background:#f5f7f4;color:#18201c;display:grid;min-height:100vh;place-items:center}
+    form{width:min(380px,calc(100vw - 32px));background:#fff;border:1px solid #d9ded6;border-radius:8px;padding:28px;box-shadow:0 18px 50px rgba(24,32,28,.08)}
+    h1{font-size:24px;margin:0 0 18px}
+    label{display:block;font-size:13px;font-weight:700;margin:14px 0 6px}
+    input,button{box-sizing:border-box;width:100%;height:42px;border-radius:6px;font:inherit}
+    input{border:1px solid #c8cec5;padding:0 12px}
+    button{border:0;background:#285b4d;color:#fff;font-weight:800;margin-top:18px;cursor:pointer}
+    p{min-height:20px;color:#a33a2a;font-size:13px}
+  </style>
+</head>
+<body>
+  <form id="login">
+    <h1>Wordpress Maintenance</h1>
+    <label>Username</label><input name="username" autocomplete="username" required>
+    <label>Password</label><input name="password" type="password" autocomplete="current-password" required>
+    <button>Sign in</button>
+    <p id="error"></p>
+  </form>
+  <script>
+    document.getElementById('login').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const body = Object.fromEntries(new FormData(event.currentTarget));
+      const res = await fetch('/api/login', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+      if (res.ok) location.href = '/';
+      else document.getElementById('error').textContent = (await res.json()).error || 'Login failed';
+    });
+  </script>
+</body>
+</html>"""
+
+
+def app_html(settings: Settings) -> str:
+    remote_defaults = {
+        "host": settings.remote_host,
+        "user": settings.remote_user,
+        "port": settings.remote_port,
+        "repoPath": settings.remote_repo_path,
+        "identityFile": settings.remote_identity_file,
+        "python": settings.remote_python,
+    }
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wordpress Maintenance Console</title>
+  <style>
+    :root{{--bg:#f3f5f1;--panel:#fff;--line:#d8ddd3;--text:#18201c;--muted:#657267;--accent:#285b4d;--warn:#9a4b22;--bad:#a33a2a;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}}
+    *{{box-sizing:border-box}} body{{margin:0;background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif}}
+    header{{min-height:64px;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:12px 24px;border-bottom:1px solid var(--line);background:#fbfcfa;position:sticky;top:0;z-index:3}}
+    h1{{font-size:19px;margin:0}} a{{color:var(--accent);font-weight:700;text-decoration:none}}
+    .provider-bar{{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:14px 18px 0;max-width:1500px;margin:0 auto}}
+    .provider-tabs{{display:flex;gap:8px;flex-wrap:wrap}} .provider-tabs button{{height:34px;background:#e6ebe3;color:#213129}} .provider-tabs button.active{{background:var(--accent);color:#fff}}
+    .provider-add{{display:flex;gap:8px;align-items:center;margin-left:auto}} .provider-add input{{width:190px;height:34px}} .provider-add button{{height:34px}}
+    main{{display:grid;grid-template-columns:minmax(300px,420px) 1fr;gap:18px;padding:18px;max-width:1500px;margin:0 auto}}
+    section{{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px}}
+    h2{{font-size:15px;margin:0 0 14px}} h3{{font-size:13px;margin:18px 0 8px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}}
+    label{{display:block;font-size:12px;font-weight:800;margin:10px 0 5px;color:#334139}}
+    input,select,textarea,button{{font:inherit;border-radius:6px}} input,select,textarea{{width:100%;border:1px solid #c8cec5;padding:9px 10px;background:#fff;color:var(--text)}} textarea{{min-height:154px;font-family:var(--mono);font-size:12px}}
+    .row{{display:grid;grid-template-columns:1fr 1fr;gap:10px}} .toggles{{display:flex;flex-wrap:wrap;gap:10px;margin:12px 0}}
+    .check{{display:inline-flex;gap:8px;align-items:center;border:1px solid var(--line);border-radius:6px;padding:6px 10px;background:#fafbf9}} .check input{{width:auto}}
+    .terminal-toolbar{{display:flex;justify-content:flex-end;align-items:center;margin:6px 0 4px}}
+    .terminal-toolbar .check{{font-size:11px;padding:4px 8px;background:transparent;border:1px solid var(--line)}}
+    .provider-bar .add-toggle{{height:34px;padding:0 12px;font-size:12px}}
+    button{{height:40px;border:0;padding:0 14px;background:var(--accent);color:white;font-weight:800;cursor:pointer}} button.secondary{{background:#e6ebe3;color:#213129}} button.danger{{background:var(--warn)}} button:disabled{{opacity:.55;cursor:not-allowed}}
+    .actions{{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}} .status{{font-size:12px;color:var(--muted);min-height:18px;margin-top:8px}}
+    #terminal{{height:620px;overflow:auto;background:#101511;color:#d9f7df;border-radius:8px;padding:14px;font-family:var(--mono);font-size:12px;line-height:1.5;white-space:pre-wrap;border:1px solid #26362a}}
+    .meta{{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}} .pill{{border:1px solid var(--line);background:#f7f8f5;color:var(--muted);border-radius:999px;padding:5px 9px;font-size:12px}}
+    .tabs{{display:flex;gap:8px;margin-bottom:12px}} .tabs button{{background:#e6ebe3;color:#213129}} .tabs button.active{{background:var(--accent);color:#fff}}
+    .hidden{{display:none}} .warn{{color:var(--bad);font-weight:800}}
+    table{{width:100%;border-collapse:collapse;font-size:12px;margin-top:8px}} th,td{{text-align:left;padding:8px;border-bottom:1px solid var(--line)}} th{{color:var(--muted);font-weight:800;text-transform:uppercase;font-size:10px}}
+    .modal{{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;z-index:100}}
+    .modal-content{{background:var(--panel);padding:24px;border-radius:8px;width:min(900px,95vw);max-height:90vh;overflow:auto;position:relative}}
+    .close-modal{{position:absolute;top:12px;right:16px;font-size:24px;cursor:pointer;background:none;border:0;color:var(--muted)}}
+    .collapsible{{cursor:pointer;display:flex;align-items:center;gap:8px;user-select:none}} .collapsible::before{{content:'▶';font-size:10px;transition:transform .2s}} .collapsible.open::before{{transform:rotate(90deg)}}
+    .client-picker{{border:1px solid var(--line);border-radius:6px;background:#fff}}
+    .client-picker-toolbar{{display:flex;gap:8px;align-items:center;padding:8px;border-bottom:1px solid var(--line);flex-wrap:wrap}}
+    .client-picker-toolbar input{{flex:1;min-width:140px;font-size:12px;padding:6px 8px}}
+    .client-quick{{display:flex;gap:4px;flex-wrap:wrap}}
+    .client-quick button{{font-size:11px;height:auto;padding:4px 8px;margin:0;background:#f3f4f1;color:var(--text);font-weight:600;border:1px solid var(--line);border-radius:4px;cursor:pointer;width:auto}}
+    .client-quick button:hover{{background:#e9ebe6}}
+    .client-picker-list{{max-height:280px;overflow-y:auto;padding:4px 0}}
+    .client-picker-list label{{display:flex;align-items:flex-start;gap:8px;padding:6px 10px;font-size:12px;cursor:pointer;border-bottom:1px solid #f0f1ee;font-weight:normal;margin:0}}
+    .client-picker-list label:hover{{background:#f8faf7}}
+    .client-picker-list label.hidden{{display:none}}
+    .client-picker-list input[type=checkbox]{{width:auto;height:auto;margin:2px 0 0;flex-shrink:0}}
+    .client-picker-list .row-main{{flex:1;min-width:0;color:var(--text)}}
+    .client-picker-list .row-main>div:first-child{{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-weight:600}}
+    .client-picker-list .row-meta{{font-size:11px;color:var(--muted);margin-top:3px;word-break:break-word}}
+    .client-picker-list .row-badges{{display:inline-flex;gap:4px;flex-wrap:wrap}}
+    .client-picker-list .badge{{font-size:10px;padding:1px 5px;border-radius:3px;background:#eef0eb;color:#444}}
+    .client-picker-list .badge.woo{{background:#f4ead8;color:#7a5a17}}
+    .client-picker-list .badge.never{{background:#fde9e9;color:#902020}}
+    .client-picker-list .badge.recent{{background:#e3f0e3;color:#1d5d1d}}
+    .client-picker-list .archive-btn{{font-size:10px;padding:2px 8px;height:auto;background:#eef0eb;color:#555;border:1px solid var(--line);border-radius:3px;flex-shrink:0;align-self:center;cursor:pointer;opacity:0;transition:opacity .15s}}
+    .client-picker-list label:hover .archive-btn{{opacity:1}}
+    .client-picker-list .archive-btn:hover{{background:#fde9e9;color:#902020}}
+    .client-picker-list .archive-btn:disabled{{opacity:0.5;cursor:wait}}
+    .archived-list{{font-size:11px;max-height:200px;overflow-y:auto;border:1px solid var(--line);border-radius:4px;margin-top:4px}}
+    .archived-list .archived-row{{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:5px 8px;border-bottom:1px solid #f0f1ee}}
+    .archived-list .archived-row:last-child{{border-bottom:none}}
+    .archived-list .archived-row .restore-btn{{font-size:10px;padding:2px 8px;height:auto;background:#e3f0e3;color:#1d5d1d;border:1px solid #c4ddc4;border-radius:3px;cursor:pointer}}
+    .archived-list .archived-row .restore-btn:hover{{background:#d2e6d2}}
+    .archived-list .archived-row .restore-btn:disabled{{opacity:0.5;cursor:wait}}
+    .client-picker-footer{{display:flex;justify-content:space-between;gap:10px;padding:6px 10px;border-top:1px solid var(--line);font-size:11px;color:var(--muted);background:#fafbf8}}
+    .client-picker-footer #clientPickerCount{{font-weight:600;color:var(--text)}}
+    .client-history{{background:#f8faf7;border:1px solid var(--line);border-radius:6px;padding:12px;margin-top:10px;font-size:12px}}
+    .client-history h4{{margin:0 0 8px;font-size:11px;text-transform:uppercase;color:var(--muted)}}
+    .client-history .notes-site{{margin-top:6px;padding:6px 8px;background:#fff;border:1px solid var(--line);border-radius:4px}}
+    .client-history .notes-text{{color:var(--muted);font-style:italic;margin:2px 0}}
+    .client-history code{{background:#eef0eb;padding:1px 4px;border-radius:3px;font-family:var(--mono);font-size:11px}}
+    .stat-card{{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:12px;margin-top:10px}}
+    .stat-item{{background:#f8faf7;border:1px solid var(--line);padding:10px;border-radius:6px}}
+    .stat-value{{font-size:18px;font-weight:800;color:var(--accent)}} .stat-label{{font-size:10px;color:var(--muted);text-transform:uppercase}}
+    .cancel-btn{{background:var(--bad);padding:2px 6px;height:auto;font-size:10px;margin-left:8px;border-radius:4px}}
+    @media (max-width: 920px){{main{{grid-template-columns:1fr;padding:12px}} #terminal{{height:420px}} header{{padding:12px 14px}} .provider-add{{width:100%;margin-left:0}} .provider-add input{{width:100%}}}}
+
+
+  </style>
+</head>
+<body>
+  <div id="tlsBanner" class="hidden" style="background:var(--warn);color:#fff;padding:8px;text-align:center;font-size:13px;font-weight:700">
+    Warning: serving over HTTP. Credentials are sent unencrypted. Use a reverse proxy with TLS in production.
+  </div>
+  <header><h1>Wordpress Maintenance Console</h1><a href="/logout">Logout</a></header>
+  <nav class="provider-bar" aria-label="Hosting providers">
+    <div class="provider-tabs" id="providerTabs"></div>
+    <button class="secondary add-toggle" id="toggleAddProvider" type="button">+ Add provider</button>
+    <div class="provider-add hidden" id="providerAddPanel">
+      <input id="newProvider" placeholder="Provider name">
+      <button class="secondary" id="addProvider">Add</button>
+    </div>
+  </nav>
+  <main>
+    <div>
+      <section>
+        <p class="status" id="providerStatus"></p>
+        <input type="hidden" id="target" value="local">
+        <div class="toggles">
+          <label class="check"><input id="execute" type="checkbox"> Execute mode</label>
+          <label class="check"><input id="includeWoo" type="checkbox"> Include WooCommerce</label>
+          <label class="check" title="Ignore any recent dry-run summary cache; always collect a fresh inline baseline per site."><input id="recheckUpdates" type="checkbox"> Re-check updates</label>
+          <label class="check" title="Force every site through the full backup+update+verify path even when its inline baseline shows no pending updates."><input id="noSkipUpToDate" type="checkbox"> Disable up-to-date skip</label>
+        </div>
+        <div class="row" style="align-items:flex-end">
+          <div style="max-width:180px">
+            <label>Up-to-date TTL (min)</label>
+            <input id="skipUpToDateTtl" type="number" min="0" placeholder="60">
+          </div>
+          <p class="status" style="margin:0 0 6px 8px;font-size:11px;opacity:0.7">Execute mode skips sites whose dry-run summary is newer than this window. 0 disables.</p>
+        </div>
+        <label>Client scope</label>
+        <div class="client-picker">
+          <div class="client-picker-toolbar">
+            <input id="clientFilterText" type="search" placeholder="Filter clients...">
+            <div class="client-quick">
+              <button type="button" data-quick="all">All</button>
+              <button type="button" data-quick="none">None</button>
+              <button type="button" data-quick="never">Never run</button>
+              <button type="button" data-quick="stale">Not run 24h+</button>
+              <button type="button" data-quick="woo">WooCommerce</button>
+            </div>
+          </div>
+          <div id="clientFileList" class="client-picker-list"></div>
+          <div class="client-picker-footer">
+            <span id="clientPickerCount">0 selected</span>
+            <span id="clientListSummary"></span>
+          </div>
+        </div>
+        <div id="clientHistory" class="client-history hidden"></div>
+        <h3 class="collapsible" id="toggleArchived" style="font-size:12px;margin-top:8px">Archived clients</h3>
+        <div id="archivedPanel" class="hidden">
+          <div id="archivedList" class="archived-list"></div>
+          <p class="status" id="archivedStatus" style="font-size:11px;opacity:0.7;margin:6px 0 0"></p>
+        </div>
+        <label>SSH key</label>
+        <select id="sshKey"><option value="">Use .env / remote default</option></select>
+        <div class="actions">
+          <input id="sshKeyFile" type="file">
+          <button class="secondary" id="uploadSshKey">Upload key</button>
+        </div>
+        <div id="remoteFields" class="hidden">
+          <h3>Remote execution</h3>
+          <div class="row"><div><label>Host</label><input id="remoteHost"></div><div><label>Port</label><input id="remotePort" type="number" min="1"></div></div>
+          <label>User</label><input id="remoteUser">
+          <label>Repo path</label><input id="remoteRepoPath">
+          <label>Identity file</label><input id="remoteIdentityFile">
+          <label>Python</label><input id="remotePython">
+        </div>
+        <p class="status warn" id="executeWarn"></p>
+        <div class="actions"><button id="startRun">Start run</button><button class="secondary" id="refreshClients">Refresh clients</button></div>
+        <p class="status" id="runStatus"></p>
+      </section>
+      <section style="margin-top:18px">
+        <h2 class="collapsible" id="toggleRecentRuns">Recent runs</h2>
+        <div id="recentRunsPanel">
+          <div class="row" style="margin-bottom:10px">
+            <input id="filterClient" placeholder="Filter by client..." style="font-size:11px;padding:6px">
+            <select id="filterStatus" style="font-size:11px;padding:6px">
+              <option value="">All statuses</option>
+              <option value="running">Running</option>
+              <option value="success">Success</option>
+              <option value="failed">Failed</option>
+            </select>
+          </div>
+          <table id="recentRunsTable">
+            <thead><tr><th>ID</th><th>Status</th><th>Target</th><th>Started</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+      <section style="margin-top:18px">
+        <h2>Add client</h2>
+        <div class="tabs"><button class="active" data-tab="manual">Manual</button><button data-tab="import">JSON import</button></div>
+        <div id="manualTab">
+          <label>Client name</label><input id="clientName">
+          <div class="row"><div><label>Email</label><input id="email"></div><div><label>Server IP</label><input id="serverIp"></div></div>
+          <div class="row"><div><label>Master username</label><input id="masterUsername"></div><div><label>Master password</label><input id="masterPassword" type="password"></div></div>
+          <label>Website domain</label><input id="websiteDomain">
+          <label>Public HTML path</label><input id="publicHtmlPath" placeholder="/home/master/applications/appid/public_html">
+          <div class="toggles">
+            <label class="check"><input id="isStaging" type="checkbox"> Staging</label>
+            <label class="check"><input id="hasWoo" type="checkbox"> WooCommerce</label>
+          </div>
+          <button id="saveManual">Save client</button>
+        </div>
+        <div id="importTab" class="hidden">
+          <label>JSON file</label><input id="jsonFile" type="file" accept="application/json,.json">
+          <label>Client JSON</label><textarea id="jsonImport" spellcheck="false"></textarea>
+          <button id="saveImport">Import JSON</button>
+        </div>
+        <p class="status" id="clientStatus"></p>
+      </section>
+    </div>
+    <section>
+      <div class="meta"><span class="pill" id="providerPill">Cloudways</span><span class="pill" id="modePill">dry-run</span><span class="pill" id="targetPill">local</span><span class="pill" id="statusPill">idle</span></div>
+      <div class="terminal-toolbar">
+        <label class="check"><input id="streamDebug" type="checkbox"> Show debug logs</label>
+      </div>
+      <div id="terminal">No run started.</div>
+      
+      <div id="runSummary" class="hidden" style="margin-top:18px">
+        <h2 class="collapsible open" id="toggleSummary">Run Summary</h2>
+        <div id="summaryPanel"></div>
+      </div>
+
+      <div style="margin-top:18px">
+        <h2 class="collapsible" id="toggleStats">Plugin health (last 30d)</h2>
+        <div id="statsPanel" class="hidden">
+          <table id="statsTable">
+            <thead><tr><th>Plugin</th><th>Fails</th><th>Skips</th><th>Last Fail</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div style="margin-top:18px">
+        <h2 class="collapsible" id="toggleLogs">Logs</h2>
+        <div id="logsPanel" class="hidden">
+          <table id="logsTable">
+            <thead><tr><th>File</th><th>Run ID</th><th>Size</th><th>Modified</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </main>
+  <script>
+    const remoteDefaults = {json.dumps(remote_defaults)};
+    const $ = (id) => document.getElementById(id);
+    Object.assign($('remoteHost'), {{value: remoteDefaults.host}});
+    Object.assign($('remoteUser'), {{value: remoteDefaults.user}});
+    Object.assign($('remotePort'), {{value: remoteDefaults.port}});
+    Object.assign($('remoteRepoPath'), {{value: remoteDefaults.repoPath}});
+    Object.assign($('remoteIdentityFile'), {{value: remoteDefaults.identityFile}});
+    Object.assign($('remotePython'), {{value: remoteDefaults.python}});
+
+    if (location.protocol === 'http:' && !['localhost', '127.0.0.1'].includes(location.hostname)) {{
+      $('tlsBanner').classList.remove('hidden');
+    }}
+
+    function getCookie(name) {{
+      const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+      return match ? match[2] : null;
+    }}
+
+    async function api(path, options={{}}) {{
+      const headers = {{'Content-Type':'application/json', ...options.headers}};
+      const csrf = getCookie('csrf_token');
+      if (csrf && ['POST', 'DELETE'].includes(options.method?.toUpperCase())) {{
+        headers['X-CSRF-Token'] = csrf;
+      }}
+      const res = await fetch(path, {{...options, headers}});
+      const body = await res.json().catch(() => ({{}}));
+      if (!res.ok) throw new Error(body.error || res.statusText);
+      return body;
+    }}
+    function parseIso(iso) {{
+      if (!iso) return NaN;
+      // Accept "2026-04-28T02:57:53+00:00", "2026-04-28T02:57:53Z",
+      // or naive "2026-04-28T02:57:53" (assume UTC).
+      let s = String(iso);
+      if (!/[zZ]|[+-]\\d{{2}}:?\\d{{2}}$/.test(s)) s += 'Z';
+      const t = new Date(s).getTime();
+      return Number.isFinite(t) ? t : NaN;
+    }}
+    function fmtAge(iso) {{
+      const t = parseIso(iso);
+      if (!Number.isFinite(t)) return null;
+      const d = new Date(t);
+      const mins = Math.max(0, Math.round((Date.now() - t) / 60000));
+      let rel;
+      if (mins < 60) rel = `${{mins}} min ago`;
+      else if (mins < 60*36) rel = `${{Math.round(mins/60)}} hr ago`;
+      else rel = `${{Math.round(mins/1440)}} days ago`;
+      const abs = d.toLocaleString(undefined, {{
+        month: 'short', day: 'numeric',
+        hour: 'numeric', minute: '2-digit'
+      }});
+      return `${{abs}} (${{rel}})`;
+    }}
+    let clientsCache = [];
+    async function loadClients() {{
+      const data = await api(`/api/clients?provider=${{encodeURIComponent(selectedProvider)}}`);
+      clientsCache = data.clients || [];
+      const list = $('clientFileList');
+      list.innerHTML = '';
+      const now = Date.now();
+      const DAY = 24*3600*1000;
+      clientsCache.forEach((client) => {{
+        const t = parseIso(client.last_success_at);
+        const recent = Number.isFinite(t) && (now - t) < DAY;
+        const never = !Number.isFinite(t);
+        const woo = !!client.has_woocommerce;
+        const total = client.domains_total || (client.domains ? client.domains.length : 0);
+        const ranCount = client.domains_run ? client.domains_run.length : 0;
+        const doms = client.domains || [];
+        let domainStr = '';
+        if (doms.length === 1) domainStr = doms[0];
+        else if (doms.length > 1) domainStr = `${{doms.length}} sites: ${{doms.slice(0, 2).join(', ')}}${{doms.length > 2 ? ` +${{doms.length - 2}}` : ''}}`;
+        const badges = [];
+        if (woo) badges.push('<span class="badge woo">Woo</span>');
+        if (never) badges.push('<span class="badge never">never run</span>');
+        else if (recent) badges.push('<span class="badge recent">' + fmtAge(client.last_success_at) + '</span>');
+        else badges.push('<span class="badge">' + fmtAge(client.last_success_at) + '</span>');
+        if (total > 1) badges.push(`<span class="badge">${{ranCount}}/${{total}}</span>`);
+        const label = document.createElement('label');
+        label.dataset.name = client.name;
+        if (woo) label.dataset.woo = '1';
+        if (recent) label.dataset.recent = '1';
+        if (never) label.dataset.never = '1';
+        label.dataset.search = (client.label + ' ' + doms.join(' ')).toLowerCase();
+        label.innerHTML = `
+          <input type="checkbox" value="${{client.name}}">
+          <div class="row-main">
+            <div>${{client.label}}<span class="row-badges">${{badges.join('')}}</span></div>
+            ${{domainStr ? `<div class="row-meta">${{domainStr}}</div>` : ''}}
+          </div>
+          <button type="button" class="archive-btn" data-name="${{client.name}}" title="Archive — hide from runs until restored">Archive</button>
+        `;
+        list.appendChild(label);
+      }});
+      list.querySelectorAll('input[type=checkbox]').forEach(cb => cb.addEventListener('change', onClientSelectionChange));
+      list.querySelectorAll('.archive-btn').forEach(btn => {{
+        btn.addEventListener('click', async (event) => {{
+          event.preventDefault();
+          event.stopPropagation();
+          const name = btn.dataset.name;
+          if (!confirm(`Archive ${{name}}?\n\nWill be hidden from runs and from the picker. Restore from the Archived panel.`)) return;
+          btn.disabled = true;
+          try {{
+            await api(`/api/clients/${{encodeURIComponent(name)}}/archive`, {{method:'POST'}});
+            await Promise.all([loadClients(), loadArchivedClients()]);
+          }} catch (e) {{
+            alert('Archive failed: ' + e.message);
+            btn.disabled = false;
+          }}
+        }});
+      }});
+      const wooCount = clientsCache.filter(c => c.has_woocommerce).length;
+      const recentCount = clientsCache.filter(c => {{
+        const t = parseIso(c.last_success_at);
+        return Number.isFinite(t) && (now - t) < DAY;
+      }}).length;
+      const neverCount = clientsCache.filter(c => !c.last_success_at).length;
+      const status = $('clientListSummary');
+      if (status) status.textContent = `${{clientsCache.length}} clients · ${{wooCount}} Woo · ${{recentCount}} run <24h · ${{neverCount}} never`;
+      onClientSelectionChange();
+    }}
+    function selectedClientNames() {{
+      return [...document.querySelectorAll('#clientFileList input[type=checkbox]:checked')].map(cb => cb.value);
+    }}
+    async function loadArchivedClients() {{
+      const list = $('archivedList');
+      const status = $('archivedStatus');
+      try {{
+        const data = await api('/api/clients/archived');
+        list.innerHTML = '';
+        const rows = data.clients || [];
+        rows.forEach((c) => {{
+          const item = document.createElement('div');
+          item.className = 'archived-row';
+          const label = c.client_name || c.name;
+          item.innerHTML = `
+            <div><strong>${{label}}</strong><span style="opacity:0.6;font-family:var(--mono)"> · ${{c.archived_path}}</span></div>
+            <button type="button" class="restore-btn" data-name="${{c.name}}">Restore</button>
+          `;
+          list.appendChild(item);
+        }});
+        status.textContent = rows.length === 0 ? 'No archived clients.' : `${{rows.length}} archived`;
+        list.querySelectorAll('.restore-btn').forEach(btn => {{
+          btn.addEventListener('click', async () => {{
+            const name = btn.dataset.name;
+            btn.disabled = true;
+            try {{
+              await api(`/api/clients/${{encodeURIComponent(name)}}/restore`, {{method:'POST'}});
+              await Promise.all([loadClients(), loadArchivedClients()]);
+            }} catch (e) {{
+              alert('Restore failed: ' + e.message);
+              btn.disabled = false;
+            }}
+          }});
+        }});
+      }} catch (e) {{
+        status.textContent = 'Failed to load archived clients.';
+        console.error('archived load', e);
+      }}
+    }}
+    function onClientSelectionChange() {{
+      const sel = selectedClientNames();
+      $('clientPickerCount').textContent = sel.length === 0 ? 'All clients (none selected)' : `${{sel.length}} selected`;
+      const container = $('clientHistory');
+      if (sel.length === 1) {{
+        loadClientHistory(sel[0]);
+      }} else {{
+        container.classList.add('hidden');
+      }}
+    }}
+    async function loadClientHistory(name) {{
+      const container = $('clientHistory');
+      try {{
+        const data = await api(`/api/clients/${{encodeURIComponent(name)}}/history`);
+        const sites = data.notes_sites || {{}};
+        const skipBlocks = [];
+        Object.keys(sites).forEach(domain => {{
+          const entry = sites[domain] || {{}};
+          const items = entry.skip_items || [];
+          const dnote = (entry.notes || '').trim();
+          if (!items.length && !dnote) return;
+          const itemHtml = items.map(it => {{
+            const reason = it.reason ? ` — ${{it.reason}}` : '';
+            return `<div>· <code>${{it.type}}:${{it.slug}}</code>${{reason}}</div>`;
+          }}).join('');
+          skipBlocks.push(`<div class="notes-site"><strong>${{domain}}</strong>${{dnote ? `<div class="notes-text">${{dnote}}</div>` : ''}}${{itemHtml}}</div>`);
+        }});
+        const generalNote = (data.notes_general || '').trim();
+        container.innerHTML = `
+          <h4>${{data.client}} History</h4>
+          <div>Last touched: ${{data.last_touched}}</div>
+          <div>Last success: ${{data.last_success}}</div>
+          ${{data.recent_failures && data.recent_failures.length ? `<div class="warn">Recent failures: ${{data.recent_failures.length}}</div>` : ''}}
+          ${{generalNote ? `<div class="notes-text" style="margin-top:8px"><strong>Notes:</strong> ${{generalNote}}</div>` : ''}}
+          ${{skipBlocks.length ? `<div style="margin-top:8px"><strong>Configured skips:</strong>${{skipBlocks.join('')}}</div>` : ''}}
+        `;
+        container.classList.remove('hidden');
+      }} catch (e) {{ console.error('Failed to load client history', e); }}
+    }}
+    function applyClientFilter() {{
+      const q = ($('clientFilterText').value || '').toLowerCase().trim();
+      document.querySelectorAll('#clientFileList label').forEach(label => {{
+        label.classList.toggle('hidden', q && !label.dataset.search.includes(q));
+      }});
+    }}
+    function quickSelect(kind) {{
+      const labels = [...document.querySelectorAll('#clientFileList label')].filter(l => !l.classList.contains('hidden'));
+      labels.forEach(l => {{
+        const cb = l.querySelector('input[type=checkbox]');
+        if (kind === 'all') cb.checked = true;
+        else if (kind === 'none') cb.checked = false;
+        else if (kind === 'never') cb.checked = l.dataset.never === '1';
+        else if (kind === 'stale') cb.checked = l.dataset.recent !== '1';
+        else if (kind === 'woo') cb.checked = l.dataset.woo === '1';
+      }});
+      onClientSelectionChange();
+    }}
+    async function loadSshKeys() {{
+      const data = await api('/api/ssh-keys');
+      const select = $('sshKey');
+      const previous = select.value;
+      select.innerHTML = '<option value="">Use .env / remote default</option>';
+      data.keys.forEach((key) => {{
+        const option = document.createElement('option');
+        option.value = key.name;
+        option.textContent = key.name;
+        select.appendChild(option);
+      }});
+      if ([...select.options].some((option) => option.value === previous)) select.value = previous;
+    }}
+    function runPayload() {{
+      return {{
+        provider: selectedProvider,
+        target: $('target').value,
+        execute: $('execute').checked,
+        includeWooCommerce: $('includeWoo').checked,
+        recheckUpdates: $('recheckUpdates').checked,
+        noSkipUpToDate: $('noSkipUpToDate').checked,
+        skipUpToDateTtl: $('skipUpToDateTtl').value,
+        streamDebug: $('streamDebug').checked,
+        clientFiles: selectedClientNames(),
+        sshKey: $('sshKey').value,
+        remoteHost: $('remoteHost').value,
+        remotePort: Number($('remotePort').value || 22),
+        remoteUser: $('remoteUser').value,
+        remoteRepoPath: $('remoteRepoPath').value,
+        remoteIdentityFile: $('remoteIdentityFile').value,
+        remotePython: $('remotePython').value
+      }};
+    }}
+    const defaultProviders = ['Cloudways', 'Siteground', 'Cloudron'];
+    const storedProviders = JSON.parse(localStorage.getItem('maintenanceProviders') || '[]');
+    let providers = [...new Set([...defaultProviders, ...storedProviders])];
+    let selectedProvider = localStorage.getItem('selectedProvider') || 'Cloudways';
+    function saveProviders() {{
+      localStorage.setItem('maintenanceProviders', JSON.stringify(providers.filter((name) => !defaultProviders.includes(name))));
+      localStorage.setItem('selectedProvider', selectedProvider);
+    }}
+    const runnableProviders = new Set(['cloudways', 'siteground']);
+    function renderProviders() {{
+      if (!providers.includes(selectedProvider)) selectedProvider = providers[0] || 'Cloudways';
+      const tabs = $('providerTabs');
+      tabs.innerHTML = '';
+      providers.forEach((provider) => {{
+        const isImplemented = runnableProviders.has(provider.toLowerCase());
+        const button = document.createElement('button');
+        button.innerHTML = provider + (!isImplemented ? ' <span style="font-size:9px;opacity:0.7">(soon)</span>' : '');
+        button.classList.toggle('active', provider === selectedProvider);
+        if (!isImplemented) button.style.opacity = '0.7';
+        button.addEventListener('click', () => {{
+          selectedProvider = provider;
+          saveProviders();
+          renderProviders();
+          loadClients().catch((error) => $('runStatus').textContent = error.message);
+        }});
+        tabs.appendChild(button);
+      }});
+      $('providerPill').textContent = selectedProvider;
+      const providerKey = selectedProvider.toLowerCase();
+      const runnable = runnableProviders.has(providerKey);
+      $('startRun').style.opacity = runnable ? '1' : '0.6';
+      $('providerStatus').textContent = runnable ? '' : `${{selectedProvider}} tab is ready for inventory; no runner is configured yet.`;
+      const placeholder = providerKey === 'siteground'
+        ? '/home/<user>/www/<domain>/public_html'
+        : (runnable ? '/home/master/applications/appid/public_html' : 'Provider-specific WordPress path');
+      $('publicHtmlPath').placeholder = placeholder;
+    }}
+    function appendLine(line) {{
+      const terminal = $('terminal');
+      if (terminal.textContent === 'No run started.') terminal.textContent = '';
+      terminal.textContent += line + '\\n';
+      terminal.scrollTop = terminal.scrollHeight;
+    }}
+
+    // Phase B: Collapsible panels
+    document.querySelectorAll('.collapsible').forEach(h2 => {{
+      h2.addEventListener('click', () => {{
+        h2.classList.toggle('open');
+        const panel = h2.nextElementSibling;
+        if (panel) panel.classList.toggle('hidden');
+      }});
+    }});
+
+    // Phase B: Modal for log viewing
+    function showModal(content, title = '') {{
+      const modal = document.createElement('div');
+      modal.className = 'modal';
+      modal.innerHTML = `
+        <div class="modal-content">
+          <button class="close-modal">&times;</button>
+          <h2>${{title}}</h2>
+          <pre style="white-space:pre-wrap;font-family:var(--mono);font-size:12px;background:#f8faf7;padding:12px;border:1px solid var(--line);border-radius:6px">${{content}}</pre>
+        </div>
+      `;
+      document.body.appendChild(modal);
+      modal.querySelector('.close-modal').onclick = () => modal.remove();
+      modal.onclick = (e) => {{ if (e.target === modal) modal.remove(); }};
+    }}
+
+    // B1: Recent runs
+    async function loadRecentRuns() {{
+      const client = $('filterClient').value;
+      const status = $('filterStatus').value;
+      try {{
+        const data = await api(`/api/runs?limit=50&client=${{encodeURIComponent(client)}}&status=${{encodeURIComponent(status)}}`);
+        const tbody = $('recentRunsTable').querySelector('tbody');
+        tbody.innerHTML = '';
+        data.runs.forEach(run => {{
+          const tr = document.createElement('tr');
+          tr.style.cursor = 'pointer';
+          const cancelBtn = run.status === 'running' ? `<button class="cancel-btn" data-id="${{run.id}}">Cancel</button>` : '';
+          tr.innerHTML = `
+            <td>${{run.id}}</td>
+            <td><span class="pill">${{run.status}}</span>${{cancelBtn}}</td>
+            <td>${{run.target}}</td>
+            <td>${{new Date(run.startedAt * 1000).toLocaleString()}}</td>
+          `;
+          tr.onclick = (e) => {{
+            if (e.target.tagName === 'BUTTON') return;
+            if (run.status === 'running') {{
+              reAttachSSE(run.id);
+            }} else {{
+              showRunSummary(run.id);
+            }}
+          }};
+          tbody.appendChild(tr);
+        }});
+        tbody.querySelectorAll('.cancel-btn').forEach(btn => {{
+          btn.onclick = async () => {{
+            try {{
+              btn.disabled = true;
+              await api(`/api/runs/${{btn.dataset.id}}/cancel`, {{method: 'POST'}});
+              loadRecentRuns();
+            }} catch (e) {{
+              alert('Cancel failed: ' + e.message);
+              btn.disabled = false;
+            }}
+          }};
+        }});
+      }} catch (e) {{ console.error('Failed to load runs', e); }}
+    }}
+    $('filterClient').addEventListener('input', loadRecentRuns);
+    $('filterStatus').addEventListener('change', loadRecentRuns);
+
+    function reAttachSSE(runId) {{
+      $('terminal').textContent = '';
+      $('statusPill').textContent = 'running';
+      $('runStatus').textContent = `Re-attached to run ${{runId}}`;
+      const stream = new EventSource(`/api/runs/${{runId}}/stream`);
+      stream.addEventListener('line', (event) => appendLine(event.data));
+      stream.addEventListener('done', (event) => {{
+        const done = JSON.parse(event.data);
+        $('statusPill').textContent = `${{done.status}} (${{done.exitCode}})`;
+        appendLine(`run finished: ${{done.status}} exit=${{done.exitCode}}`);
+        loadRecentRuns();
+        showRunSummary(runId);
+        stream.close();
+      }});
+    }}
+
+    // B2: Client picker filter + quick-select wiring
+    $('clientFilterText').addEventListener('input', applyClientFilter);
+    document.querySelectorAll('.client-quick button').forEach(btn => {{
+      btn.addEventListener('click', () => quickSelect(btn.dataset.quick));
+    }});
+
+    // B3: Plugin health
+    async function loadPluginStats() {{
+      try {{
+        const data = await api('/api/stats/plugins');
+        const tbody = $('statsTable').querySelector('tbody');
+        tbody.innerHTML = '';
+        data.top_failed.forEach(s => {{
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td>${{s.plugin}}</td>
+            <td class="warn">${{s.fail_count}}</td>
+            <td>${{s.skip_count}}</td>
+            <td>${{new Date(s.last_failure_at * 1000).toLocaleDateString()}}</td>
+          `;
+          tbody.appendChild(tr);
+        }});
+      }} catch (e) {{ console.error('Failed to load stats', e); }}
+    }}
+
+    // B4: Run Summary
+    async function showRunSummary(runId) {{
+      try {{
+        const data = await api(`/api/runs/${{runId}}/summary`);
+        const panel = $('summaryPanel');
+        panel.innerHTML = `
+          <div class="stat-card">
+            <div class="stat-item"><div class="stat-value">${{data.sites.length}}</div><div class="stat-label">Sites</div></div>
+            <div class="stat-item"><div class="stat-value">${{data.plugins.length}}</div><div class="stat-label">Updates</div></div>
+            <div class="stat-item"><div class="stat-value">${{data.sites.filter(s=>s.outcome==='success').length}}</div><div class="stat-label">Success</div></div>
+          </div>
+          <table style="margin-top:14px">
+            <thead><tr><th>Domain</th><th>Outcome</th><th>Reason</th></tr></thead>
+            <tbody>
+              ${{data.sites.map(s => `<tr><td>${{s.domain}}</td><td>${{s.outcome}}</td><td>${{s.reason}}</td></tr>`).join('')}}
+            </tbody>
+          </table>
+        `;
+        $('runSummary').classList.remove('hidden');
+      }} catch (e) {{ console.error('Failed to load summary', e); }}
+    }}
+
+    // B5: Logs
+    async function loadLogs() {{
+      try {{
+        const data = await api('/api/logs');
+        const tbody = $('logsTable').querySelector('tbody');
+        tbody.innerHTML = '';
+        data.logs.forEach(log => {{
+          const tr = document.createElement('tr');
+          tr.style.cursor = 'pointer';
+          tr.innerHTML = `
+            <td>${{log.filename}}</td>
+            <td>${{log.run_id}}</td>
+            <td>${{(log.size_bytes/1024).toFixed(1)}} KB</td>
+            <td>${{new Date(log.modified_at * 1000).toLocaleString()}}</td>
+          `;
+          tr.onclick = async () => {{
+            const text = await fetch(`/api/logs/${{log.filename}}`).then(r => r.text());
+            showModal(text, log.filename);
+          }};
+          tbody.appendChild(tr);
+        }});
+      }} catch (e) {{ console.error('Failed to load logs', e); }}
+    }}
+
+    $('target').addEventListener('change', () => {{
+      $('remoteFields').classList.toggle('hidden', $('target').value !== 'remote');
+      $('targetPill').textContent = $('target').value;
+    }});
+    $('execute').addEventListener('change', () => {{
+      $('modePill').textContent = $('execute').checked ? 'execute' : 'dry-run';
+      $('executeWarn').textContent = $('execute').checked ? 'Execute mode will perform remote writes and backups.' : '';
+    }});
+    $('startRun').addEventListener('click', async () => {{
+      if (!runnableProviders.has(selectedProvider.toLowerCase())) {{
+        $('runStatus').textContent = `Runner not yet implemented for ${{selectedProvider}}`;
+        return;
+      }}
+      try {{
+        const data = await api('/api/runs', {{method:'POST', body:JSON.stringify(runPayload())}});
+        $('terminal').textContent = '';
+        $('statusPill').textContent = data.status;
+        $('runStatus').textContent = `Run ${{data.id}} started`;
+        loadRecentRuns();
+        const stream = new EventSource(`/api/runs/${{data.id}}/stream`);
+        stream.addEventListener('line', (event) => appendLine(event.data));
+        stream.addEventListener('done', (event) => {{
+          const done = JSON.parse(event.data);
+          $('statusPill').textContent = `${{done.status}} (${{done.exitCode}})`;
+          appendLine(`run finished: ${{done.status}} exit=${{done.exitCode}}`);
+          loadRecentRuns();
+          showRunSummary(data.id);
+          stream.close();
+        }});
+      }} catch (error) {{ $('runStatus').textContent = error.message; }}
+    }});
+    $('refreshClients').addEventListener('click', loadClients);
+    $('uploadSshKey').addEventListener('click', async () => {{
+      const file = $('sshKeyFile').files[0];
+      if (!file) {{ $('runStatus').textContent = 'Choose an SSH key file first.'; return; }}
+      try {{
+        const data = await api('/api/ssh-keys', {{method:'POST', body:JSON.stringify({{name:file.name, content:await file.text()}})}});
+        $('runStatus').textContent = `Uploaded SSH key ${{data.name}}`;
+        await loadSshKeys();
+        $('sshKey').value = data.name;
+      }} catch (error) {{ $('runStatus').textContent = error.message; }}
+    }});
+    $('toggleAddProvider').addEventListener('click', () => {{
+      const panel = $('providerAddPanel');
+      const wasHidden = panel.classList.toggle('hidden');
+      if (!wasHidden) $('newProvider').focus();
+    }});
+    $('addProvider').addEventListener('click', () => {{
+      const name = $('newProvider').value.trim();
+      if (!name) return;
+      providers = [...new Set([...providers, name])];
+      selectedProvider = name;
+      $('newProvider').value = '';
+      $('providerAddPanel').classList.add('hidden');
+      saveProviders();
+      renderProviders();
+      loadClients().catch((error) => $('runStatus').textContent = error.message);
+    }});
+    document.querySelectorAll('.tabs button').forEach((button) => {{
+      button.addEventListener('click', () => {{
+        document.querySelectorAll('.tabs button').forEach((b) => b.classList.remove('active'));
+        button.classList.add('active');
+        $('manualTab').classList.toggle('hidden', button.dataset.tab !== 'manual');
+        $('importTab').classList.toggle('hidden', button.dataset.tab !== 'import');
+      }});
+    }});
+    $('saveManual').addEventListener('click', async () => {{
+      const ids = ['clientName','email','serverIp','masterUsername','masterPassword','websiteDomain','publicHtmlPath'];
+      const payload = Object.fromEntries(ids.map((id) => [id, $(id).value]));
+      payload.provider = selectedProvider;
+      payload.isStaging = $('isStaging').checked; payload.hasWooCommerce = $('hasWoo').checked;
+      try {{ const data = await api('/api/clients/manual', {{method:'POST', body:JSON.stringify(payload)}}); $('clientStatus').textContent = `Saved ${{data.path}}`; await loadClients(); }}
+      catch (error) {{ $('clientStatus').textContent = error.message; }}
+    }});
+    $('saveImport').addEventListener('click', async () => {{
+      try {{
+        const client = JSON.parse($('jsonImport').value);
+        const data = await api('/api/clients/import', {{method:'POST', body:JSON.stringify({{client}})}});
+        $('clientStatus').textContent = `Imported ${{data.path}}`; await loadClients();
+      }} catch (error) {{ $('clientStatus').textContent = error.message; }}
+    }});
+    $('jsonFile').addEventListener('change', async (event) => {{
+      const file = event.target.files[0];
+      if (file) $('jsonImport').value = await file.text();
+    }});
+    renderProviders();
+    loadSshKeys().catch((error) => $('runStatus').textContent = error.message);
+    loadClients().catch((error) => $('runStatus').textContent = error.message);
+    loadArchivedClients();
+    loadRecentRuns();
+    loadPluginStats();
+    loadLogs();
+  </script>
+</body>
+</html>"""
+
+
+def make_handler(settings: Settings) -> type[WebUIHandler]:
+    class ConfiguredHandler(WebUIHandler):
+        pass
+
+    ConfiguredHandler.settings = settings
+    return ConfiguredHandler
+
+
+def build_cli() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the authenticated WordPress maintenance web UI.")
+    parser.add_argument("--host", default=None, help="Bind host (default: WEBUI_HOST or 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=None, help="Bind port (default: WEBUI_PORT or 8787)")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = build_cli()
+    settings = Settings.from_env()
+    if args.host:
+        settings = Settings(**{**settings.__dict__, "host": args.host})
+    if args.port:
+        settings = Settings(**{**settings.__dict__, "port": args.port})
+    if not settings.password:
+        print("Refusing to start: set WEBUI_PASSWORD first.", file=sys.stderr)
+        return 2
+    init_db()
+    server = ThreadingHTTPServer((settings.host, settings.port), make_handler(settings))
+    print(f"Serving Cloudways maintenance UI at http://{settings.host}:{settings.port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopping web UI.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
