@@ -71,6 +71,7 @@ import ssl
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -143,6 +144,39 @@ KNOWN_CACHE_PLUGINS = {
     "cache-enabler":       ("Cache Enabler",        "cache-enabler clear"),
 }
 
+# Transient/regenerable directories excluded from both the backup archive and
+# the disk-space estimate. WordPress or the cache plugin rebuilds these on
+# demand, so archiving them wastes disk and can block otherwise-healthy sites
+# at the disk-check gate: jsweldingandfabrication.com failed run
+# 20260730T215215Z with 3.7GB of Breeze cache inside a 4.7GB tree whose real
+# content was ~950MB.
+#
+# Paths are relative to the WordPress root. Deliberately NOT excluded:
+#   wp-content/wflogs   — Wordfence firewall rules/IP reputation; small, and
+#                         losing it on rollback degrades security posture.
+#   wp-content/updraft  — the client's OWN backups. Dropping those during a
+#                         restore is not a call this tool makes silently.
+BACKUP_EXCLUDE_DIRS = (
+    "wp-content/cache",               # Breeze, W3TC, WP Super Cache, Comet, ...
+    "wp-content/upgrade",             # WP core's transient unpack dir
+    "wp-content/upgrade-temp-backup",  # WP 6.3+ rollback staging
+    "wp-content/uploads/cache",       # some plugins nest cache under uploads
+    "wp-content/et-cache",            # Divi
+    "wp-content/litespeed",           # LiteSpeed Cache
+)
+
+# Backup size estimation. The old 0.6 "tar.gz ≈ 50% + SQL ≈ 10%" figure was
+# only ever safe because highly-compressible cache inflated the denominator.
+# Measured against two real archives on 143.244.179.152 (2026-04-24):
+#   kzwbjzqspp  ~1.10GB tree → 946MB tar.gz  (86%)
+#   vkkueyverz  ~1.15GB tree → 931MB tar.gz  (79%)
+# Once cache is excluded the remainder is mostly uploads/ (JPEG/PNG/PDF, already
+# compressed), so the ratio approaches 1.0 and 0.6 becomes an UNDER-estimate
+# exactly when we start relying on it.
+BACKUP_SIZE_RATIO = 0.9            # tar.gz of a cache-excluded tree
+BACKUP_DB_RATIO = 0.15             # SQL dump headroom
+BACKUP_HEADROOM_MULTIPLIER = 2.0   # require 2x the estimate as free space
+
 # Confidence-scoring rules used by _compute_confidence. Tunable in one place.
 CONFIDENCE_RULES = {
     "woocommerce_penalty": 15,
@@ -173,6 +207,35 @@ CONFIDENCE_RULES = {
 # an error.
 _PLUGIN_STATUS_SUCCESS = frozenset({"updated", "success", "updated successfully"})
 _PLUGIN_STATUS_UPTODATE = frozenset({"up to date", "already up to date"})
+
+
+def _tar_exclude_flags(excludes: Sequence[str]) -> str:
+    """Render BACKUP_EXCLUDE_DIRS as `tar --exclude` flags.
+
+    Archives are created with `tar -C <wp_root> .`, so members are named
+    `./wp-content/cache/...` — the patterns must carry the same `./` prefix to
+    match. GNU tar honours --exclude positionally, so callers MUST place the
+    result before the `.` file operand.
+
+    Returns "" for an empty list, which keeps the generated command byte-identical
+    to the pre-exclusion behaviour under --no-backup-excludes.
+    """
+    return " ".join(shlex.quote(f"--exclude=./{path}") for path in excludes)
+
+
+def _du_exclude_paths(wp_path: str, excludes: Sequence[str]) -> list[str]:
+    """Absolute paths of the excluded dirs, for the `du -sbc` subtraction.
+
+    The disk estimate deliberately does NOT use `du --exclude`: GNU du matches
+    its patterns against the path as du prints it, while tar matches against the
+    archive member name. Those semantics differ enough that a silent mismatch is
+    plausible, and a mismatch here means an under-reserved disk — the exact
+    failure the disk-check gate exists to prevent.
+
+    Measuring the excluded dirs separately and subtracting makes the estimate
+    equal to what tar actually writes *by construction*, from this one list.
+    """
+    return [f"{wp_path}/{path}" for path in excludes]
 
 
 def _extract_plugin_error(result: dict) -> str:
@@ -1802,53 +1865,121 @@ class WPUpdater:
     # user), not web-accessible, and persistent across reboots.
     # ------------------------------------------------------------------
 
+    def _active_excludes(self) -> Sequence[str]:
+        """The exclusion list in force for this run.
+
+        Single accessor so the disk estimate, the backup archive and the
+        rollback forensic snapshot can never consult different lists.
+        """
+        if getattr(self.args, "no_backup_excludes", False):
+            return ()
+        return BACKUP_EXCLUDE_DIRS
+
+    def _tar_excludes(self) -> str:
+        """`tar --exclude` fragment, trailing space included when non-empty."""
+        flags = _tar_exclude_flags(self._active_excludes())
+        return f"{flags} " if flags else ""
+
     def _step_disk_check(self, r: SiteReport) -> None:
         """
         Check available disk space and estimate backup size BEFORE writing
         anything.  A WordPress backup needs room for:
-          - A compressed tar of public_html
+          - A compressed tar of public_html (minus BACKUP_EXCLUDE_DIRS)
           - A full SQL dump of the database
-        We estimate the backup at ~50% of public_html size (tar.gz compression)
-        plus a generous margin.  If available space is less than 2x the
-        estimated backup size, we abort — filling a disk on a shared Cloudways
-        server could take down every app on that instance.
+
+        The estimate is sized against what tar will ACTUALLY write, not the
+        whole tree: transient cache dirs are excluded from both, measured from
+        the same BACKUP_EXCLUDE_DIRS list so the two cannot drift apart. If
+        available space is less than BACKUP_HEADROOM_MULTIPLIER x the estimate
+        we abort — filling a disk on a shared Cloudways server could take down
+        every app on that instance.
 
         This check runs in both dry-run and execute mode so the operator
         always sees the disk health.
         """
         t0 = ts()
 
-        # du -sb = total bytes of public_html
-        # df -B1 = available bytes on the partition
+        excl_paths = _du_exclude_paths(r.wp_path, self._active_excludes())
+
+        # du -sb  = total bytes of public_html
+        # du -sbc = grand total of the excluded dirs (last line); missing paths
+        #           are skipped via 2>/dev/null and simply contribute 0, so a
+        #           site without a cache dir measures the same as one with an
+        #           empty cache dir. No `set -e` here — du exits non-zero when
+        #           any operand is absent, which is the normal case.
+        # df -B1  = available bytes on the partition
+        if excl_paths:
+            quoted = " ".join(shlex.quote(p) for p in excl_paths)
+            excl_line = (
+                f"excl_bytes=$(du -sbc {quoted} 2>/dev/null"
+                f" | tail -1 | awk '{{print $1}}')"
+            )
+        else:
+            excl_line = "excl_bytes=0"
+
         check_script = f"""\
 du_bytes=$(du -sb {shlex.quote(r.wp_path)} 2>/dev/null | awk '{{print $1}}')
+{excl_line}
 avail_bytes=$(df -B1 {shlex.quote(r.wp_path)} 2>/dev/null | awk 'NR==2{{print $4}}')
-echo "${{du_bytes:-0}} ${{avail_bytes:-0}}"
+echo "${{du_bytes:-0}} ${{excl_bytes:-0}} ${{avail_bytes:-0}}"
 """
         raw = self._ssh(r, check_script).strip()
+        parts = raw.split()
         try:
-            site_bytes, avail_bytes = (int(p) for p in raw.split())
+            if len(parts) == 2:
+                # Legacy two-field response (older agent, or a shell that
+                # dropped the middle field). Degrade to "nothing excluded"
+                # rather than crashing — the estimate is then conservative.
+                site_bytes, avail_bytes = (int(p) for p in parts)
+                excl_bytes = 0
+            else:
+                site_bytes, excl_bytes, avail_bytes = (int(p) for p in parts)
         except ValueError:
             self._record_step(r, "disk-check", "success",
                               f"could not parse disk info (raw={raw!r}), proceeding", t0)
             return
 
-        site_mb = site_bytes / (1024 * 1024)
-        avail_mb = avail_bytes / (1024 * 1024)
-        # Estimate: compressed tar ≈ 50% of original + SQL dump ≈ 10% of original
-        est_backup_mb = site_mb * 0.6
-        # Require at least 2x the estimated backup size as headroom
-        required_mb = est_backup_mb * 2
+        # The excluded dirs are a subset of the tree, so excl > site is
+        # impossible and means the reading is untrustworthy (a du that followed
+        # a symlink out of the tree, a path collision, a garbled response).
+        # Do NOT clamp to site_bytes — that would make backed_up 0 and let any
+        # site pass. Discard the exclusion entirely and size against the whole
+        # tree, which is the conservative direction.
+        if excl_bytes < 0 or excl_bytes > site_bytes:
+            self.log.warning(
+                "disk-check: implausible exclusion reading (%d of %d bytes) "
+                "for %s — sizing backup against the full tree",
+                excl_bytes, site_bytes, r.domain,
+            )
+            excl_bytes = 0
 
+        site_mb = site_bytes / (1024 * 1024)
+        excluded_mb = excl_bytes / (1024 * 1024)
+        # What tar will actually write — the whole tree minus the transient dirs.
+        backed_up_mb = site_mb - excluded_mb
+        avail_mb = avail_bytes / (1024 * 1024)
+        est_backup_mb = backed_up_mb * (BACKUP_SIZE_RATIO + BACKUP_DB_RATIO)
+        required_mb = est_backup_mb * BACKUP_HEADROOM_MULTIPLIER
+
+        # site_mb intentionally stays the FULL tree: the large_site_threshold_mb
+        # confidence rule still wants to know a 4.7GB tree is slow to walk, and
+        # keeping the key's meaning stable keeps historical summaries comparable.
         r.baseline["disk"] = {
             "site_mb": round(site_mb, 1),
+            "excluded_mb": round(excluded_mb, 1),
+            "backed_up_mb": round(backed_up_mb, 1),
             "available_mb": round(avail_mb, 1),
             "estimated_backup_mb": round(est_backup_mb, 1),
         }
 
+        excl_note = (
+            f" ({excluded_mb:.0f}MB transient excluded)" if excluded_mb > 0 else ""
+        )
+
         if avail_mb < required_mb:
             detail = (
-                f"INSUFFICIENT DISK — site={site_mb:.0f}MB, "
+                f"INSUFFICIENT DISK — site={site_mb:.0f}MB{excl_note}, "
+                f"backing up {backed_up_mb:.0f}MB, "
                 f"available={avail_mb:.0f}MB, need≥{required_mb:.0f}MB"
             )
             self.log.error("⚠ %s  |  %s", detail, r.domain)
@@ -1856,7 +1987,8 @@ echo "${{du_bytes:-0}} ${{avail_bytes:-0}}"
             raise HealthCheckError(detail)
 
         detail = (
-            f"site={site_mb:.0f}MB, available={avail_mb:.0f}MB, "
+            f"site={site_mb:.0f}MB{excl_note}, "
+            f"backing up {backed_up_mb:.0f}MB, available={avail_mb:.0f}MB, "
             f"est_backup={est_backup_mb:.0f}MB — OK"
         )
         self._record_step(r, "disk-check", "success", detail, t0)
@@ -1892,10 +2024,17 @@ echo "${{du_bytes:-0}} ${{avail_bytes:-0}}"
                               f"would create backup at {backup_dir}", t0)
             return
 
+        # Transient dirs are excluded from the archive. The flags must precede
+        # the `.` operand — GNU tar applies --exclude positionally. The trailing
+        # space is part of the rendered fragment; an empty list yields "" so the
+        # command stays byte-identical to the pre-exclusion form.
+        tar_excludes = self._tar_excludes()
+
         # The backup script is piped via stdin to avoid quoting issues.
         # It creates:
         #   preflight.sql       — full DB dump with DROP TABLE statements
-        #   public_html.tar.gz  — compressed snapshot of the entire app
+        #   public_html.tar.gz  — compressed snapshot of the app, minus
+        #                         BACKUP_EXCLUDE_DIRS (regenerable cache)
         #   plugins.json        — plugin inventory at backup time
         #   themes.json         — theme inventory at backup time
         script = f"""\
@@ -1910,7 +2049,7 @@ wp --path={shlex.quote(r.wp_path)} theme list --format=json > {shlex.quote(backu
 # but fail on >1. The `|| _tar_rc=$?` is required: without it, `set -e` fires
 # on tar's non-zero exit before the rc capture runs, killing the script.
 _tar_rc=0
-tar -czf {shlex.quote(backup_dir + '/public_html.tar.gz')} -C {shlex.quote(r.wp_path)} . 2>&1 || _tar_rc=$?
+tar -czf {shlex.quote(backup_dir + '/public_html.tar.gz')} -C {shlex.quote(r.wp_path)} {tar_excludes}. 2>&1 || _tar_rc=$?
 [ "$_tar_rc" -le 1 ] || exit "$_tar_rc"
 # Verify both backup files are non-empty
 test -s {shlex.quote(backup_dir + '/preflight.sql')}
@@ -2339,6 +2478,15 @@ echo 'backup-ok'
         fs_backup = f"{r.backup_dir}/public_html.tar.gz"
         failed_snapshot = f"{r.backup_dir}/failed-state.tar.gz"
 
+        # Recreated after the extract (step 5c). Rendered as `:` when nothing is
+        # excluded — a bare `mkdir -p` with no operands exits non-zero, which
+        # under `set -euo pipefail` would abort the rollback itself.
+        _mkdirs = _du_exclude_paths(r.wp_path, self._active_excludes())
+        rollback_mkdir_line = (
+            "mkdir -p " + " ".join(shlex.quote(p) for p in _mkdirs)
+            if _mkdirs else ":"
+        )
+
         script = f"""\
 set -euo pipefail
 # 0a. Defense-in-depth on the live tree: refuse to wipe a directory that
@@ -2365,8 +2513,11 @@ if ! (set +o pipefail; tar -tzf {shlex.quote(fs_backup)} 2>/dev/null | grep -qE 
     echo "rollback-abort: {fs_backup} missing wp-config.php — refusing to extract" >&2
     exit 95
 fi
-# 1. Archive the broken state for forensic analysis
-tar -czf {shlex.quote(failed_snapshot)} -C {shlex.quote(r.wp_path)} . 2>/dev/null || true
+# 1. Archive the broken state for forensic analysis. Same exclusions as the
+#    pre-flight backup: this runs DURING a rollback, on a disk that is often
+#    already under pressure, and writing gigabytes of regenerable cache here
+#    is the fastest way to turn a recoverable failure into an unrecoverable one.
+tar -czf {shlex.quote(failed_snapshot)} -C {shlex.quote(r.wp_path)} {self._tar_excludes()}. 2>/dev/null || true
 # 2. Best-effort ownership recovery before the wipe. rm -rf normally
 #    succeeds via parent-dir perms regardless of child ownership, but
 #    a child directory with restrictive mode can block recursion. If
@@ -2409,6 +2560,12 @@ if [ -f {shlex.quote(r.backup_dir + "/wp-config.sha256")} ]; then
         exit 93
     fi
 fi
+# 5c. Recreate the transient dirs that were excluded from the archive. The
+#     wipe in step 3 removed them and the extract in step 4 did not bring them
+#     back, but wp-content/advanced-cache.php IS restored — so a cache drop-in
+#     comes back live and expects its directory to exist. Most plugins recreate
+#     it lazily; "most" is not a guarantee worth relying on in a rollback path.
+{rollback_mkdir_line}
 # 6. Restore database from pre-flight dump.
 #    cd into wp_path so wp-config.php's relative require (e.g. require 'wp-salt.php')
 #    resolves against the WP root, not the SSH login home dir.
@@ -2967,6 +3124,17 @@ echo 'rollback-ok'
                 f" -{rules['large_site_penalty']}  Large site ({site_mb:.0f} MB)"
             )
 
+        # Cache-dominated tree. No score penalty — the backup now excludes it,
+        # so it doesn't make THIS run riskier — but a site more than half
+        # regenerable cache has a problem the operator should see on the
+        # dry-run report rather than discovering as a hard disk-check failure.
+        excluded_mb = disk.get("excluded_mb", 0)
+        if site_mb > 0 and excluded_mb > site_mb * 0.5:
+            factors.append(
+                f"  0  Note: {excluded_mb:.0f} MB of {site_mb:.0f} MB is "
+                f"transient cache (excluded from backup)"
+            )
+
         # Tight disk space
         avail_mb = disk.get("available_mb", 0)
         est_backup = disk.get("estimated_backup_mb", 0)
@@ -3086,6 +3254,12 @@ echo 'rollback-ok'
               f"{disk.get('site_mb', 0):.0f}",
               f"{disk.get('available_mb', 0):.0f}",
               f"{disk.get('estimated_backup_mb', 0):.0f}")
+            excluded_mb = disk.get("excluded_mb", 0)
+            if excluded_mb:
+                L("  │                %s MB transient cache excluded "
+                  "→ %s MB actually archived",
+                  f"{excluded_mb:.0f}",
+                  f"{disk.get('backed_up_mb', 0):.0f}")
         else:
             L("  │  Disk:         not checked")
 
@@ -3269,6 +3443,16 @@ def build_cli() -> argparse.Namespace:
     p.add_argument(
         "--skip-staging", action="store_true",
         help="Skip sites with is_staging=true.",
+    )
+    p.add_argument(
+        "--no-backup-excludes", action="store_true",
+        help=(
+            "Archive transient cache directories too (larger backups, and a "
+            "cache-bloated site may fail the disk check). By default "
+            f"{len(BACKUP_EXCLUDE_DIRS)} regenerable dirs such as "
+            "wp-content/cache are excluded from both the backup and the "
+            "disk-space estimate."
+        ),
     )
     p.add_argument(
         "--skip-ssl-verify", action="store_true",
