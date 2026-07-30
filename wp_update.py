@@ -2692,13 +2692,25 @@ echo 'rollback-ok'
         # load_env already expanded ~ in any path read from .env, so this
         # is just a typesafe Path() coercion.
         key_path = Path(r.ssh_key_path) if r.ssh_key_path else None
+        # `-i` adds an identity but does not stop OpenSSH from offering every
+        # key exposed by SSH_AUTH_SOCK. Hosts commonly disconnect after only a
+        # handful of rejected keys, so a busy desktop agent can prevent the
+        # requested key (or password fallback) from ever being attempted.
+        key_auth_opts = [
+            "-o", "BatchMode=yes",
+            "-o", "IdentitiesOnly=yes",
+        ]
+        password_auth_opts = [
+            "-o", "PubkeyAuthentication=no",
+            "-o", "PreferredAuthentications=password,keyboard-interactive",
+        ]
 
         # Tier 2: SSH key + master username
         if r.auth_method == "master-key":
             target = f"{r.master_user}@{r.server_ip}"
             if key_path and key_path.exists():
                 return ([
-                    "ssh", *common_opts, "-o", "BatchMode=yes",
+                    "ssh", *common_opts, *key_auth_opts,
                     "-i", str(key_path), target, "bash", "-ls",
                 ], None)
             raise SSHError(f"master-key auth requires SSH key but {key_path} not found")
@@ -2708,14 +2720,15 @@ echo 'rollback-ok'
             target = f"{r.master_user}@{r.server_ip}"
             return ([
                 "sshpass", "-e",
-                "ssh", *common_opts, target, "bash", "-ls",
+                "ssh", *common_opts, *password_auth_opts,
+                target, "bash", "-ls",
             ], r.master_password)
 
         # Tier 1 (default): SSH key + wpupdates user
         target = f"{r.ssh_user}@{r.server_ip}"
         if key_path and key_path.exists():
             return ([
-                "ssh", *common_opts, "-o", "BatchMode=yes",
+                "ssh", *common_opts, *key_auth_opts,
                 "-i", str(key_path), target, "bash", "-ls",
             ], None)
 
@@ -2723,7 +2736,8 @@ echo 'rollback-ok'
         if r.ssh_password and shutil.which("sshpass"):
             return ([
                 "sshpass", "-e",
-                "ssh", *common_opts, target, "bash", "-ls",
+                "ssh", *common_opts, *password_auth_opts,
+                target, "bash", "-ls",
             ], r.ssh_password)
 
         raise SSHError(

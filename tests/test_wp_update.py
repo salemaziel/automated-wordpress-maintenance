@@ -259,6 +259,56 @@ def test_ssh_command_bypasses_system_config_by_default(tmp_path: Path) -> None:
     assert command[:3] == ["ssh", "-F", "/dev/null"]
     assert "-o" in command
     assert "BatchMode=yes" in command
+    assert "IdentitiesOnly=yes" in command
+
+
+def test_ssh_key_auth_limits_agent_identities_for_master_user(tmp_path: Path) -> None:
+    args = make_args(tmp_path)
+    ssh_key = tmp_path / "id_rsa"
+    ssh_key.write_text("dummy-key")
+    updater = wp_update.WPUpdater(args)
+    report = make_report(
+        auth_method="master-key",
+        master_user="master_example",
+        ssh_key_path=str(ssh_key),
+    )
+
+    command, password = updater._ssh_cmd(report)
+
+    assert password is None
+    assert "IdentitiesOnly=yes" in command
+    assert command[command.index("-i") + 1] == str(ssh_key)
+
+
+@pytest.mark.parametrize(
+    ("auth_method", "ssh_password", "master_password"),
+    [
+        ("key", "app-secret", ""),
+        ("master", "", "master-secret"),
+    ],
+)
+def test_ssh_password_auth_disables_public_key_attempts(
+    tmp_path: Path,
+    auth_method: str,
+    ssh_password: str,
+    master_password: str,
+) -> None:
+    updater = wp_update.WPUpdater(make_args(tmp_path))
+    report = make_report(
+        auth_method=auth_method,
+        ssh_user="wpupdates",
+        ssh_password=ssh_password,
+        master_user="master_example",
+        master_password=master_password,
+    )
+
+    with patch("wp_update.shutil.which", return_value="/usr/bin/sshpass"):
+        command, password = updater._ssh_cmd(report)
+
+    assert command[:4] == ["sshpass", "-e", "ssh", "-F"]
+    assert "PubkeyAuthentication=no" in command
+    assert "PreferredAuthentications=password,keyboard-interactive" in command
+    assert password == (master_password or ssh_password)
 
 
 def test_ssh_command_includes_controlmaster_when_mux_enabled(tmp_path: Path) -> None:

@@ -136,6 +136,14 @@ SSH access is attempted in a fallback sequence:
 
 If the script has to operate as the master user, it captures the original filesystem ownership before updates and restores it afterward.
 
+The CLI restricts key authentication to the inventory-selected key and disables
+public-key attempts during password fallback. This prevents a local SSH agent
+containing many unrelated keys from exhausting a host's authentication-attempt
+limit and causing `Too many authentication failures`. The problem can appear
+suddenly even when the repository, client inventory, credentials, and command
+are unchanged: a reboot, login, or desktop-keyring restart can attach the
+process to an SSH agent exposing enough identities to exceed the server limit.
+
 ## How the update flow works
 
 `wp_update.py` is intentionally monolithic: all orchestration lives in one file so the full update lifecycle is visible in one place.
