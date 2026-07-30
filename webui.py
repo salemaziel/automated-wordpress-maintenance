@@ -634,6 +634,10 @@ def build_wp_args(payload: dict[str, Any], *, remote: bool = False) -> list[str]
         args.append("--recheck-updates")
     if payload.get("noSkipUpToDate"):
         args.append("--no-skip-up-to-date")
+    # Escape hatch for the transient-cache exclusion. Rare, but the only way to
+    # get a byte-complete archive when a site keeps real data under a cache path.
+    if payload.get("noBackupExcludes"):
+        args.append("--no-backup-excludes")
     ttl_raw = payload.get("skipUpToDateTtl")
     if ttl_raw is not None and str(ttl_raw).strip() != "":
         # Malformed input from the form silently falls back to the CLI's
@@ -1603,6 +1607,7 @@ def app_html(settings: Settings) -> str:
           <label class="check"><input id="includeWoo" type="checkbox"> Include WooCommerce</label>
           <label class="check" title="Ignore any recent dry-run summary cache; always collect a fresh inline baseline per site."><input id="recheckUpdates" type="checkbox"> Re-check updates</label>
           <label class="check" title="Force every site through the full backup+update+verify path even when its inline baseline shows no pending updates."><input id="noSkipUpToDate" type="checkbox"> Disable up-to-date skip</label>
+          <label class="check" title="Archive the full public_html, including regenerable cache dirs (wp-content/cache, upgrade, ...). Larger backups and a bigger disk reservation; only needed when a site keeps real data under a cache path."><input id="noBackupExcludes" type="checkbox"> Back up cache dirs too</label>
         </div>
         <div class="row" style="align-items:flex-end">
           <div style="max-width:180px">
@@ -1966,6 +1971,7 @@ def app_html(settings: Settings) -> str:
         includeWooCommerce: $('includeWoo').checked,
         recheckUpdates: $('recheckUpdates').checked,
         noSkipUpToDate: $('noSkipUpToDate').checked,
+        noBackupExcludes: $('noBackupExcludes').checked,
         skipUpToDateTtl: $('skipUpToDateTtl').value,
         streamDebug: $('streamDebug').checked,
         clientFiles: selectedClientNames(),

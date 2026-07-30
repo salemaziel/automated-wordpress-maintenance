@@ -2861,6 +2861,30 @@ def test_disk_check_clamps_impossible_exclusion_reading(tmp_path: Path) -> None:
     assert disk["backed_up_mb"] == disk["site_mb"]
 
 
+def test_disk_check_unreadable_cache_dir_does_not_under_reserve(tmp_path: Path) -> None:
+    """A cache dir the SSH user cannot read is invisible to BOTH du passes.
+
+    Verified empirically against GNU du: with `chmod 000 wp-content/cache`,
+    `du -sb <tree>` omits the cache contents entirely and `du -sbc <cache>`
+    reports 0 (both errors swallowed by 2>/dev/null). So the response is
+    "whole tree already minus cache" + "0 excluded", and backed_up must equal
+    the reported tree — which is exactly what tar, running as the same user
+    with the same lack of access, can write. The danger would be subtracting
+    a cache size that the tree measurement never included, reserving less
+    disk than tar needs; assert that cannot happen.
+    """
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    site_bytes = 100 * 1024 * 1024      # tree total, already missing the cache
+    excl_bytes = 0                       # unreadable → measures as nothing
+    avail_bytes = 40 * 1024 * 1024 * 1024
+    _disk_check_capture(updater, r, f"{site_bytes} {excl_bytes} {avail_bytes}")
+    disk = r.baseline["disk"]
+    assert disk["excluded_mb"] == 0
+    # Nothing subtracted, so the reservation covers the full readable tree.
+    assert disk["backed_up_mb"] == disk["site_mb"] == 100.0
+
+
 def _extract_tar_excludes(script: str) -> set[str]:
     """Every --exclude=./<path> in a generated tar command, normalised."""
     return {m.lstrip("./") for m in re.findall(r"--exclude=(\S+)", script)}

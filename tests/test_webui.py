@@ -185,6 +185,18 @@ def test_local_command_forwards_no_skip_up_to_date_flag() -> None:
     assert "--no-skip-up-to-date" in command
 
 
+def test_local_command_forwards_no_backup_excludes_flag() -> None:
+    command = webui.build_local_command({"execute": True, "noBackupExcludes": True})
+    assert "--no-backup-excludes" in command
+
+
+def test_local_command_omits_no_backup_excludes_by_default() -> None:
+    """Cache exclusion is the default; the full-archive escape hatch must be
+    opt-in, or every webui run reserves disk for cache it won't archive."""
+    command = webui.build_local_command({"execute": True})
+    assert "--no-backup-excludes" not in command
+
+
 def test_local_command_forwards_skip_up_to_date_ttl_value() -> None:
     command = webui.build_local_command({"execute": True, "skipUpToDateTtl": 120})
     # Flag + value must be adjacent and pass through as an int-string.
