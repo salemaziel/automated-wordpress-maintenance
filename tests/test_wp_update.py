@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -41,6 +42,7 @@ def make_args(
         no_skip_up_to_date=False,
         recheck_updates=False,
         stream=False,
+        no_backup_excludes=False,
     )
 
 
@@ -2696,3 +2698,328 @@ def test_maybe_update_sheet_forwards_dry_run_flag(tmp_path: Path) -> None:
     assert mock_call.call_args.kwargs["dry_run"] is True
     assert mock_call.call_args.kwargs["spreadsheet_id"] == "SHEET_ID"
     assert mock_call.call_args.kwargs["tab_name"] == "Plugin Updates"
+
+
+# ---------------------------------------------------------------------------
+# Transient-cache exclusion from backups and the disk-space estimate.
+#
+# Regression origin: jsweldingandfabrication.com failed dry-run 20260730T215215Z
+# at disk-check with 3.7GB of Breeze cache inside a 4.7GB tree. All byte figures
+# below are the real measurements from that server unless noted.
+# ---------------------------------------------------------------------------
+
+# Live readings from 143.244.179.152:/home/master/applications/kzwbjzqspp/public_html
+JSWELDING_SITE_BYTES = 5103991282   # whole tree
+JSWELDING_EXCL_BYTES = 3920009496   # transient cache dirs
+JSWELDING_AVAIL_BYTES = 4197322752  # free on /
+
+
+def _disk_check_capture(
+    updater: wp_update.WPUpdater,
+    r: wp_update.SiteReport,
+    response: str,
+) -> str:
+    """Run _step_disk_check against a canned remote response, return the script."""
+    captured: list[str] = []
+
+    def fake_ssh(report: wp_update.SiteReport, script: str, **kw: object) -> str:
+        captured.append(script)
+        return response
+
+    with patch.object(updater, "_ssh", side_effect=fake_ssh):
+        updater._step_disk_check(r)
+    return captured[0]
+
+
+def test_disk_check_excludes_cache_from_requirement(tmp_path: Path) -> None:
+    """The real jswelding numbers must now PASS: 4.9GB tree, but only 1.1GB of
+    it is actually archived, so 4GB free is ample headroom."""
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    _disk_check_capture(
+        updater, r,
+        f"{JSWELDING_SITE_BYTES} {JSWELDING_EXCL_BYTES} {JSWELDING_AVAIL_BYTES}",
+    )
+
+    disk = r.baseline["disk"]
+    assert disk["site_mb"] == pytest.approx(4868, abs=1)
+    assert disk["excluded_mb"] == pytest.approx(3738, abs=1)
+    # The load-bearing invariant: what we archive is the tree minus exclusions.
+    assert disk["backed_up_mb"] == pytest.approx(
+        disk["site_mb"] - disk["excluded_mb"], abs=0.1
+    )
+    assert disk["backed_up_mb"] == pytest.approx(1129, abs=1)
+    # Step recorded success, not failure.
+    assert [s for s in r.steps if s.name == "disk-check"][0].status == "success"
+
+
+def test_disk_check_still_fails_when_genuinely_full(tmp_path: Path) -> None:
+    """Excluding cache must not defang the gate — the same tree with only
+    1.5GB free still has to fail, because 1.1GB really is being archived."""
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+
+    with pytest.raises(wp_update.HealthCheckError):
+        _disk_check_capture(
+            updater, r,
+            f"{JSWELDING_SITE_BYTES} {JSWELDING_EXCL_BYTES} {1500 * 1024 * 1024}",
+        )
+
+    step = [s for s in r.steps if s.name == "disk-check"][0]
+    assert step.status == "failed"
+    assert "INSUFFICIENT DISK" in step.detail
+    # Operator must be able to see WHY from the message alone.
+    assert "transient excluded" in step.detail
+
+
+def test_disk_check_tolerates_legacy_two_field_response(tmp_path: Path) -> None:
+    """A shell that returns the pre-change two-field format degrades to
+    'nothing excluded' (conservative) rather than crashing the site."""
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    # 1GB tree, 10GB free — passes either way; the point is that it parses.
+    _disk_check_capture(
+        updater, r, f"{1024 * 1024 * 1024} {10 * 1024 * 1024 * 1024}"
+    )
+    assert r.baseline["disk"]["excluded_mb"] == 0
+    assert r.baseline["disk"]["backed_up_mb"] == pytest.approx(1024, abs=1)
+
+
+def test_disk_check_unparseable_response_still_proceeds(tmp_path: Path) -> None:
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    _disk_check_capture(updater, r, "du: command not found")
+    step = [s for s in r.steps if s.name == "disk-check"][0]
+    assert step.status == "success"
+    assert "could not parse" in step.detail
+
+
+def test_disk_check_clamps_impossible_exclusion_reading(tmp_path: Path) -> None:
+    """A du reading claiming more cache than there is tree is impossible, and
+    must NOT be clamped to the tree size — that would make backed_up 0 and let
+    any site pass the gate. It has to fall back to sizing the whole tree."""
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    with pytest.raises(wp_update.HealthCheckError):
+        _disk_check_capture(
+            updater, r,
+            # excluded > site, and almost no free space
+            f"{1024 * 1024 * 1024} {99 * 1024 * 1024 * 1024} {1024 * 1024}",
+        )
+    disk = r.baseline["disk"]
+    assert disk["excluded_mb"] == 0
+    assert disk["backed_up_mb"] == disk["site_mb"]
+
+
+def _extract_tar_excludes(script: str) -> set[str]:
+    """Every --exclude=./<path> in a generated tar command, normalised."""
+    return {m.lstrip("./") for m in re.findall(r"--exclude=(\S+)", script)}
+
+
+def _extract_du_excludes(script: str, wp_path: str) -> set[str]:
+    """Every excluded path in a generated `du -sbc` line, normalised."""
+    line = next(ln for ln in script.splitlines() if ln.startswith("excl_bytes="))
+    return {
+        tok[len(wp_path) + 1:]
+        for tok in line.split()
+        if tok.startswith(wp_path + "/")
+    }
+
+
+def test_backup_tar_excludes_match_du_excludes(tmp_path: Path) -> None:
+    """THE equivalence test.
+
+    If the disk estimate and the archive ever disagree about what is being
+    written, the gate under-reserves disk — the exact failure it exists to
+    prevent. Both must derive from BACKUP_EXCLUDE_DIRS.
+    """
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+
+    disk_script = _disk_check_capture(updater, r, "0 0 0")
+
+    r.backup_dir = ""
+    captured: list[str] = []
+    with patch.object(updater, "_ssh", side_effect=lambda *a, **k: captured.append(a[1]) or "backup-ok"):
+        updater._step_backup(r)
+
+    tar_excludes = _extract_tar_excludes(captured[0])
+    du_excludes = _extract_du_excludes(disk_script, r.wp_path)
+
+    assert tar_excludes == du_excludes
+    assert tar_excludes == set(wp_update.BACKUP_EXCLUDE_DIRS)
+
+
+def test_backup_tar_excludes_precede_the_dot_operand(tmp_path: Path) -> None:
+    """GNU tar applies --exclude positionally; flags after the `.` operand are
+    silently ignored and we would archive the cache anyway."""
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    r.backup_dir = ""
+    captured: list[str] = []
+    with patch.object(updater, "_ssh", side_effect=lambda *a, **k: captured.append(a[1]) or "backup-ok"):
+        updater._step_backup(r)
+
+    tar_line = next(
+        ln for ln in captured[0].splitlines()
+        if ln.startswith("tar -czf") and "public_html.tar.gz" in ln
+    )
+    tokens = tar_line.split()
+    dot_index = tokens.index(".")
+    last_exclude = max(i for i, t in enumerate(tokens) if t.startswith("--exclude="))
+    assert last_exclude < dot_index
+
+
+def test_backup_integrity_greps_survive_exclusions(tmp_path: Path) -> None:
+    """Excluding cache must not weaken the archive integrity assertions —
+    wp-content/ and wp-config.php are still required to be present."""
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    r.backup_dir = ""
+    captured: list[str] = []
+    with patch.object(updater, "_ssh", side_effect=lambda *a, **k: captured.append(a[1]) or "backup-ok"):
+        updater._step_backup(r)
+
+    script = captured[0]
+    assert "wp-content/ missing from archive" in script
+    assert "wp-config.php missing from archive" in script
+    assert "sha256sum wp-config.php" in script
+
+
+def test_exclusions_identical_across_providers(tmp_path: Path) -> None:
+    """Nothing about the exclusion list is provider-specific."""
+    updater = _make_updater(tmp_path)
+
+    cw = _make_exec_report()
+    sg = _make_exec_report(
+        provider="siteground",
+        wp_path="/home/customer/www/example.com/public_html",
+        home_dir="/home/customer",
+    )
+
+    def _backup_script(rep: wp_update.SiteReport) -> str:
+        rep.backup_dir = ""
+        captured: list[str] = []
+        with patch.object(
+            updater, "_ssh",
+            side_effect=lambda *a, **k: captured.append(a[1]) or "backup-ok",
+        ):
+            updater._step_backup(rep)
+        return captured[0]
+
+    assert (
+        _extract_tar_excludes(_backup_script(cw))
+        == _extract_tar_excludes(_backup_script(sg))
+        == set(wp_update.BACKUP_EXCLUDE_DIRS)
+    )
+
+
+def test_no_backup_excludes_flag_restores_full_archive(tmp_path: Path) -> None:
+    """The escape hatch must produce a byte-complete archive and an estimate
+    sized against the whole tree."""
+    args = make_args(tmp_path, execute=True)
+    args.no_backup_excludes = True
+    args.env_file.write_text("SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=fake-pw\n")
+    updater = wp_update.WPUpdater(args)
+    r = _make_exec_report()
+
+    # 1GB tree, 10GB free — fits either way; the point is the estimate is
+    # sized against the WHOLE tree.
+    disk_script = _disk_check_capture(
+        updater, r, f"{1024 * 1024 * 1024} 0 {10 * 1024 * 1024 * 1024}"
+    )
+    assert "excl_bytes=0" in disk_script
+    assert r.baseline["disk"]["excluded_mb"] == 0
+    assert r.baseline["disk"]["backed_up_mb"] == r.baseline["disk"]["site_mb"]
+
+    r.backup_dir = ""
+    captured: list[str] = []
+    with patch.object(updater, "_ssh", side_effect=lambda *a, **k: captured.append(a[1]) or "backup-ok"):
+        updater._step_backup(r)
+    assert "--exclude=" not in captured[0]
+
+
+def test_rollback_snapshot_excludes_cache(tmp_path: Path) -> None:
+    """The forensic snapshot runs DURING a rollback on an already-tight disk.
+    Writing gigabytes of regenerable cache there turns a recoverable failure
+    into an unrecoverable one."""
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    captured: list[str] = []
+    with patch.object(updater, "_ssh", side_effect=lambda *a, **k: captured.append(a[1]) or "rollback-ok"):
+        updater._step_rollback(r)
+
+    snapshot_line = next(
+        ln for ln in captured[0].splitlines() if "failed-state.tar.gz" in ln
+    )
+    assert _extract_tar_excludes(snapshot_line) == set(wp_update.BACKUP_EXCLUDE_DIRS)
+
+
+def test_rollback_recreates_excluded_dirs_before_db_import(tmp_path: Path) -> None:
+    """The wipe removed them and the extract does not bring them back, but
+    advanced-cache.php IS restored — so the drop-in comes back live and
+    expects its directory. Ordering matters: after extract, before db import."""
+    updater = _make_updater(tmp_path)
+    r = _make_exec_report()
+    captured: list[str] = []
+    with patch.object(updater, "_ssh", side_effect=lambda *a, **k: captured.append(a[1]) or "rollback-ok"):
+        updater._step_rollback(r)
+
+    lines = captured[0].splitlines()
+    mkdir_idx = next(i for i, ln in enumerate(lines) if ln.startswith("mkdir -p "))
+    extract_idx = next(i for i, ln in enumerate(lines) if ln.startswith("tar -xzf"))
+    import_idx = next(i for i, ln in enumerate(lines) if "db import" in ln)
+
+    assert extract_idx < mkdir_idx < import_idx
+    for path in wp_update.BACKUP_EXCLUDE_DIRS:
+        assert f"{r.wp_path}/{path}" in lines[mkdir_idx]
+
+
+def test_rollback_mkdir_is_noop_when_nothing_excluded(tmp_path: Path) -> None:
+    """A bare `mkdir -p` with no operands exits non-zero, and the rollback
+    script runs under `set -euo pipefail` — that would abort the rollback."""
+    args = make_args(tmp_path, execute=True)
+    args.no_backup_excludes = True
+    args.env_file.write_text("SSH_USER=wpupdates\nSSH_KEY=\nAPP_PW=fake-pw\n")
+    updater = wp_update.WPUpdater(args)
+    r = _make_exec_report()
+
+    captured: list[str] = []
+    with patch.object(updater, "_ssh", side_effect=lambda *a, **k: captured.append(a[1]) or "rollback-ok"):
+        updater._step_rollback(r)
+
+    assert not any(ln.strip() == "mkdir -p" for ln in captured[0].splitlines())
+
+
+def test_confidence_flags_cache_dominant_site(tmp_path: Path) -> None:
+    """A site that is mostly cache should surface on the dry-run report as a
+    note, without a score penalty (the backup no longer carries it)."""
+    updater = _make_updater(tmp_path, execute=False)
+    r = _make_exec_report()
+    # Needs at least one pending update: with nothing to do, _compute_confidence
+    # deliberately discards all factors for a "nothing to change" summary.
+    r.baseline = {
+        "plugin_updates": [{"name": "example-plugin"}],
+        "theme_updates": [],
+        "core_updates": [],
+        "backup_plugins": [{"slug": "updraftplus"}],
+        "disk": {
+            "site_mb": 4868, "excluded_mb": 3738, "backed_up_mb": 1129,
+            "available_mb": 4003, "estimated_backup_mb": 1186,
+        },
+    }
+    conf = updater._compute_confidence(r)
+    assert any("transient cache" in f for f in conf["factors"])
+
+    # Control: same 4868 MB tree, but none of it is transient. No note — and
+    # an identical score, proving the note itself carries no penalty. (site_mb
+    # is held constant so the pre-existing large_site_penalty applies to both.)
+    r2 = _make_exec_report()
+    r2.baseline = dict(r.baseline)
+    r2.baseline["disk"] = {
+        "site_mb": 4868, "excluded_mb": 0, "backed_up_mb": 4868,
+        "available_mb": 4003, "estimated_backup_mb": 1186,
+    }
+    conf2 = updater._compute_confidence(r2)
+    assert not any("transient cache" in f for f in conf2["factors"])
+    assert conf2["score"] == conf["score"]
